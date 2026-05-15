@@ -1,0 +1,14 @@
+# user-provided inputs (per CLAUDE.md §4)
+inputs/logo-markings/*
+!inputs/logo-markings/.gitkeep
+
+# generated artifacts
+outputs/
+.cache/
+testbed/
+review.html
+
+# python
+__pycache__/
+*.egg-info/
+.venv/
