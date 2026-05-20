@@ -12,3 +12,8 @@ review.html
 __pycache__/
 *.egg-info/
 .venv/
+
+# Claude Code local infra (project instructions, sub-agent defs,
+# grader taxonomy, local settings) — local-only, not for public repo
+CLAUDE.md
+.claude/

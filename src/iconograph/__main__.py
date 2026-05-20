@@ -41,6 +41,12 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command == "testbed" and args.stage == "categorize":
+        from iconograph.testbed import run_categorize_testbed
+        return run_categorize_testbed()
+    if args.command == "testbed" and args.stage == "preprocess":
+        from iconograph.testbed import run_preprocess_testbed
+        return run_preprocess_testbed()
     return _not_implemented(args.command)
 
 
