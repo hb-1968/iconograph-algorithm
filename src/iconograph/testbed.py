@@ -1,24 +1,57 @@
-"""Testbed driver. First implementation: `testbed categorize`.
+"""Testbed driver — per-stage in-development runners, plus the `bench`
+harness. Each runner maps a per-fixture worker across a fork()-mode
+multiprocessing.Pool and writes the stage's H7 artifact. Upstream stages
+flow through iconograph.cache so reruns and downstream testbeds skip
+recompute.
 
-Loads ground truth from fixtures/README.md, runs categorize() on every
-PNG fixture, prints the 3×3 routing confusion matrix + per-field
-accuracies to stdout, and writes testbed/categorize/grid.png. Per H7
-this is the single artifact under review; per H8 the grid is
-byte-identical on rerun.
+Performance: the master process pre-decodes every fixture PNG into
+_FIXTURE_RGBA before forking the pool, and pre-warms the cache RAM tier
+from existing on-disk pkls. Both dicts are COW-inherited by every worker,
+so workers do pure-RAM dict lookups for upstream stages instead of disk
+reads. Per H6 the disk pickle store remains the source of truth.
 """
 
 from __future__ import annotations
 
+import json
+import multiprocessing as mp
+import os
 import re
+import subprocess
+import sys
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
+import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from iconograph.application.categorize import Categorization, categorize, load_rgba
+from iconograph.application.compress import (
+    Circle,
+    Classified,
+    Ellipse,
+    L1Miss,
+    Rectangle,
+    SegmentClassification,
+    Triangle,
+    align,
+    draw_overlay,
+    segment_prim_classify,
+)
 from iconograph.application.preprocess import preprocess
+from iconograph.application.compress.L2_compound_classify import (
+    ACCEPT_IOU as L2_ACCEPT_IOU,
+    L2Compound,
+    L2Defer,
+    L2_compound_classify,
+    _offset_part,
+    render_compound,
+)
+from iconograph.cache import cached, prewarm
 
 ROUTING_LABELS = ("standard", "inverted", "burst")
 
@@ -43,6 +76,163 @@ TESTBED_DIR = REPO_ROOT / "testbed" / "categorize"
 GRID_PATH = TESTBED_DIR / "grid.png"
 PREPROCESS_DIR = REPO_ROOT / "testbed" / "preprocess"
 PREPROCESS_GRID_PATH = PREPROCESS_DIR / "grid.png"
+ALIGN_DIR = REPO_ROOT / "testbed" / "align"
+ALIGN_GRID_PATH = ALIGN_DIR / "grid.png"
+SPC_DIR = REPO_ROOT / "testbed" / "segment_prim_classify"
+SPC_GRID_PATH = SPC_DIR / "grid.png"
+L2CC_DIR = REPO_ROOT / "testbed" / "L2_compound_classify"
+L2CC_GRID_PATH = L2CC_DIR / "grid.png"
+
+
+# ─── Parallel-fixture runner infrastructure ───────────────────────────
+#
+# Each testbed runner maps a per-fixture worker across a multiprocessing.Pool
+# (fork context — workers inherit the parent's already-imported modules and
+# the OMP/BLAS=1 env vars set in __main__.py, so we avoid thread oversubscrip-
+# tion without re-importing in each worker). Per-stage outputs go through the
+# H6 cache in iconograph.cache so reruns and downstream-stage testbeds skip
+# recomputing upstream stages.
+
+
+def _worker_init() -> None:
+    cv2.setNumThreads(1)
+
+
+def _pool(n_items: int):
+    nproc = max(1, min(os.cpu_count() or 1, n_items))
+    return mp.get_context("fork").Pool(processes=nproc, initializer=_worker_init)
+
+
+# Master-only RGBA cache. Populated by _prewarm_fixtures before _pool()
+# forks; workers see it via copy-on-write. KeyError on lookup means the
+# caller forgot to call _setup_run() before forking — that's a bug.
+_FIXTURE_RGBA: dict[str, np.ndarray] = {}
+
+_PREWARM_STAGES: tuple[str, ...] = ("categorize", "preprocess", "align", "segment_prim_classify")
+
+
+def _prewarm_fixtures(fixtures: list[Path]) -> None:
+    """Decode every fixture PNG into _FIXTURE_RGBA[stem]. Idempotent.
+    Byte-identical to the per-stage load_rgba() it replaces."""
+    for p in fixtures:
+        if p.stem in _FIXTURE_RGBA:
+            continue
+        _FIXTURE_RGBA[p.stem] = load_rgba(p)
+
+
+def _setup_run(fixtures: list[Path]) -> None:
+    """Master-side prep before _pool() fork: pre-decode fixtures and
+    pre-warm the cache RAM tier for every implemented stage."""
+    _prewarm_fixtures(fixtures)
+    prewarm(fixtures, _PREWARM_STAGES)
+
+
+def _do_categorize(p: Path) -> Categorization:
+    return categorize(p)
+
+
+def _do_preprocess(rgba: np.ndarray, cat: Categorization) -> np.ndarray:
+    return preprocess(cat, rgba)
+
+
+def _do_align(pre_out: np.ndarray) -> np.ndarray:
+    return align(pre_out)
+
+
+def _do_segment_prim_classify(aligned: np.ndarray) -> SegmentClassification:
+    return segment_prim_classify(aligned)
+
+
+def _worker_categorize(p: Path) -> tuple[Path, Categorization]:
+    pred = cached(p, "categorize", _do_categorize, p)
+    return p, pred
+
+
+def _worker_preprocess(p: Path) -> "PreprocessResult":
+    try:
+        cat = cached(p, "categorize", _do_categorize, p)
+    except Exception as e:
+        r = PreprocessResult(p, None, None, f"categorize: {type(e).__name__}: {e}")
+        _write_preprocess_strip(r)
+        return r
+    try:
+        out = cached(p, "preprocess", _do_preprocess, _FIXTURE_RGBA[p.stem], cat)
+    except Exception as e:
+        r = PreprocessResult(p, cat.routing, None, f"preprocess: {type(e).__name__}: {e}")
+        _write_preprocess_strip(r)
+        return r
+    contract_err = _check_preprocess_contract(out)
+    if contract_err is not None:
+        r = PreprocessResult(p, cat.routing, None, contract_err)
+        _write_preprocess_strip(r)
+        return r
+    r = PreprocessResult(p, cat.routing, out, None)
+    _write_preprocess_strip(r)
+    return r
+
+
+def _worker_align(p: Path) -> "AlignResult":
+    try:
+        cat = cached(p, "categorize", _do_categorize, p)
+    except Exception as e:
+        r = AlignResult(p, None, None, None, f"categorize: {type(e).__name__}: {e}")
+        _write_align_strip(r)
+        return r
+    try:
+        pre_out = cached(p, "preprocess", _do_preprocess, _FIXTURE_RGBA[p.stem], cat)
+    except Exception as e:
+        r = AlignResult(p, cat.routing, None, None, f"preprocess: {type(e).__name__}: {e}")
+        _write_align_strip(r)
+        return r
+    try:
+        aligned = cached(p, "align", _do_align, pre_out)
+    except Exception as e:
+        r = AlignResult(p, cat.routing, pre_out, None, f"align: {type(e).__name__}: {e}")
+        _write_align_strip(r)
+        return r
+    contract_err = _check_align_contract(aligned)
+    if contract_err is not None:
+        r = AlignResult(p, cat.routing, pre_out, None, contract_err)
+        _write_align_strip(r)
+        return r
+    r = AlignResult(p, cat.routing, pre_out, aligned, None)
+    _write_align_strip(r)
+    return r
+
+
+def _worker_segment_prim_classify(p: Path) -> "SegmentPrimClassifyResult":
+    try:
+        cat = cached(p, "categorize", _do_categorize, p)
+    except Exception as e:
+        r = SegmentPrimClassifyResult(p, None, None, None, f"categorize: {type(e).__name__}: {e}")
+        _write_segment_prim_classify_strip(r)
+        return r
+    try:
+        pre_out = cached(p, "preprocess", _do_preprocess, _FIXTURE_RGBA[p.stem], cat)
+    except Exception as e:
+        r = SegmentPrimClassifyResult(p, cat.routing, None, None, f"preprocess: {type(e).__name__}: {e}")
+        _write_segment_prim_classify_strip(r)
+        return r
+    try:
+        aligned = cached(p, "align", _do_align, pre_out)
+    except Exception as e:
+        r = SegmentPrimClassifyResult(p, cat.routing, None, None, f"align: {type(e).__name__}: {e}")
+        _write_segment_prim_classify_strip(r)
+        return r
+    try:
+        out = cached(p, "segment_prim_classify", _do_segment_prim_classify, aligned)
+    except Exception as e:
+        r = SegmentPrimClassifyResult(p, cat.routing, aligned, None, f"segment_prim_classify: {type(e).__name__}: {e}")
+        _write_segment_prim_classify_strip(r)
+        return r
+    contract_err = _check_segment_prim_classify_contract(out)
+    if contract_err is not None:
+        r = SegmentPrimClassifyResult(p, cat.routing, aligned, None, contract_err)
+        _write_segment_prim_classify_strip(r)
+        return r
+    r = SegmentPrimClassifyResult(p, cat.routing, aligned, out, None)
+    _write_segment_prim_classify_strip(r)
+    return r
 
 
 @dataclass(frozen=True)
@@ -131,14 +321,20 @@ def run_categorize_testbed() -> int:
         print("error: no rows parsed from fixtures/README.md")
         return 2
     fixtures = sorted(FIXTURES.glob("*.png"))
+    if not fixtures:
+        print(f"error: no PNG fixtures found under {FIXTURES.relative_to(REPO_ROOT)}")
+        return 2
+    _setup_run(fixtures)
+    with _pool(len(fixtures)) as pool:
+        raw = list(pool.imap_unordered(_worker_categorize, fixtures))
+    raw.sort(key=lambda x: x[0].name)
     results: list[tuple[Path, GroundTruth, Categorization]] = []
     skipped: list[str] = []
-    for p in fixtures:
+    for p, pred in raw:
         gt = truth.get(p.name)
         if gt is None:
             skipped.append(p.name)
             continue
-        pred = categorize(p)
         results.append((p, gt, pred))
 
     matrix = np.zeros((3, 3), dtype=int)
@@ -414,30 +610,11 @@ def run_preprocess_testbed() -> int:
         print(f"error: no PNG fixtures found under {FIXTURES.relative_to(REPO_ROOT)}")
         return 2
 
-    results: list[PreprocessResult] = []
-    for p in fixtures:
-        try:
-            cat = categorize(p)
-        except Exception as e:
-            results.append(
-                PreprocessResult(p, None, None, f"categorize: {type(e).__name__}: {e}")
-            )
-            continue
-        try:
-            rgba = load_rgba(p)
-            out = preprocess(cat, rgba)
-        except Exception as e:
-            results.append(
-                PreprocessResult(
-                    p, cat.routing, None, f"preprocess: {type(e).__name__}: {e}"
-                )
-            )
-            continue
-        contract_err = _check_preprocess_contract(out)
-        if contract_err is not None:
-            results.append(PreprocessResult(p, cat.routing, None, contract_err))
-            continue
-        results.append(PreprocessResult(p, cat.routing, out, None))
+    PREPROCESS_DIR.mkdir(parents=True, exist_ok=True)
+    _setup_run(fixtures)
+    with _pool(len(fixtures)) as pool:
+        results = list(pool.imap_unordered(_worker_preprocess, fixtures))
+    results.sort(key=lambda r: r.path.name)
 
     n = len(results)
     hist = {lbl: sum(1 for r in results if r.routing == lbl) for lbl in ROUTING_LABELS}
@@ -454,9 +631,6 @@ def run_preprocess_testbed() -> int:
         for r in failures:
             print(f"  {r.path.name}: {r.error}")
 
-    PREPROCESS_DIR.mkdir(parents=True, exist_ok=True)
-    for r in results:
-        _write_preprocess_strip(r)
     _compose_preprocess_grid(results, hist, passed, n)
 
     return 0 if not failures else 1
@@ -653,3 +827,832 @@ def _compose_preprocess_grid(
 
     canvas.save(PREPROCESS_GRID_PATH, "PNG", optimize=True)
     print(f"Saved {PREPROCESS_GRID_PATH.relative_to(REPO_ROOT)}")
+
+
+# ─── Stage 3 align testbed ────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class AlignResult:
+    path: Path
+    routing: Literal["standard", "inverted", "burst"] | None
+    preprocess_output: np.ndarray | None
+    aligned_output: np.ndarray | None
+    error: str | None
+
+
+def run_align_testbed() -> int:
+    fixtures = sorted(FIXTURES.glob("*.png"))
+    if not fixtures:
+        print(f"error: no PNG fixtures found under {FIXTURES.relative_to(REPO_ROOT)}")
+        return 2
+
+    ALIGN_DIR.mkdir(parents=True, exist_ok=True)
+    _setup_run(fixtures)
+    with _pool(len(fixtures)) as pool:
+        results = list(pool.imap_unordered(_worker_align, fixtures))
+    results.sort(key=lambda r: r.path.name)
+
+    n = len(results)
+    hist = {lbl: sum(1 for r in results if r.routing == lbl) for lbl in ROUTING_LABELS}
+    passed = sum(1 for r in results if r.error is None)
+    failures = [r for r in results if r.error is not None]
+
+    print(
+        "Routing histogram: "
+        + " ".join(f"{lbl}={hist[lbl]}" for lbl in ROUTING_LABELS)
+    )
+    print(f"{passed}/{n} fixtures passed (no exception, contract OK)")
+    if failures:
+        print(f"Failures ({len(failures)}):")
+        for r in failures:
+            print(f"  {r.path.name}: {r.error}")
+
+    _compose_align_grid(results, hist, passed, n)
+
+    return 0 if not failures else 1
+
+
+def _check_align_contract(out: object) -> str | None:
+    """Verify align() honors its (S, S, 3) uint8 RGB contract."""
+    if not isinstance(out, np.ndarray):
+        return f"output type {type(out).__name__}, expected np.ndarray"
+    if out.dtype != np.uint8:
+        return f"dtype {out.dtype}, expected uint8"
+    if out.ndim != 3 or out.shape[2] != 3:
+        return f"shape {out.shape}, expected (S, S, 3)"
+    if out.shape[0] != out.shape[1]:
+        return f"shape {out.shape}, not square"
+    return None
+
+
+def _write_align_strip(r: AlignResult) -> None:
+    """Per-fixture H7 strip: preprocess output | aligned output + caption."""
+    PANEL = 512
+    CAPTION_H = 36
+    total_w = PANEL * 2
+    total_h = PANEL + CAPTION_H
+
+    canvas = Image.new("RGB", (total_w, total_h), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+
+    if r.preprocess_output is not None:
+        pre_img = Image.fromarray(r.preprocess_output, "RGB")
+        pre_panel = _fit_to_panel(pre_img, PANEL)
+        canvas.paste(pre_panel, (0, 0))
+    else:
+        f_dash = _load_font(48)
+        _draw_centered_text(draw, 0, 0, PANEL, PANEL, "—", f_dash, (0xAA, 0xAA, 0xAA))
+
+    if r.aligned_output is not None:
+        out_img = Image.fromarray(r.aligned_output, "RGB")
+        out_panel = _fit_to_panel(out_img, PANEL)
+        canvas.paste(out_panel, (PANEL, 0))
+    else:
+        f_fail = _load_font(48)
+        _draw_centered_text(draw, PANEL, 0, PANEL, PANEL, "FAIL", f_fail, MISMATCH)
+
+    draw.line([(PANEL, 0), (PANEL, PANEL)], fill=(0xCC, 0xCC, 0xCC), width=1)
+
+    draw.rectangle((0, PANEL, total_w, total_h), fill=(0xF4, 0xF4, 0xF4))
+    f = _load_font(13)
+    if r.routing is not None:
+        chip_w = 80
+        chip_h = 20
+        chip_y = PANEL + (CAPTION_H - chip_h) // 2
+        draw.rectangle(
+            (8, chip_y, 8 + chip_w, chip_y + chip_h), fill=ROUTING_COLORS[r.routing]
+        )
+        _draw_centered_text(draw, 8, chip_y, chip_w, chip_h, r.routing, f, (255, 255, 255))
+        text_x = 8 + chip_w + 12
+    else:
+        text_x = 8
+    caption = r.path.name + (f"  •  ERROR: {r.error}" if r.error else "")
+    draw.text(
+        (text_x, PANEL + (CAPTION_H - 14) // 2),
+        caption,
+        font=f,
+        fill=(0, 0, 0) if r.error is None else MISMATCH,
+    )
+
+    canvas.save(ALIGN_DIR / r.path.name, "PNG", optimize=True)
+
+
+def _compose_align_grid(
+    results: list[AlignResult],
+    hist: dict[str, int],
+    passed: int,
+    n: int,
+) -> None:
+    THUMB = 96
+    OUT_W = 128
+    BAND_W = 100
+    CHECK_W = 36
+    NAME_W = 180
+    PAD = 8
+    ROW_H = THUMB
+
+    cols = [THUMB, NAME_W, OUT_W, BAND_W, CHECK_W]
+    col_x = [PAD]
+    for w in cols[:-1]:
+        col_x.append(col_x[-1] + w + PAD)
+    total_w = col_x[-1] + cols[-1] + PAD
+
+    header_h = 100
+    body_h = (ROW_H + PAD) * len(results) + PAD
+    total_h = header_h + body_h
+
+    canvas = Image.new("RGB", (total_w, total_h), (0xF4, 0xF4, 0xF4))
+    draw = ImageDraw.Draw(canvas)
+    f_title = _load_font(18)
+    f_body = _load_font(13)
+    f_small = _load_font(11)
+    f_big = _load_font(22)
+    f_fail = _load_font(14)
+
+    draw.text((PAD, PAD), "Stage 3 align — testbed grid", font=f_title, fill=(0, 0, 0))
+    hist_text = " ".join(f"{lbl}={hist[lbl]}" for lbl in ROUTING_LABELS)
+    draw.text((PAD, PAD + 28), f"Routing histogram: {hist_text}", font=f_body, fill=(0, 0, 0))
+    pass_color = MATCH if passed == n else MISMATCH
+    draw.text(
+        (PAD, PAD + 50),
+        f"{passed}/{n} fixtures passed (no exception, contract OK)",
+        font=f_body,
+        fill=pass_color,
+    )
+
+    for r_idx, r in enumerate(results):
+        y = header_h + r_idx * (ROW_H + PAD)
+
+        draw.rectangle(
+            (col_x[0], y, col_x[0] + THUMB, y + ROW_H),
+            fill=(255, 255, 255),
+            outline=(0xAA, 0xAA, 0xAA),
+        )
+        if r.preprocess_output is not None:
+            thumb = Image.fromarray(r.preprocess_output, "RGB")
+            thumb.thumbnail((THUMB - 6, ROW_H - 6))
+            tx = col_x[0] + (THUMB - thumb.width) // 2
+            ty = y + (ROW_H - thumb.height) // 2
+            canvas.paste(thumb, (tx, ty))
+
+        draw.rectangle(
+            (col_x[1], y, col_x[1] + NAME_W, y + ROW_H), fill=(0xFA, 0xFA, 0xFA)
+        )
+        draw.text(
+            (col_x[1] + 6, y + ROW_H // 2 - 8), r.path.name, font=f_small, fill=(0, 0, 0)
+        )
+
+        draw.rectangle(
+            (col_x[2], y, col_x[2] + OUT_W, y + ROW_H),
+            fill=(255, 255, 255),
+            outline=(0xAA, 0xAA, 0xAA),
+        )
+        if r.aligned_output is not None:
+            out_img = Image.fromarray(r.aligned_output, "RGB")
+            out_img.thumbnail((OUT_W - 6, ROW_H - 6))
+            ox = col_x[2] + (OUT_W - out_img.width) // 2
+            oy = y + (ROW_H - out_img.height) // 2
+            canvas.paste(out_img, (ox, oy))
+        else:
+            _draw_centered_text(draw, col_x[2], y, OUT_W, ROW_H, "FAIL", f_fail, MISMATCH)
+
+        if r.routing is not None:
+            draw.rectangle(
+                (col_x[3], y, col_x[3] + BAND_W, y + ROW_H),
+                fill=ROUTING_COLORS[r.routing],
+            )
+            _draw_centered_text(
+                draw, col_x[3], y, BAND_W, ROW_H, r.routing, f_body, (255, 255, 255)
+            )
+        else:
+            draw.rectangle(
+                (col_x[3], y, col_x[3] + BAND_W, y + ROW_H), fill=(0x9E, 0x9E, 0x9E)
+            )
+            _draw_centered_text(
+                draw, col_x[3], y, BAND_W, ROW_H, "n/a", f_body, (255, 255, 255)
+            )
+
+        ok = r.error is None
+        draw.rectangle(
+            (col_x[4], y, col_x[4] + CHECK_W, y + ROW_H),
+            fill=(MATCH if ok else MISMATCH),
+        )
+        mark = "✓" if ok else "✗"
+        bbox = draw.textbbox((0, 0), mark, font=f_big)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        draw.text(
+            (col_x[4] + (CHECK_W - tw) // 2, y + (ROW_H - th) // 2 - 2),
+            mark,
+            font=f_big,
+            fill=(255, 255, 255),
+        )
+
+    canvas.save(ALIGN_GRID_PATH, "PNG", optimize=True)
+    print(f"Saved {ALIGN_GRID_PATH.relative_to(REPO_ROOT)}")
+
+
+# ─── Stage 3 L1 segment_prim_classify testbed ─────────────────────────
+
+
+@dataclass(frozen=True)
+class SegmentPrimClassifyResult:
+    path: Path
+    routing: Literal["standard", "inverted", "burst"] | None
+    aligned_input: np.ndarray | None
+    output: SegmentClassification | None
+    error: str | None
+
+
+def run_segment_prim_classify_testbed() -> int:
+    fixtures = sorted(FIXTURES.glob("*.png"))
+    if not fixtures:
+        print(f"error: no PNG fixtures found under {FIXTURES.relative_to(REPO_ROOT)}")
+        return 2
+
+    SPC_DIR.mkdir(parents=True, exist_ok=True)
+    _setup_run(fixtures)
+    with _pool(len(fixtures)) as pool:
+        results = list(pool.imap_unordered(_worker_segment_prim_classify, fixtures))
+    results.sort(key=lambda r: r.path.name)
+
+    n = len(results)
+    hist = {lbl: sum(1 for r in results if r.routing == lbl) for lbl in ROUTING_LABELS}
+    passed = sum(1 for r in results if r.error is None)
+    failures = [r for r in results if r.error is not None]
+
+    n_classified = 0
+    n_l1miss = 0
+    for r in results:
+        if r.output is None:
+            continue
+        for seg in r.output.segments:
+            if isinstance(seg, Classified):
+                n_classified += 1
+            else:
+                n_l1miss += 1
+
+    print(
+        "Routing histogram: "
+        + " ".join(f"{lbl}={hist[lbl]}" for lbl in ROUTING_LABELS)
+    )
+    print(f"{passed}/{n} fixtures passed (no exception, contract OK)")
+    print(f"Total segments: classified={n_classified}, L1miss={n_l1miss}")
+    if failures:
+        print(f"Failures ({len(failures)}):")
+        for r in failures:
+            print(f"  {r.path.name}: {r.error}")
+
+    _compose_segment_prim_classify_grid(results, hist, passed, n)
+
+    return 0 if not failures else 1
+
+
+def _check_segment_prim_classify_contract(out: object) -> str | None:
+    if not isinstance(out, SegmentClassification):
+        return f"output type {type(out).__name__}, expected SegmentClassification"
+    if not isinstance(out.segments, list):
+        return f"segments type {type(out.segments).__name__}, expected list"
+    for i, seg in enumerate(out.segments):
+        if not isinstance(seg, (Classified, L1Miss)):
+            return f"segments[{i}] type {type(seg).__name__}, expected Classified|L1Miss"
+    if not isinstance(out.binarized, np.ndarray) or out.binarized.dtype != np.uint8:
+        return f"binarized dtype {getattr(out.binarized, 'dtype', None)}, expected uint8 ndarray"
+    if not isinstance(out.labels, np.ndarray) or out.labels.dtype != np.int32:
+        return f"labels dtype {getattr(out.labels, 'dtype', None)}, expected int32 ndarray"
+    return None
+
+
+def _write_segment_prim_classify_strip(r: SegmentPrimClassifyResult) -> None:
+    PANEL = 512
+    CAPTION_H = 36
+    total_w = PANEL * 2
+    total_h = PANEL + CAPTION_H
+
+    canvas = Image.new("RGB", (total_w, total_h), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+
+    if r.aligned_input is not None:
+        aligned_img = Image.fromarray(r.aligned_input, "RGB")
+        aligned_panel = _fit_to_panel(aligned_img, PANEL)
+        canvas.paste(aligned_panel, (0, 0))
+    else:
+        f_dash = _load_font(48)
+        _draw_centered_text(draw, 0, 0, PANEL, PANEL, "—", f_dash, (0xAA, 0xAA, 0xAA))
+
+    if r.output is not None and r.aligned_input is not None:
+        overlay_arr = draw_overlay(r.aligned_input, r.output)
+        overlay_img = Image.fromarray(overlay_arr, "RGB")
+        overlay_panel = _fit_to_panel(overlay_img, PANEL)
+        canvas.paste(overlay_panel, (PANEL, 0))
+    else:
+        f_fail = _load_font(48)
+        _draw_centered_text(draw, PANEL, 0, PANEL, PANEL, "FAIL", f_fail, MISMATCH)
+
+    draw.line([(PANEL, 0), (PANEL, PANEL)], fill=(0xCC, 0xCC, 0xCC), width=1)
+
+    draw.rectangle((0, PANEL, total_w, total_h), fill=(0xF4, 0xF4, 0xF4))
+    f = _load_font(13)
+    if r.routing is not None:
+        chip_w = 80
+        chip_h = 20
+        chip_y = PANEL + (CAPTION_H - chip_h) // 2
+        draw.rectangle(
+            (8, chip_y, 8 + chip_w, chip_y + chip_h), fill=ROUTING_COLORS[r.routing]
+        )
+        _draw_centered_text(draw, 8, chip_y, chip_w, chip_h, r.routing, f, (255, 255, 255))
+        text_x = 8 + chip_w + 12
+    else:
+        text_x = 8
+
+    if r.output is not None:
+        c_circ = sum(1 for s in r.output.segments
+                     if isinstance(s, Classified) and isinstance(s.primitive, Circle))
+        c_rect = sum(1 for s in r.output.segments
+                     if isinstance(s, Classified) and isinstance(s.primitive, Rectangle))
+        c_tri = sum(1 for s in r.output.segments
+                    if isinstance(s, Classified) and isinstance(s.primitive, Triangle))
+        c_ell = sum(1 for s in r.output.segments
+                    if isinstance(s, Classified) and isinstance(s.primitive, Ellipse))
+        n_l1 = sum(1 for s in r.output.segments if isinstance(s, L1Miss))
+        summary = (
+            f"  •  classified={c_circ + c_rect + c_tri + c_ell} "
+            f"(circ={c_circ} rect={c_rect} tri={c_tri} ell={c_ell})  "
+            f"•  L1miss={n_l1}"
+        )
+    elif r.error:
+        summary = f"  •  ERROR: {r.error}"
+    else:
+        summary = ""
+
+    caption = r.path.name + summary
+    draw.text(
+        (text_x, PANEL + (CAPTION_H - 14) // 2),
+        caption,
+        font=f,
+        fill=(0, 0, 0) if r.error is None else MISMATCH,
+    )
+
+    canvas.save(SPC_DIR / r.path.name, "PNG", optimize=True)
+
+
+def _compose_segment_prim_classify_grid(
+    results: list[SegmentPrimClassifyResult],
+    hist: dict[str, int],
+    passed: int,
+    n: int,
+) -> None:
+    THUMB = 96
+    OUT_W = 128
+    BAND_W = 100
+    CHECK_W = 36
+    NAME_W = 180
+    PAD = 8
+    ROW_H = THUMB
+
+    cols = [THUMB, NAME_W, OUT_W, BAND_W, CHECK_W]
+    col_x = [PAD]
+    for w in cols[:-1]:
+        col_x.append(col_x[-1] + w + PAD)
+    total_w = col_x[-1] + cols[-1] + PAD
+
+    header_h = 120
+    body_h = (ROW_H + PAD) * len(results) + PAD
+    total_h = header_h + body_h
+
+    canvas = Image.new("RGB", (total_w, total_h), (0xF4, 0xF4, 0xF4))
+    draw = ImageDraw.Draw(canvas)
+    f_title = _load_font(18)
+    f_body = _load_font(13)
+    f_small = _load_font(11)
+    f_big = _load_font(22)
+    f_fail = _load_font(14)
+
+    draw.text((PAD, PAD), "Stage 3 L1 segment_prim_classify — testbed grid", font=f_title, fill=(0, 0, 0))
+    hist_text = " ".join(f"{lbl}={hist[lbl]}" for lbl in ROUTING_LABELS)
+    draw.text((PAD, PAD + 28), f"Routing histogram: {hist_text}", font=f_body, fill=(0, 0, 0))
+    pass_color = MATCH if passed == n else MISMATCH
+    draw.text(
+        (PAD, PAD + 50),
+        f"{passed}/{n} fixtures passed (no exception, contract OK)",
+        font=f_body,
+        fill=pass_color,
+    )
+    total_classified = sum(
+        sum(1 for s in r.output.segments if isinstance(s, Classified))
+        for r in results if r.output is not None
+    )
+    total_l1miss = sum(
+        sum(1 for s in r.output.segments if isinstance(s, L1Miss))
+        for r in results if r.output is not None
+    )
+    draw.text(
+        (PAD, PAD + 72),
+        f"Total segments: classified={total_classified}  •  L1miss={total_l1miss}",
+        font=f_body,
+        fill=(0, 0, 0),
+    )
+
+    for r_idx, r in enumerate(results):
+        y = header_h + r_idx * (ROW_H + PAD)
+
+        draw.rectangle(
+            (col_x[0], y, col_x[0] + THUMB, y + ROW_H),
+            fill=(255, 255, 255),
+            outline=(0xAA, 0xAA, 0xAA),
+        )
+        if r.aligned_input is not None:
+            thumb = Image.fromarray(r.aligned_input, "RGB")
+            thumb.thumbnail((THUMB - 6, ROW_H - 6))
+            tx = col_x[0] + (THUMB - thumb.width) // 2
+            ty = y + (ROW_H - thumb.height) // 2
+            canvas.paste(thumb, (tx, ty))
+
+        draw.rectangle(
+            (col_x[1], y, col_x[1] + NAME_W, y + ROW_H), fill=(0xFA, 0xFA, 0xFA)
+        )
+        draw.text(
+            (col_x[1] + 6, y + ROW_H // 2 - 8), r.path.name, font=f_small, fill=(0, 0, 0)
+        )
+
+        draw.rectangle(
+            (col_x[2], y, col_x[2] + OUT_W, y + ROW_H),
+            fill=(255, 255, 255),
+            outline=(0xAA, 0xAA, 0xAA),
+        )
+        if r.output is not None and r.aligned_input is not None:
+            overlay_arr = draw_overlay(r.aligned_input, r.output)
+            overlay_img = Image.fromarray(overlay_arr, "RGB")
+            overlay_img.thumbnail((OUT_W - 6, ROW_H - 6))
+            ox = col_x[2] + (OUT_W - overlay_img.width) // 2
+            oy = y + (ROW_H - overlay_img.height) // 2
+            canvas.paste(overlay_img, (ox, oy))
+        else:
+            _draw_centered_text(draw, col_x[2], y, OUT_W, ROW_H, "FAIL", f_fail, MISMATCH)
+
+        if r.routing is not None:
+            draw.rectangle(
+                (col_x[3], y, col_x[3] + BAND_W, y + ROW_H),
+                fill=ROUTING_COLORS[r.routing],
+            )
+            _draw_centered_text(
+                draw, col_x[3], y, BAND_W, ROW_H, r.routing, f_body, (255, 255, 255)
+            )
+        else:
+            draw.rectangle(
+                (col_x[3], y, col_x[3] + BAND_W, y + ROW_H), fill=(0x9E, 0x9E, 0x9E)
+            )
+            _draw_centered_text(
+                draw, col_x[3], y, BAND_W, ROW_H, "n/a", f_body, (255, 255, 255)
+            )
+
+        ok = r.error is None
+        draw.rectangle(
+            (col_x[4], y, col_x[4] + CHECK_W, y + ROW_H),
+            fill=(MATCH if ok else MISMATCH),
+        )
+        mark = "✓" if ok else "✗"
+        bbox = draw.textbbox((0, 0), mark, font=f_big)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        draw.text(
+            (col_x[4] + (CHECK_W - tw) // 2, y + (ROW_H - th) // 2 - 2),
+            mark,
+            font=f_big,
+            fill=(255, 255, 255),
+        )
+
+    canvas.save(SPC_GRID_PATH, "PNG", optimize=True)
+    print(f"Saved {SPC_GRID_PATH.relative_to(REPO_ROOT)}")
+
+
+# ─── Stage 3 L2 L2_compound_classify testbed ──────────────────────────
+#
+# Runs the L2 router/engine (greedy union + intelligent hole-negation + global-
+# ring collapse) and renders its OUTPUT. Output goes to testbed/L2_compound_
+# classify/: one strip per fixture, a row per emitted L2 segment (compound or
+# defer) — aligned crop | target mask | reconstruction — labelled with structure
+# (local / global-ring), IoU, add/sub part counts, and OK/defer. A global-ring
+# group is one row over its combined bbox. Classified pass-throughs and zero-miss
+# fixtures are skipped. Greedy won the H7 weigh, so a single result column.
+
+
+@dataclass
+class _L2View:
+    crop: np.ndarray              # (h, w, 3) RGB — aligned pixels under the segment
+    target: np.ndarray            # (h, w) uint8 {0,255} — binarized crop
+    recon: np.ndarray             # (h, w, 3) RGB — reconstruction (or deferred mask)
+    label: str
+    ok: bool
+
+
+@dataclass(frozen=True)
+class L2CompoundResult:
+    path: Path
+    routing: Literal["standard", "inverted", "burst"] | None
+    n_misses: int
+    n_compound: int
+    n_defer: int
+    n_global_ring: int
+    sum_iou: float                # over accepted compounds
+    error: str | None
+
+
+def _l2_mask_to_rgb(mask: np.ndarray) -> np.ndarray:
+    rgb = np.full((mask.shape[0], mask.shape[1], 3), 255, dtype=np.uint8)
+    rgb[mask > 0] = (60, 60, 60)
+    return rgb
+
+
+def _l2_binarize(crop_rgb: np.ndarray) -> np.ndarray:
+    """Reconstruct the L1 foreground target from an aligned crop (matches L1's
+    WHITE_THRESH=250 rule)."""
+    return (np.any(crop_rgb < 250, axis=2).astype(np.uint8)) * 255
+
+
+def _l2_panel_label(
+    draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int,
+    text: str, font: ImageFont.FreeTypeFont, fill: tuple[int, int, int],
+) -> None:
+    draw.rectangle((x, y, x + w, y + h), fill=(0xF6, 0xF6, 0xF6))
+    _draw_centered_text(draw, x, y, w, h, text, font, fill)
+
+
+def _worker_L2_compound_classify(p: Path) -> "L2CompoundResult":
+    try:
+        cat = cached(p, "categorize", _do_categorize, p)
+    except Exception as e:
+        return L2CompoundResult(p, None, 0, 0, 0, 0, 0.0, f"categorize: {type(e).__name__}: {e}")
+    try:
+        pre = cached(p, "preprocess", _do_preprocess, _FIXTURE_RGBA[p.stem], cat)
+    except Exception as e:
+        return L2CompoundResult(p, cat.routing, 0, 0, 0, 0, 0.0, f"preprocess: {type(e).__name__}: {e}")
+    try:
+        aligned = cached(p, "align", _do_align, pre)
+    except Exception as e:
+        return L2CompoundResult(p, cat.routing, 0, 0, 0, 0, 0.0, f"align: {type(e).__name__}: {e}")
+    try:
+        sc = cached(p, "segment_prim_classify", _do_segment_prim_classify, aligned)
+    except Exception as e:
+        return L2CompoundResult(p, cat.routing, 0, 0, 0, 0, 0.0, f"segment_prim_classify: {type(e).__name__}: {e}")
+
+    try:
+        cc = L2_compound_classify(sc, cat)
+        n_misses = sum(1 for s in sc.segments if isinstance(s, L1Miss))
+        views: list[_L2View] = []
+        n_compound = n_defer = n_ring = 0
+        sum_iou = 0.0
+        for seg in cc.segments:
+            if isinstance(seg, L2Compound):
+                x, y, w, h = seg.bbox
+                crop = aligned[y:y + h, x:x + w].copy()
+                local = tuple(_offset_part(part, -x, -y) for part in seg.parts)
+                recon = render_compound(local, h, w, color=tuple(int(c) for c in seg.color_rgb))
+                n_sub = sum(1 for part in seg.parts if part.op == "subtract")
+                n_add = len(seg.parts) - n_sub
+                label = f"{seg.structure}  iou={seg.iou:.2f}  {n_add}+{n_sub}p  OK"
+                views.append(_L2View(crop, _l2_binarize(crop), recon, label, True))
+                n_compound += 1
+                sum_iou += seg.iou
+                if seg.structure == "global_ring":
+                    n_ring += 1
+            elif isinstance(seg, L2Defer):
+                x, y, w, h = seg.bbox
+                crop = aligned[y:y + h, x:x + w].copy()
+                views.append(_L2View(
+                    crop, _l2_binarize(crop), _l2_mask_to_rgb(seg.mask),
+                    f"defer ({seg.reason})", False,
+                ))
+                n_defer += 1
+        if views:
+            _write_L2_compound_classify_strip(p, cat.routing, views)
+        return L2CompoundResult(p, cat.routing, n_misses, n_compound, n_defer, n_ring, sum_iou, None)
+    except Exception as e:
+        return L2CompoundResult(p, cat.routing, 0, 0, 0, 0, 0.0, f"L2_compound_classify: {type(e).__name__}: {e}")
+
+
+def _write_L2_compound_classify_strip(
+    p: Path,
+    routing: Literal["standard", "inverted", "burst"] | None,
+    views: list["_L2View"],
+) -> None:
+    PANEL = 200
+    LABEL_H = 22
+    HEADER_H = 30
+    COLS = 3
+    row_h = PANEL + LABEL_H
+    total_w = PANEL * COLS
+    total_h = HEADER_H + row_h * len(views)
+
+    canvas = Image.new("RGB", (total_w, total_h), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    f = _load_font(13)
+    fs = _load_font(12)
+
+    draw.rectangle((0, 0, total_w, HEADER_H), fill=(0xF0, 0xF0, 0xF0))
+    text_x = 8
+    if routing is not None:
+        cw, ch = 70, 18
+        cy = (HEADER_H - ch) // 2
+        draw.rectangle((8, cy, 8 + cw, cy + ch), fill=ROUTING_COLORS[routing])
+        _draw_centered_text(draw, 8, cy, cw, ch, routing, fs, (255, 255, 255))
+        text_x = 8 + cw + 10
+    draw.text(
+        (text_x, (HEADER_H - 14) // 2),
+        f"{p.name}  •  {len(views)} L2 segment(s)  •  OK = iou >= {L2_ACCEPT_IOU:.2f}",
+        font=f, fill=(0, 0, 0),
+    )
+
+    for i, v in enumerate(views):
+        y0 = HEADER_H + i * row_h
+        draw.line([(0, y0), (total_w, y0)], fill=(0xDD, 0xDD, 0xDD), width=1)
+
+        canvas.paste(_fit_to_panel(Image.fromarray(v.crop, "RGB"), PANEL), (0, y0))
+        _l2_panel_label(draw, 0, y0 + PANEL, PANEL, LABEL_H, "aligned crop", fs, (0, 0, 0))
+
+        canvas.paste(_fit_to_panel(Image.fromarray(_l2_mask_to_rgb(v.target), "RGB"), PANEL), (PANEL, y0))
+        _l2_panel_label(draw, PANEL, y0 + PANEL, PANEL, LABEL_H, "target mask", fs, (0, 0, 0))
+
+        canvas.paste(_fit_to_panel(Image.fromarray(v.recon, "RGB"), PANEL), (2 * PANEL, y0))
+        _l2_panel_label(
+            draw, 2 * PANEL, y0 + PANEL, PANEL, LABEL_H, v.label,
+            fs, MATCH if v.ok else MISMATCH,
+        )
+
+    canvas.save(L2CC_DIR / p.name, "PNG", optimize=True)
+
+
+def _compose_L2_compound_classify_grid(results: list["L2CompoundResult"]) -> None:
+    shown = [r for r in results if r.error is None and (r.n_compound + r.n_defer) > 0]
+    shown.sort(key=lambda r: r.path.name)
+    L2CC_DIR.mkdir(parents=True, exist_ok=True)
+    if not shown:
+        print("No L2 segments across the fixture set — nothing to compose.")
+        return
+
+    GRID_W = 620
+    GAP = 6
+    strips: list[Image.Image] = []
+    for r in shown:
+        sp = L2CC_DIR / r.path.name
+        if not sp.exists():
+            continue
+        im = Image.open(sp).convert("RGB")
+        h = max(1, int(im.height * (GRID_W / im.width)))
+        strips.append(im.resize((GRID_W, h)))
+
+    total_h = GAP + sum(im.height + GAP for im in strips)
+    canvas = Image.new("RGB", (GRID_W, total_h), (0xCC, 0xCC, 0xCC))
+    y = GAP
+    for im in strips:
+        canvas.paste(im, (0, y))
+        y += im.height + GAP
+    canvas.save(L2CC_GRID_PATH, "PNG", optimize=True)
+    print(f"Saved {L2CC_GRID_PATH.relative_to(REPO_ROOT)}")
+
+
+def run_L2_compound_classify_testbed(only: list[str] | None = None) -> int:
+    fixtures = sorted(FIXTURES.glob("*.png"))
+    if only:
+        wanted = set(only)
+        fixtures = [p for p in fixtures if p.stem in wanted]
+        if not fixtures:
+            avail = ", ".join(sorted(p.stem for p in FIXTURES.glob("*.png")))
+            print(f"error: --only matched no fixtures. available: {avail}")
+            return 2
+    if not fixtures:
+        print(f"error: no PNG fixtures found under {FIXTURES.relative_to(REPO_ROOT)}")
+        return 2
+
+    L2CC_DIR.mkdir(parents=True, exist_ok=True)
+    _setup_run(fixtures)
+    with _pool(len(fixtures)) as pool:
+        results = list(pool.imap_unordered(_worker_L2_compound_classify, fixtures))
+    results.sort(key=lambda r: r.path.name)
+
+    n = len(results)
+    passed = sum(1 for r in results if r.error is None)
+    failures = [r for r in results if r.error is not None]
+    total_misses = sum(r.n_misses for r in results if r.error is None)
+    total_compound = sum(r.n_compound for r in results if r.error is None)
+    total_defer = sum(r.n_defer for r in results if r.error is None)
+    total_ring = sum(r.n_global_ring for r in results if r.error is None)
+    sum_iou = sum(r.sum_iou for r in results if r.error is None)
+    mean_iou = sum_iou / total_compound if total_compound else 0.0
+
+    print(f"{passed}/{n} fixtures processed; {total_misses} L1 misses total")
+    print(f"  compounds={total_compound} (global_ring={total_ring})  defers={total_defer}  "
+          f"mean compound iou={mean_iou:.3f}")
+    if failures:
+        print(f"Failures ({len(failures)}):")
+        for r in failures:
+            print(f"  {r.path.name}: {r.error}")
+
+    _compose_L2_compound_classify_grid(results)
+    return 0 if not failures else 1
+
+
+# ─── bench harness ────────────────────────────────────────────────────
+
+
+WORKER_BY_STAGE: dict = {
+    "categorize": _worker_categorize,
+    "preprocess": _worker_preprocess,
+    "align":      _worker_align,
+    "segment_prim_classify": _worker_segment_prim_classify,
+    "L2_compound_classify": _worker_L2_compound_classify,
+}
+
+
+def run_bench(
+    stage: str | None = None,
+    serial: bool = False,
+    label: str | None = None,
+) -> int:
+    """Benchmark the implemented testbed stages end-to-end and emit a JSON
+    report under .cache/bench/. Use as the H1 baseline before / after any
+    perf change.
+
+    stage:  one of WORKER_BY_STAGE keys, or None to run all of them.
+    serial: run in the master process, letting BLAS use multiple threads.
+            Default forks the same pool testbed uses.
+    label:  free-form tag appended to the JSON filename.
+    """
+    fixtures = sorted(FIXTURES.glob("*.png"))
+    if not fixtures:
+        print(f"error: no PNG fixtures found under {FIXTURES.relative_to(REPO_ROOT)}")
+        return 2
+
+    if stage is None:
+        stages_to_run = list(WORKER_BY_STAGE.keys())
+    else:
+        if stage not in WORKER_BY_STAGE:
+            print(
+                f"error: bench stage {stage!r} not in {sorted(WORKER_BY_STAGE)}",
+                file=sys.stderr,
+            )
+            return 2
+        stages_to_run = [stage]
+
+    timings: dict[str, dict[str, float]] = {}
+
+    t0 = time.perf_counter()
+    _prewarm_fixtures(fixtures)
+    decode_ms = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
+    prewarm(fixtures, _PREWARM_STAGES)
+    prewarm_ms = (time.perf_counter() - t0) * 1000
+
+    timings["_master"] = {
+        "decode_ms": decode_ms,
+        "cache_prewarm_ms": prewarm_ms,
+    }
+
+    for s in stages_to_run:
+        t0 = time.perf_counter()
+        if serial:
+            for p in fixtures:
+                WORKER_BY_STAGE[s](p)
+        else:
+            with _pool(len(fixtures)) as pool:
+                list(pool.imap_unordered(WORKER_BY_STAGE[s], fixtures))
+        wall_ms = (time.perf_counter() - t0) * 1000
+        timings[s] = {
+            "wall_ms": wall_ms,
+            "per_fixture_ms": wall_ms / len(fixtures),
+        }
+
+    sha = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    slug = f"{sha or 'nosha'}-{ts}"
+    if label:
+        slug += f"-{label}"
+    out_path = REPO_ROOT / ".cache" / "bench" / f"{slug}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps({
+        "sha": sha,
+        "ts": ts,
+        "serial": serial,
+        "label": label,
+        "n_fixtures": len(fixtures),
+        "stages": stages_to_run,
+        "timings_ms": timings,
+    }, indent=2))
+
+    print(f"bench  sha={sha or '?'}  serial={serial}  n={len(fixtures)}")
+    m = timings["_master"]
+    print(f"  {'_master.decode':>20s}  {m['decode_ms']:8.1f} ms")
+    print(f"  {'_master.prewarm':>20s}  {m['cache_prewarm_ms']:8.1f} ms")
+    for s in stages_to_run:
+        t = timings[s]
+        print(
+            f"  {s:>20s}  wall={t['wall_ms']:8.1f} ms  "
+            f"per_fixture={t['per_fixture_ms']:7.2f} ms"
+        )
+    print(f"saved {out_path.relative_to(REPO_ROOT)}")
+    return 0
