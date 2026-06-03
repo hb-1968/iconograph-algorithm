@@ -34,23 +34,19 @@ from iconograph.application.compress import (
     Circle,
     Classified,
     Ellipse,
+    Feature,
+    FeatureSegmentation,
     L1Miss,
     Rectangle,
     SegmentClassification,
     Triangle,
     align,
+    draw_feature_overlay,
     draw_overlay,
+    segment_features,
     segment_prim_classify,
 )
 from iconograph.application.preprocess import preprocess
-from iconograph.application.compress.L2_compound_classify import (
-    ACCEPT_IOU as L2_ACCEPT_IOU,
-    L2Compound,
-    L2Defer,
-    L2_compound_classify,
-    _offset_part,
-    render_compound,
-)
 from iconograph.cache import cached, prewarm
 
 ROUTING_LABELS = ("standard", "inverted", "burst")
@@ -80,8 +76,8 @@ ALIGN_DIR = REPO_ROOT / "testbed" / "align"
 ALIGN_GRID_PATH = ALIGN_DIR / "grid.png"
 SPC_DIR = REPO_ROOT / "testbed" / "segment_prim_classify"
 SPC_GRID_PATH = SPC_DIR / "grid.png"
-L2CC_DIR = REPO_ROOT / "testbed" / "L2_compound_classify"
-L2CC_GRID_PATH = L2CC_DIR / "grid.png"
+L2FS_DIR = REPO_ROOT / "testbed" / "L2_feature_segment"
+L2FS_GRID_PATH = L2FS_DIR / "grid.png"
 
 
 # ─── Parallel-fixture runner infrastructure ───────────────────────────
@@ -108,7 +104,9 @@ def _pool(n_items: int):
 # caller forgot to call _setup_run() before forking — that's a bug.
 _FIXTURE_RGBA: dict[str, np.ndarray] = {}
 
-_PREWARM_STAGES: tuple[str, ...] = ("categorize", "preprocess", "align", "segment_prim_classify")
+_PREWARM_STAGES: tuple[str, ...] = (
+    "categorize", "preprocess", "align", "segment_prim_classify", "L2_feature_segment",
+)
 
 
 def _prewarm_fixtures(fixtures: list[Path]) -> None:
@@ -141,6 +139,12 @@ def _do_align(pre_out: np.ndarray) -> np.ndarray:
 
 def _do_segment_prim_classify(aligned: np.ndarray) -> SegmentClassification:
     return segment_prim_classify(aligned)
+
+
+def _do_l2_feature_segment(
+    sc: SegmentClassification, cat: Categorization
+) -> FeatureSegmentation:
+    return segment_features(sc, cat)
 
 
 def _worker_categorize(p: Path) -> tuple[Path, Categorization]:
@@ -232,6 +236,37 @@ def _worker_segment_prim_classify(p: Path) -> "SegmentPrimClassifyResult":
         return r
     r = SegmentPrimClassifyResult(p, cat.routing, aligned, out, None)
     _write_segment_prim_classify_strip(r)
+    return r
+
+
+def _worker_l2_feature_segment(p: Path) -> "L2FeatureSegmentResult":
+    try:
+        cat = cached(p, "categorize", _do_categorize, p)
+    except Exception as e:
+        r = L2FeatureSegmentResult(p, None, None, None, None, f"categorize: {type(e).__name__}: {e}")
+        _write_l2_feature_segment_strip(r)
+        return r
+    try:
+        pre_out = cached(p, "preprocess", _do_preprocess, _FIXTURE_RGBA[p.stem], cat)
+        aligned = cached(p, "align", _do_align, pre_out)
+        sc = cached(p, "segment_prim_classify", _do_segment_prim_classify, aligned)
+    except Exception as e:
+        r = L2FeatureSegmentResult(p, cat.routing, None, None, None, f"upstream: {type(e).__name__}: {e}")
+        _write_l2_feature_segment_strip(r)
+        return r
+    try:
+        out = cached(p, "L2_feature_segment", _do_l2_feature_segment, sc, cat)
+    except Exception as e:
+        r = L2FeatureSegmentResult(p, cat.routing, aligned, sc, None, f"L2_feature_segment: {type(e).__name__}: {e}")
+        _write_l2_feature_segment_strip(r)
+        return r
+    contract_err = _check_l2_feature_segment_contract(out)
+    if contract_err is not None:
+        r = L2FeatureSegmentResult(p, cat.routing, aligned, sc, None, contract_err)
+        _write_l2_feature_segment_strip(r)
+        return r
+    r = L2FeatureSegmentResult(p, cat.routing, aligned, sc, out, None)
+    _write_l2_feature_segment_strip(r)
     return r
 
 
@@ -1327,230 +1362,247 @@ def _compose_segment_prim_classify_grid(
     print(f"Saved {SPC_GRID_PATH.relative_to(REPO_ROOT)}")
 
 
-# ─── Stage 3 L2 L2_compound_classify testbed ──────────────────────────
-#
-# Runs the L2 router/engine (greedy union + intelligent hole-negation + global-
-# ring collapse) and renders its OUTPUT. Output goes to testbed/L2_compound_
-# classify/: one strip per fixture, a row per emitted L2 segment (compound or
-# defer) — aligned crop | target mask | reconstruction — labelled with structure
-# (local / global-ring), IoU, add/sub part counts, and OK/defer. A global-ring
-# group is one row over its combined bbox. Classified pass-throughs and zero-miss
-# fixtures are skipped. Greedy won the H7 weigh, so a single result column.
-
-
-@dataclass
-class _L2View:
-    crop: np.ndarray              # (h, w, 3) RGB — aligned pixels under the segment
-    target: np.ndarray            # (h, w) uint8 {0,255} — binarized crop
-    recon: np.ndarray             # (h, w, 3) RGB — reconstruction (or deferred mask)
-    label: str
-    ok: bool
+# ─── Stage 3 L2 feature_segment testbed ───────────────────────────────
 
 
 @dataclass(frozen=True)
-class L2CompoundResult:
+class L2FeatureSegmentResult:
     path: Path
     routing: Literal["standard", "inverted", "burst"] | None
-    n_misses: int
-    n_compound: int
-    n_defer: int
-    n_global_ring: int
-    sum_iou: float                # over accepted compounds
+    aligned_input: np.ndarray | None
+    l1_output: SegmentClassification | None
+    output: FeatureSegmentation | None
     error: str | None
 
 
-def _l2_mask_to_rgb(mask: np.ndarray) -> np.ndarray:
-    rgb = np.full((mask.shape[0], mask.shape[1], 3), 255, dtype=np.uint8)
-    rgb[mask > 0] = (60, 60, 60)
-    return rgb
+def _l2_kind_counts(out: FeatureSegmentation) -> dict[str, int]:
+    kc = {"local": 0, "global": 0, "defer": 0}
+    for s in out.segments:
+        if isinstance(s, Feature):
+            kc[s.kind] += 1
+    return kc
 
 
-def _l2_binarize(crop_rgb: np.ndarray) -> np.ndarray:
-    """Reconstruct the L1 foreground target from an aligned crop (matches L1's
-    WHITE_THRESH=250 rule)."""
-    return (np.any(crop_rgb < 250, axis=2).astype(np.uint8)) * 255
+def _l2_summary(out: FeatureSegmentation) -> str:
+    """`L3 G4 D0  •  half_circle, annular_sector×3` — kind counts + hint tally."""
+    kc = _l2_kind_counts(out)
+    hints: dict[str, int] = {}
+    for s in out.segments:
+        if isinstance(s, Feature):
+            h = s.shape_hint or "—"
+            hints[h] = hints.get(h, 0) + 1
+    hint_str = ", ".join(f"{h}×{c}" if c > 1 else h for h, c in sorted(hints.items()))
+    return f"L{kc['local']} G{kc['global']} D{kc['defer']}  •  {hint_str}"
 
 
-def _l2_panel_label(
-    draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int,
-    text: str, font: ImageFont.FreeTypeFont, fill: tuple[int, int, int],
-) -> None:
-    draw.rectangle((x, y, x + w, y + h), fill=(0xF6, 0xF6, 0xF6))
-    _draw_centered_text(draw, x, y, w, h, text, font, fill)
-
-
-def _worker_L2_compound_classify(p: Path) -> "L2CompoundResult":
-    try:
-        cat = cached(p, "categorize", _do_categorize, p)
-    except Exception as e:
-        return L2CompoundResult(p, None, 0, 0, 0, 0, 0.0, f"categorize: {type(e).__name__}: {e}")
-    try:
-        pre = cached(p, "preprocess", _do_preprocess, _FIXTURE_RGBA[p.stem], cat)
-    except Exception as e:
-        return L2CompoundResult(p, cat.routing, 0, 0, 0, 0, 0.0, f"preprocess: {type(e).__name__}: {e}")
-    try:
-        aligned = cached(p, "align", _do_align, pre)
-    except Exception as e:
-        return L2CompoundResult(p, cat.routing, 0, 0, 0, 0, 0.0, f"align: {type(e).__name__}: {e}")
-    try:
-        sc = cached(p, "segment_prim_classify", _do_segment_prim_classify, aligned)
-    except Exception as e:
-        return L2CompoundResult(p, cat.routing, 0, 0, 0, 0, 0.0, f"segment_prim_classify: {type(e).__name__}: {e}")
-
-    try:
-        cc = L2_compound_classify(sc, cat)
-        n_misses = sum(1 for s in sc.segments if isinstance(s, L1Miss))
-        views: list[_L2View] = []
-        n_compound = n_defer = n_ring = 0
-        sum_iou = 0.0
-        for seg in cc.segments:
-            if isinstance(seg, L2Compound):
-                x, y, w, h = seg.bbox
-                crop = aligned[y:y + h, x:x + w].copy()
-                local = tuple(_offset_part(part, -x, -y) for part in seg.parts)
-                recon = render_compound(local, h, w, color=tuple(int(c) for c in seg.color_rgb))
-                n_sub = sum(1 for part in seg.parts if part.op == "subtract")
-                n_add = len(seg.parts) - n_sub
-                label = f"{seg.structure}  iou={seg.iou:.2f}  {n_add}+{n_sub}p  OK"
-                views.append(_L2View(crop, _l2_binarize(crop), recon, label, True))
-                n_compound += 1
-                sum_iou += seg.iou
-                if seg.structure == "global_ring":
-                    n_ring += 1
-            elif isinstance(seg, L2Defer):
-                x, y, w, h = seg.bbox
-                crop = aligned[y:y + h, x:x + w].copy()
-                views.append(_L2View(
-                    crop, _l2_binarize(crop), _l2_mask_to_rgb(seg.mask),
-                    f"defer ({seg.reason})", False,
-                ))
-                n_defer += 1
-        if views:
-            _write_L2_compound_classify_strip(p, cat.routing, views)
-        return L2CompoundResult(p, cat.routing, n_misses, n_compound, n_defer, n_ring, sum_iou, None)
-    except Exception as e:
-        return L2CompoundResult(p, cat.routing, 0, 0, 0, 0, 0.0, f"L2_compound_classify: {type(e).__name__}: {e}")
-
-
-def _write_L2_compound_classify_strip(
-    p: Path,
-    routing: Literal["standard", "inverted", "burst"] | None,
-    views: list["_L2View"],
-) -> None:
-    PANEL = 200
-    LABEL_H = 22
-    HEADER_H = 30
-    COLS = 3
-    row_h = PANEL + LABEL_H
-    total_w = PANEL * COLS
-    total_h = HEADER_H + row_h * len(views)
-
-    canvas = Image.new("RGB", (total_w, total_h), (255, 255, 255))
-    draw = ImageDraw.Draw(canvas)
-    f = _load_font(13)
-    fs = _load_font(12)
-
-    draw.rectangle((0, 0, total_w, HEADER_H), fill=(0xF0, 0xF0, 0xF0))
-    text_x = 8
-    if routing is not None:
-        cw, ch = 70, 18
-        cy = (HEADER_H - ch) // 2
-        draw.rectangle((8, cy, 8 + cw, cy + ch), fill=ROUTING_COLORS[routing])
-        _draw_centered_text(draw, 8, cy, cw, ch, routing, fs, (255, 255, 255))
-        text_x = 8 + cw + 10
-    draw.text(
-        (text_x, (HEADER_H - 14) // 2),
-        f"{p.name}  •  {len(views)} L2 segment(s)  •  OK = iou >= {L2_ACCEPT_IOU:.2f}",
-        font=f, fill=(0, 0, 0),
-    )
-
-    for i, v in enumerate(views):
-        y0 = HEADER_H + i * row_h
-        draw.line([(0, y0), (total_w, y0)], fill=(0xDD, 0xDD, 0xDD), width=1)
-
-        canvas.paste(_fit_to_panel(Image.fromarray(v.crop, "RGB"), PANEL), (0, y0))
-        _l2_panel_label(draw, 0, y0 + PANEL, PANEL, LABEL_H, "aligned crop", fs, (0, 0, 0))
-
-        canvas.paste(_fit_to_panel(Image.fromarray(_l2_mask_to_rgb(v.target), "RGB"), PANEL), (PANEL, y0))
-        _l2_panel_label(draw, PANEL, y0 + PANEL, PANEL, LABEL_H, "target mask", fs, (0, 0, 0))
-
-        canvas.paste(_fit_to_panel(Image.fromarray(v.recon, "RGB"), PANEL), (2 * PANEL, y0))
-        _l2_panel_label(
-            draw, 2 * PANEL, y0 + PANEL, PANEL, LABEL_H, v.label,
-            fs, MATCH if v.ok else MISMATCH,
-        )
-
-    canvas.save(L2CC_DIR / p.name, "PNG", optimize=True)
-
-
-def _compose_L2_compound_classify_grid(results: list["L2CompoundResult"]) -> None:
-    shown = [r for r in results if r.error is None and (r.n_compound + r.n_defer) > 0]
-    shown.sort(key=lambda r: r.path.name)
-    L2CC_DIR.mkdir(parents=True, exist_ok=True)
-    if not shown:
-        print("No L2 segments across the fixture set — nothing to compose.")
-        return
-
-    GRID_W = 620
-    GAP = 6
-    strips: list[Image.Image] = []
-    for r in shown:
-        sp = L2CC_DIR / r.path.name
-        if not sp.exists():
-            continue
-        im = Image.open(sp).convert("RGB")
-        h = max(1, int(im.height * (GRID_W / im.width)))
-        strips.append(im.resize((GRID_W, h)))
-
-    total_h = GAP + sum(im.height + GAP for im in strips)
-    canvas = Image.new("RGB", (GRID_W, total_h), (0xCC, 0xCC, 0xCC))
-    y = GAP
-    for im in strips:
-        canvas.paste(im, (0, y))
-        y += im.height + GAP
-    canvas.save(L2CC_GRID_PATH, "PNG", optimize=True)
-    print(f"Saved {L2CC_GRID_PATH.relative_to(REPO_ROOT)}")
-
-
-def run_L2_compound_classify_testbed(only: list[str] | None = None) -> int:
+def run_l2_feature_segment_testbed() -> int:
     fixtures = sorted(FIXTURES.glob("*.png"))
-    if only:
-        wanted = set(only)
-        fixtures = [p for p in fixtures if p.stem in wanted]
-        if not fixtures:
-            avail = ", ".join(sorted(p.stem for p in FIXTURES.glob("*.png")))
-            print(f"error: --only matched no fixtures. available: {avail}")
-            return 2
     if not fixtures:
         print(f"error: no PNG fixtures found under {FIXTURES.relative_to(REPO_ROOT)}")
         return 2
 
-    L2CC_DIR.mkdir(parents=True, exist_ok=True)
+    L2FS_DIR.mkdir(parents=True, exist_ok=True)
     _setup_run(fixtures)
     with _pool(len(fixtures)) as pool:
-        results = list(pool.imap_unordered(_worker_L2_compound_classify, fixtures))
+        results = list(pool.imap_unordered(_worker_l2_feature_segment, fixtures))
     results.sort(key=lambda r: r.path.name)
 
     n = len(results)
+    hist = {lbl: sum(1 for r in results if r.routing == lbl) for lbl in ROUTING_LABELS}
     passed = sum(1 for r in results if r.error is None)
     failures = [r for r in results if r.error is not None]
-    total_misses = sum(r.n_misses for r in results if r.error is None)
-    total_compound = sum(r.n_compound for r in results if r.error is None)
-    total_defer = sum(r.n_defer for r in results if r.error is None)
-    total_ring = sum(r.n_global_ring for r in results if r.error is None)
-    sum_iou = sum(r.sum_iou for r in results if r.error is None)
-    mean_iou = sum_iou / total_compound if total_compound else 0.0
 
-    print(f"{passed}/{n} fixtures processed; {total_misses} L1 misses total")
-    print(f"  compounds={total_compound} (global_ring={total_ring})  defers={total_defer}  "
-          f"mean compound iou={mean_iou:.3f}")
+    totals = {"local": 0, "global": 0, "defer": 0}
+    for r in results:
+        if r.output is None:
+            continue
+        for k, v in _l2_kind_counts(r.output).items():
+            totals[k] += v
+
+    print("Routing histogram: " + " ".join(f"{lbl}={hist[lbl]}" for lbl in ROUTING_LABELS))
+    print(f"{passed}/{n} fixtures passed (no exception, contract OK)")
+    print(f"Total features: local={totals['local']} global={totals['global']} defer={totals['defer']}")
     if failures:
         print(f"Failures ({len(failures)}):")
         for r in failures:
             print(f"  {r.path.name}: {r.error}")
 
-    _compose_L2_compound_classify_grid(results)
+    _compose_l2_feature_segment_grid(results, hist, totals, passed, n)
     return 0 if not failures else 1
+
+
+def _check_l2_feature_segment_contract(out: object) -> str | None:
+    if not isinstance(out, FeatureSegmentation):
+        return f"output type {type(out).__name__}, expected FeatureSegmentation"
+    if not isinstance(out.segments, list):
+        return f"segments type {type(out.segments).__name__}, expected list"
+    for i, seg in enumerate(out.segments):
+        if not isinstance(seg, (Classified, Feature)):
+            return f"segments[{i}] type {type(seg).__name__}, expected Classified|Feature"
+        if isinstance(seg, Feature):
+            if not isinstance(seg.mask, np.ndarray) or seg.mask.dtype != np.uint8:
+                return f"segments[{i}].mask dtype {getattr(seg.mask, 'dtype', None)}, expected uint8 ndarray"
+            if seg.kind not in ("local", "global", "defer"):
+                return f"segments[{i}].kind {seg.kind!r}, expected local|global|defer"
+    return None
+
+
+def _write_l2_feature_segment_strip(r: L2FeatureSegmentResult) -> None:
+    """Per-fixture H7 strip: aligned (L0) | L1 primitives | L2 features + caption."""
+    PANEL = 512
+    CAPTION_H = 36
+    total_w = PANEL * 3
+    total_h = PANEL + CAPTION_H
+
+    canvas = Image.new("RGB", (total_w, total_h), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    f_big = _load_font(48)
+
+    if r.aligned_input is not None:
+        canvas.paste(_fit_to_panel(Image.fromarray(r.aligned_input, "RGB"), PANEL), (0, 0))
+    else:
+        _draw_centered_text(draw, 0, 0, PANEL, PANEL, "—", f_big, (0xAA, 0xAA, 0xAA))
+
+    if r.l1_output is not None and r.aligned_input is not None:
+        l1_arr = draw_overlay(r.aligned_input, r.l1_output)
+        canvas.paste(_fit_to_panel(Image.fromarray(l1_arr, "RGB"), PANEL), (PANEL, 0))
+    else:
+        _draw_centered_text(draw, PANEL, 0, PANEL, PANEL, "—", f_big, (0xAA, 0xAA, 0xAA))
+
+    if r.output is not None and r.aligned_input is not None:
+        l2_arr = draw_feature_overlay(r.aligned_input, r.output)
+        canvas.paste(_fit_to_panel(Image.fromarray(l2_arr, "RGB"), PANEL), (PANEL * 2, 0))
+    else:
+        _draw_centered_text(draw, PANEL * 2, 0, PANEL, PANEL, "FAIL", f_big, MISMATCH)
+
+    for x in (PANEL, PANEL * 2):
+        draw.line([(x, 0), (x, PANEL)], fill=(0xCC, 0xCC, 0xCC), width=1)
+
+    draw.rectangle((0, PANEL, total_w, total_h), fill=(0xF4, 0xF4, 0xF4))
+    f = _load_font(13)
+    if r.routing is not None:
+        chip_w, chip_h = 80, 20
+        chip_y = PANEL + (CAPTION_H - chip_h) // 2
+        draw.rectangle((8, chip_y, 8 + chip_w, chip_y + chip_h), fill=ROUTING_COLORS[r.routing])
+        _draw_centered_text(draw, 8, chip_y, chip_w, chip_h, r.routing, f, (255, 255, 255))
+        text_x = 8 + chip_w + 12
+    else:
+        text_x = 8
+    if r.output is not None:
+        summary = "  •  " + _l2_summary(r.output)
+    elif r.error:
+        summary = f"  •  ERROR: {r.error}"
+    else:
+        summary = ""
+    caption = r.path.name + summary
+    draw.text((text_x, PANEL + (CAPTION_H - 14) // 2), caption, font=f,
+              fill=(0, 0, 0) if r.error is None else MISMATCH)
+
+    canvas.save(L2FS_DIR / r.path.name, "PNG", optimize=True)
+
+
+def _compose_l2_feature_segment_grid(
+    results: list[L2FeatureSegmentResult],
+    hist: dict[str, int],
+    totals: dict[str, int],
+    passed: int,
+    n: int,
+) -> None:
+    THUMB = 96
+    OUT_W = 128
+    SUM_W = 150
+    CHECK_W = 36
+    NAME_W = 160
+    PAD = 8
+    ROW_H = THUMB
+
+    # thumb | name | L1 overlay | L2 overlay | L/G/D summary | check
+    cols = [THUMB, NAME_W, OUT_W, OUT_W, SUM_W, CHECK_W]
+    col_x = [PAD]
+    for w in cols[:-1]:
+        col_x.append(col_x[-1] + w + PAD)
+    total_w = col_x[-1] + cols[-1] + PAD
+
+    header_h = 120
+    body_h = (ROW_H + PAD) * len(results) + PAD
+    total_h = header_h + body_h
+
+    canvas = Image.new("RGB", (total_w, total_h), (0xF4, 0xF4, 0xF4))
+    draw = ImageDraw.Draw(canvas)
+    f_title = _load_font(18)
+    f_body = _load_font(13)
+    f_small = _load_font(11)
+    f_big = _load_font(22)
+    f_fail = _load_font(14)
+
+    draw.text((PAD, PAD), "Stage 3 L2 feature_segment — testbed grid", font=f_title, fill=(0, 0, 0))
+    hist_text = " ".join(f"{lbl}={hist[lbl]}" for lbl in ROUTING_LABELS)
+    draw.text((PAD, PAD + 28), f"Routing histogram: {hist_text}", font=f_body, fill=(0, 0, 0))
+    pass_color = MATCH if passed == n else MISMATCH
+    draw.text((PAD, PAD + 50), f"{passed}/{n} fixtures passed (no exception, contract OK)",
+              font=f_body, fill=pass_color)
+    draw.text(
+        (PAD, PAD + 72),
+        f"Total features: local={totals['local']}  global={totals['global']}  defer={totals['defer']}"
+        "   (columns: L1 primitives → L2 feature split)",
+        font=f_body, fill=(0, 0, 0),
+    )
+
+    for r_idx, r in enumerate(results):
+        y = header_h + r_idx * (ROW_H + PAD)
+
+        draw.rectangle((col_x[0], y, col_x[0] + THUMB, y + ROW_H),
+                       fill=(255, 255, 255), outline=(0xAA, 0xAA, 0xAA))
+        if r.aligned_input is not None:
+            thumb = Image.fromarray(r.aligned_input, "RGB")
+            thumb.thumbnail((THUMB - 6, ROW_H - 6))
+            canvas.paste(thumb, (col_x[0] + (THUMB - thumb.width) // 2,
+                                 y + (ROW_H - thumb.height) // 2))
+
+        draw.rectangle((col_x[1], y, col_x[1] + NAME_W, y + ROW_H), fill=(0xFA, 0xFA, 0xFA))
+        draw.text((col_x[1] + 6, y + ROW_H // 2 - 8), r.path.name, font=f_small, fill=(0, 0, 0))
+
+        # L1 primitive overlay
+        draw.rectangle((col_x[2], y, col_x[2] + OUT_W, y + ROW_H),
+                       fill=(255, 255, 255), outline=(0xAA, 0xAA, 0xAA))
+        if r.l1_output is not None and r.aligned_input is not None:
+            l1_img = Image.fromarray(draw_overlay(r.aligned_input, r.l1_output), "RGB")
+            l1_img.thumbnail((OUT_W - 6, ROW_H - 6))
+            canvas.paste(l1_img, (col_x[2] + (OUT_W - l1_img.width) // 2,
+                                  y + (ROW_H - l1_img.height) // 2))
+        else:
+            _draw_centered_text(draw, col_x[2], y, OUT_W, ROW_H, "—", f_fail, (0xAA, 0xAA, 0xAA))
+
+        # L2 feature overlay
+        draw.rectangle((col_x[3], y, col_x[3] + OUT_W, y + ROW_H),
+                       fill=(255, 255, 255), outline=(0xAA, 0xAA, 0xAA))
+        if r.output is not None and r.aligned_input is not None:
+            l2_img = Image.fromarray(draw_feature_overlay(r.aligned_input, r.output), "RGB")
+            l2_img.thumbnail((OUT_W - 6, ROW_H - 6))
+            canvas.paste(l2_img, (col_x[3] + (OUT_W - l2_img.width) // 2,
+                                  y + (ROW_H - l2_img.height) // 2))
+        else:
+            _draw_centered_text(draw, col_x[3], y, OUT_W, ROW_H, "FAIL", f_fail, MISMATCH)
+
+        # L/G/D summary band
+        draw.rectangle((col_x[4], y, col_x[4] + SUM_W, y + ROW_H), fill=(0xFA, 0xFA, 0xFA))
+        if r.output is not None:
+            kc = _l2_kind_counts(r.output)
+            _draw_centered_text(draw, col_x[4], y, SUM_W, ROW_H,
+                                f"L{kc['local']} G{kc['global']} D{kc['defer']}", f_body, (0, 0, 0))
+        else:
+            _draw_centered_text(draw, col_x[4], y, SUM_W, ROW_H, "n/a", f_body, (0x9E, 0x9E, 0x9E))
+
+        ok = r.error is None
+        draw.rectangle((col_x[5], y, col_x[5] + CHECK_W, y + ROW_H), fill=(MATCH if ok else MISMATCH))
+        mark = "✓" if ok else "✗"
+        bbox = draw.textbbox((0, 0), mark, font=f_big)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text((col_x[5] + (CHECK_W - tw) // 2, y + (ROW_H - th) // 2 - 2),
+                  mark, font=f_big, fill=(255, 255, 255))
+
+    canvas.save(L2FS_GRID_PATH, "PNG", optimize=True)
+    print(f"Saved {L2FS_GRID_PATH.relative_to(REPO_ROOT)}")
 
 
 # ─── bench harness ────────────────────────────────────────────────────
@@ -1561,7 +1613,7 @@ WORKER_BY_STAGE: dict = {
     "preprocess": _worker_preprocess,
     "align":      _worker_align,
     "segment_prim_classify": _worker_segment_prim_classify,
-    "L2_compound_classify": _worker_L2_compound_classify,
+    "L2_feature_segment": _worker_l2_feature_segment,
 }
 
 

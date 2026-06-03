@@ -79,12 +79,6 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="VARIANT",
         help="render multiple proposed methodologies side-by-side",
     )
-    p_testbed.add_argument(
-        "--only",
-        nargs="+",
-        metavar="FIXTURE",
-        help="restrict to fixtures by stem (filename without .png)",
-    )
 
     return parser
 
@@ -107,9 +101,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "testbed" and args.stage == "segment_prim_classify":
         from iconograph.testbed import run_segment_prim_classify_testbed
         return run_segment_prim_classify_testbed()
-    if args.command == "testbed" and args.stage == "L2_compound_classify":
-        from iconograph.testbed import run_L2_compound_classify_testbed
-        return run_L2_compound_classify_testbed(only=args.only)
+    if args.command == "testbed" and args.stage == "L2_feature_segment":
+        from iconograph.testbed import run_l2_feature_segment_testbed
+        return run_l2_feature_segment_testbed()
     return _not_implemented(args.command)
 
 

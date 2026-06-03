@@ -3,14 +3,14 @@ CC as one of {Circle, Rectangle, Triangle, Ellipse} or pass it to L2 as an
 L1Miss.
 
 Pipeline position:
-    align → segment_prim_classify (THIS) → L2 classify (TBD)
+    align → segment_prim_classify (THIS) → L2 feature-segmentation (TBD)
 
 Input is align()'s (S, S, 3) uint8 RGB on a white background, axis-aligned.
 The output is a SegmentClassification holding the binarized mask, the CC
 label image, and a per-CC list of Classified | L1Miss. CCs classify when
 one of the four primitive fits clears IOU_ACCEPT; everything else is L1Miss
-with its bbox-cropped mask retained for L2 to decompose via unions of
-primitives (negates deferred to L3).
+with its bbox-cropped mask retained for L2 to segment into near-fittable
+sub-features (shape fitting deferred to a later layer).
 
 Segmentation rule: strictly disjoint shapes — if two visually distinct
 shapes share a single foreground pixel they are one CC and they become
@@ -36,6 +36,7 @@ from iconograph.application.compress.common import (
     _fit_ellipse,
     _fit_rectangle,
     _fit_triangle,
+    _iou_bool,
     iou_analytical,
 )
 
@@ -89,12 +90,7 @@ def _axis_symmetry(roi: np.ndarray) -> float:
     rb = roi.astype(bool)
     hf = np.flip(rb, axis=1)
     vf = np.flip(rb, axis=0)
-    def _bool_iou(a: np.ndarray, b: np.ndarray) -> float:
-        u = int(np.logical_or(a, b).sum())
-        if u == 0:
-            return 0.0
-        return int(np.logical_and(a, b).sum()) / u
-    return min(_bool_iou(rb, hf), _bool_iou(rb, vf))
+    return min(_iou_bool(rb, hf), _iou_bool(rb, vf))
 
 
 def segment_prim_classify(img: np.ndarray) -> SegmentClassification:
