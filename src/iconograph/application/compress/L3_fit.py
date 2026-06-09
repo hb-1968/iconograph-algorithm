@@ -49,6 +49,7 @@ from iconograph.application.compress.common import (
     Rectangle,
     RotatedEllipse,
     RotatedRectangle,
+    RoundedRectangle,
     Triangle,
     _cand_inscribed_circle,
     _compound_iou,
@@ -187,6 +188,9 @@ def _prim_key(p: Primitive) -> tuple:
         return (t, p.x, p.y, p.w, p.h)
     if isinstance(p, RotatedRectangle):
         return (t, round(p.cx, 2), round(p.cy, 2), round(p.w, 2), round(p.h, 2), round(p.angle, 2))
+    if isinstance(p, RoundedRectangle):                                   # defensive: L3 never emits one today
+        return (t, round(p.cx, 2), round(p.cy, 2), round(p.w, 2), round(p.h, 2),
+                round(p.angle, 2), round(p.corner_radius, 2))
     return (t, *(round(v, 2) for xy in (p.v1, p.v2, p.v3) for v in xy))   # Triangle
 
 

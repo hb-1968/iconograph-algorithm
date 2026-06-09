@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import multiprocessing as mp
 import os
+import pickle
 import re
 import subprocess
 import sys
@@ -46,8 +47,17 @@ from iconograph.application.compress import (
     segment_features,
     segment_prim_classify,
 )
+from iconograph.application.compress.common import _min_feature_px
+from iconograph.application.compress.decompose import (
+    ADEQUATE_COV,
+    Decomposition,
+    decompose_shape,
+    draw_decomposition_overlay,
+)
+from iconograph.application.compress.contour_parse import draw_shape_overlay, parse_shape
+from iconograph.application.compress.L3_fit import draw_fit_overlay, fit_features
 from iconograph.application.preprocess import preprocess
-from iconograph.cache import cached, prewarm
+from iconograph.cache import CACHE_ROOT, cached, prewarm
 
 ROUTING_LABELS = ("standard", "inverted", "burst")
 
@@ -64,6 +74,7 @@ PRECEDENCE_COLORS = {
 }
 MATCH = (0x2E, 0x7D, 0x32)
 MISMATCH = (0xC6, 0x28, 0x28)
+AMBER = (0xF5, 0xA6, 0x23)   # marginal-coverage badge (between MATCH and MISMATCH)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = REPO_ROOT / "fixtures"
@@ -78,6 +89,8 @@ SPC_DIR = REPO_ROOT / "testbed" / "segment_prim_classify"
 SPC_GRID_PATH = SPC_DIR / "grid.png"
 L2FS_DIR = REPO_ROOT / "testbed" / "L2_feature_segment"
 L2FS_GRID_PATH = L2FS_DIR / "grid.png"
+DECOMPOSE_DIR = REPO_ROOT / "testbed" / "decompose"
+DECOMPOSE_GRID_PATH = DECOMPOSE_DIR / "grid.png"
 
 
 # ─── Parallel-fixture runner infrastructure ───────────────────────────
@@ -1603,6 +1616,331 @@ def _compose_l2_feature_segment_grid(
 
     canvas.save(L2FS_GRID_PATH, "PNG", optimize=True)
     print(f"Saved {L2FS_GRID_PATH.relative_to(REPO_ROOT)}")
+
+
+# ─── Stage 3 D2 decompose — coverage testbed ──────────────────────────
+#
+# Scores the contour-driven decomposer against the EXISTING cached L2
+# output. It raw-reads .cache/stages/<stem>/{align,L2_feature_segment}.pkl
+# straight off disk — NOT via cached(), which keys on a hash of the whole
+# application/ tree and would treat a decompose-only edit as a code-version
+# bump, recomputing every upstream stage. Only decompose_shape runs here:
+# no upstream recompute, no L3 beam. Coverage is already computed inside
+# each Decomposition; this layer thresholds it into green/amber/red badges.
+
+
+# `--panels` mode: when True, _worker_decompose writes the 4-panel qualitative strip
+# [target | D1 contour | D2 decompose | old L3 beam] (the former `iconograph.d2_debug` view, folded
+# in here) instead of the 2-panel scorecard strip. Set in the master before the pool forks; workers
+# inherit it via fork copy-on-write (same mechanism as _FIXTURE_RGBA). The coverage grid is unaffected.
+_DECOMPOSE_PANELS = False
+
+
+def _panel_label(panel: np.ndarray, text: str) -> np.ndarray:
+    """White caption bar + text across the top of a panel (cv2; ported from d2_debug for --panels)."""
+    out = panel.copy()
+    cv2.rectangle(out, (0, 0), (out.shape[1] - 1, 20), (255, 255, 255), -1)
+    cv2.putText(out, text, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (20, 20, 20), 1, cv2.LINE_AA)
+    return out
+
+
+@dataclass(frozen=True)
+class DecomposeResult:
+    path: Path
+    aligned: np.ndarray | None
+    decomps: list[tuple[Decomposition, tuple[int, int]]] | None
+    per_feature: list[tuple[str, float, float]]   # (shape_hint, area_cov, boundary_cov) per Feature
+    mean_area: float
+    mean_bnd: float
+    n_adequate: int                               # features with area IoU ≥ ADEQUATE_COV
+    n_total: int
+    error: str | None
+
+
+def _cov_color(cov: float) -> tuple[int, int, int]:
+    """Area-IoU traffic light: green ≥ ADEQUATE_COV, amber ≥ 0.75, else red. Keys off the
+    imported ADEQUATE_COV so it tracks the decomposer's own adequacy gate."""
+    if cov >= ADEQUATE_COV:
+        return MATCH
+    if cov >= 0.75:
+        return AMBER
+    return MISMATCH
+
+
+def _bnd_color(bnd: float) -> tuple[int, int, int]:
+    """Boundary-IoU traffic light, on the boundary scale (Cheng IoU runs lower than area IoU):
+    green ≥ 0.60, amber ≥ 0.40, else red. Display-only thresholds — they colour the chip, they
+    do not gate the pipeline."""
+    if bnd >= 0.60:
+        return MATCH
+    if bnd >= 0.40:
+        return AMBER
+    return MISMATCH
+
+
+def _split_badge(draw: ImageDraw.ImageDraw, x: int, y: int, w: int, h: int,
+                 area: float, bnd: float, label: str, font: ImageFont.FreeTypeFont) -> None:
+    """A chip split TOP=area-coloured / BOTTOM=boundary-coloured with the label centred over both.
+    A false positive — high area, low boundary — reads green-over-red at a glance."""
+    mid = y + h // 2
+    draw.rectangle((x, y, x + w, mid), fill=_cov_color(area))
+    draw.rectangle((x, mid, x + w, y + h), fill=_bnd_color(bnd))
+    _draw_centered_text(draw, x, y, w, h, label, font, (255, 255, 255))
+
+
+def _load_decompose_inputs(p: Path) -> tuple[np.ndarray, FeatureSegmentation]:
+    """Raw-read the cached aligned image + L2 segmentation for one fixture.
+    Bypasses cached() on purpose (see module note). FileNotFoundError if the
+    upstream pkls are missing — surfaced to the user, never auto-recomputed."""
+    cdir = CACHE_ROOT / p.stem
+    aligned = pickle.loads((cdir / "align.pkl").read_bytes())
+    fs = pickle.loads((cdir / "L2_feature_segment.pkl").read_bytes())
+    return aligned, fs
+
+
+def _worker_decompose(p: Path) -> "DecomposeResult":
+    try:
+        aligned, fs = _load_decompose_inputs(p)
+    except FileNotFoundError:
+        r = DecomposeResult(p, None, None, [], 0.0, 0.0, 0, 0,
+                            "no cache — run `testbed L2_feature_segment` first")
+        return r
+    except Exception as e:  # noqa: BLE001 — report and continue, like the other workers
+        return DecomposeResult(p, None, None, [], 0.0, 0.0, 0, 0, f"load: {type(e).__name__}: {e}")
+
+    min_feat = _min_feature_px(int(fs.image_shape[0]))
+    decomps: list[tuple[Decomposition, tuple[int, int]]] = []
+    per_feature: list[tuple[str, float, float]] = []
+    for seg in fs.segments:
+        if not isinstance(seg, Feature):
+            continue
+        d = decompose_shape(
+            seg.mask, min_feat, seg.shape_hint,
+            ring=seg.ring_geom, bbox_xy=(seg.bbox[0], seg.bbox[1]),
+        )
+        decomps.append((d, (seg.bbox[0], seg.bbox[1])))
+        per_feature.append((seg.shape_hint or "·", d.coverage, d.boundary_cov))
+
+    n_total = len(per_feature)
+    n_adequate = sum(1 for _, a, _b in per_feature if a >= ADEQUATE_COV)   # adequacy is area-based
+    mean_area = sum(a for _, a, _b in per_feature) / n_total if n_total else 0.0
+    mean_bnd = sum(b for _, _a, b in per_feature) / n_total if n_total else 0.0
+    r = DecomposeResult(p, aligned, decomps, per_feature, mean_area, mean_bnd, n_adequate, n_total, None)
+    if _DECOMPOSE_PANELS:
+        _write_decompose_panels(r, fs)
+    else:
+        _write_decompose_strip(r)
+    return r
+
+
+def _write_decompose_strip(r: DecomposeResult) -> None:
+    """Per-fixture H7 strip: target (L0 aligned) | D2 decomposition overlay,
+    + a caption band with an aggregate badge and one chip per feature
+    (`hint area/boundary`), each split TOP=area / BOTTOM=boundary colour."""
+    PANEL = 512
+    CAPTION_H = 40
+    total_w = PANEL * 2
+    total_h = PANEL + CAPTION_H
+
+    canvas = Image.new("RGB", (total_w, total_h), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    f_big = _load_font(48)
+
+    if r.aligned is not None:
+        canvas.paste(_fit_to_panel(Image.fromarray(r.aligned, "RGB"), PANEL), (0, 0))
+        d2_arr = draw_decomposition_overlay(r.aligned, r.decomps or [])
+        canvas.paste(_fit_to_panel(Image.fromarray(d2_arr, "RGB"), PANEL), (PANEL, 0))
+    else:
+        _draw_centered_text(draw, 0, 0, PANEL, PANEL, "—", f_big, (0xAA, 0xAA, 0xAA))
+        _draw_centered_text(draw, PANEL, 0, PANEL, PANEL, "FAIL", f_big, MISMATCH)
+    draw.line([(PANEL, 0), (PANEL, PANEL)], fill=(0xCC, 0xCC, 0xCC), width=1)
+
+    draw.rectangle((0, PANEL, total_w, total_h), fill=(0xF4, 0xF4, 0xF4))
+    f = _load_font(13)
+    f_small = _load_font(11)
+    if r.error:
+        draw.text((8, PANEL + (CAPTION_H - 14) // 2),
+                  f"{r.path.name}  •  ERROR: {r.error}", font=f, fill=MISMATCH)
+        canvas.save(DECOMPOSE_DIR / r.path.name, "PNG", optimize=True)
+        return
+
+    badge_w, badge_h = 175, 26
+    badge_y = PANEL + (CAPTION_H - badge_h) // 2
+    _split_badge(draw, 8, badge_y, badge_w, badge_h, r.mean_area, r.mean_bnd,
+                 f"a{r.mean_area:.2f}/b{r.mean_bnd:.2f} {r.n_adequate}/{r.n_total}", f)
+
+    x = 8 + badge_w + 10
+    chip_h = 26
+    chip_y = PANEL + (CAPTION_H - chip_h) // 2
+    for i, (hint, area_cov, boundary_cov) in enumerate(r.per_feature):
+        label = f"{hint} {area_cov:.2f}/{boundary_cov:.2f}"   # area / boundary IoU
+        chip_w = draw.textbbox((0, 0), label, font=f_small)[2] + 12
+        if x + chip_w > total_w - 8:
+            # ran out of caption width — mark the omitted tail rather than drop it silently (H7)
+            _draw_centered_text(draw, x, chip_y, total_w - 8 - x, chip_h,
+                                f"+{r.n_total - i}", f_small, (0x55, 0x55, 0x55))
+            break
+        _split_badge(draw, x, chip_y, chip_w, chip_h, area_cov, boundary_cov, label, f_small)
+        x += chip_w + 6
+
+    canvas.save(DECOMPOSE_DIR / r.path.name, "PNG", optimize=True)
+
+
+def _write_decompose_panels(r: "DecomposeResult", fs: FeatureSegmentation) -> None:
+    """4-panel qualitative strip [target | D1 contour | D2 decompose | old L3 beam] — the former
+    `iconograph.d2_debug` view, folded into the formal testbed via --panels. Cache-only: raw-reads
+    categorize.pkl for the L3-beam panel; falls back to the scorecard strip if cat is absent."""
+    if r.aligned is None:
+        _write_decompose_strip(r)
+        return
+    try:
+        cat = pickle.loads((CACHE_ROOT / r.path.stem / "categorize.pkl").read_bytes())
+    except FileNotFoundError:
+        _write_decompose_strip(r)
+        return
+    shapes = [(parse_shape(seg.mask), (seg.bbox[0], seg.bbox[1]))
+              for seg in fs.segments if isinstance(seg, Feature)]
+    d1 = draw_shape_overlay(r.aligned, shapes)
+    d2 = draw_decomposition_overlay(r.aligned, r.decomps or [])
+    beam = draw_fit_overlay(r.aligned, fit_features(fs, cat))
+    sep = np.full((r.aligned.shape[0], 3, 3), 0xCC, np.uint8)
+    strip = np.hstack([
+        _panel_label(r.aligned, "target"), sep,
+        _panel_label(d1, "D1 contour"), sep,
+        _panel_label(d2, "D2 decompose (fill+outlines, residual=red, junc=cyan)"), sep,
+        _panel_label(beam, "old L3 beam"),
+    ])
+    Image.fromarray(strip, "RGB").save(DECOMPOSE_DIR / r.path.name, "PNG", optimize=True)
+
+
+def _compose_decompose_grid(
+    results: list[DecomposeResult],
+    mean_area: float,
+    mean_bnd: float,
+    pct_adequate: float,
+    passed: int,
+    n: int,
+) -> None:
+    THUMB = 96
+    OUT_W = 160
+    BADGE_W = 130
+    ADQ_W = 80
+    NAME_W = 160
+    PAD = 8
+    ROW_H = THUMB
+
+    # thumb (target) | name | D2 overlay | mean-cov badge | adequate count
+    cols = [THUMB, NAME_W, OUT_W, BADGE_W, ADQ_W]
+    col_x = [PAD]
+    for w in cols[:-1]:
+        col_x.append(col_x[-1] + w + PAD)
+    total_w = col_x[-1] + cols[-1] + PAD
+
+    header_h = 116
+    body_h = (ROW_H + PAD) * len(results) + PAD
+    total_h = header_h + body_h
+
+    canvas = Image.new("RGB", (total_w, total_h), (0xF4, 0xF4, 0xF4))
+    draw = ImageDraw.Draw(canvas)
+    f_title = _load_font(18)
+    f_body = _load_font(13)
+    f_small = _load_font(11)
+    f_big = _load_font(20)
+
+    draw.text((PAD, PAD), "Stage 3 D2 decompose — coverage testbed", font=f_title, fill=(0, 0, 0))
+    draw.text((PAD, PAD + 28),
+              f"Mean area IoU {mean_area:.3f}   mean boundary IoU {mean_bnd:.3f}",
+              font=f_body, fill=(0, 0, 0))
+    draw.text((PAD, PAD + 48),
+              f"{pct_adequate:.0f}% of features area ≥ {ADEQUATE_COV:.2f} (adequate)",
+              font=f_body, fill=(0, 0, 0))
+    pass_color = MATCH if passed == n else MISMATCH
+    draw.text((PAD, PAD + 68), f"{passed}/{n} fixtures scored (cache hit)",
+              font=f_body, fill=pass_color)
+    draw.text((PAD, PAD + 90),
+              "badge split: TOP = area IoU (green ≥0.90), BOTTOM = boundary IoU (green ≥0.60)  "
+              "— green-over-red = high area but wrong contours",
+              font=f_small, fill=(0x55, 0x55, 0x55))
+
+    for r_idx, r in enumerate(results):
+        y = header_h + r_idx * (ROW_H + PAD)
+
+        draw.rectangle((col_x[0], y, col_x[0] + THUMB, y + ROW_H),
+                       fill=(255, 255, 255), outline=(0xAA, 0xAA, 0xAA))
+        if r.aligned is not None:
+            thumb = Image.fromarray(r.aligned, "RGB")
+            thumb.thumbnail((THUMB - 6, ROW_H - 6))
+            canvas.paste(thumb, (col_x[0] + (THUMB - thumb.width) // 2,
+                                 y + (ROW_H - thumb.height) // 2))
+
+        draw.rectangle((col_x[1], y, col_x[1] + NAME_W, y + ROW_H), fill=(0xFA, 0xFA, 0xFA))
+        draw.text((col_x[1] + 6, y + ROW_H // 2 - 8), r.path.name, font=f_small, fill=(0, 0, 0))
+
+        draw.rectangle((col_x[2], y, col_x[2] + OUT_W, y + ROW_H),
+                       fill=(255, 255, 255), outline=(0xAA, 0xAA, 0xAA))
+        if r.aligned is not None and r.decomps is not None:
+            d2_img = Image.fromarray(draw_decomposition_overlay(r.aligned, r.decomps), "RGB")
+            d2_img.thumbnail((OUT_W - 6, ROW_H - 6))
+            canvas.paste(d2_img, (col_x[2] + (OUT_W - d2_img.width) // 2,
+                                  y + (ROW_H - d2_img.height) // 2))
+        else:
+            _draw_centered_text(draw, col_x[2], y, OUT_W, ROW_H, "FAIL", f_big, MISMATCH)
+
+        if r.error is None and r.n_total > 0:
+            _split_badge(draw, col_x[3], y, BADGE_W, ROW_H, r.mean_area, r.mean_bnd,
+                         f"{r.mean_area:.2f}/{r.mean_bnd:.2f}", f_body)
+        else:
+            draw.rectangle((col_x[3], y, col_x[3] + BADGE_W, y + ROW_H), fill=(0x9E, 0x9E, 0x9E))
+            _draw_centered_text(draw, col_x[3], y, BADGE_W, ROW_H,
+                                "no cache" if r.error else "n/a", f_body, (255, 255, 255))
+
+        draw.rectangle((col_x[4], y, col_x[4] + ADQ_W, y + ROW_H), fill=(0xFA, 0xFA, 0xFA))
+        if r.error is None:
+            _draw_centered_text(draw, col_x[4], y, ADQ_W, ROW_H,
+                                f"{r.n_adequate}/{r.n_total}", f_body, (0, 0, 0))
+        else:
+            _draw_centered_text(draw, col_x[4], y, ADQ_W, ROW_H, "—", f_body, (0x9E, 0x9E, 0x9E))
+
+    canvas.save(DECOMPOSE_GRID_PATH, "PNG", optimize=True)
+    print(f"Saved {DECOMPOSE_GRID_PATH.relative_to(REPO_ROOT)}")
+
+
+def run_decompose_testbed(panels: bool = False) -> int:
+    """Score the D2 decomposer against the cached L2 outputs (cache-only, no upstream recompute).
+    Writes per-fixture strips + a coverage grid. With panels=True each per-fixture strip is the
+    4-panel qualitative view [target | D1 contour | D2 | old L3 beam] (the former iconograph.d2_debug)."""
+    global _DECOMPOSE_PANELS
+    _DECOMPOSE_PANELS = panels
+    fixtures = sorted(FIXTURES.glob("*.png"))
+    if not fixtures:
+        print(f"error: no PNG fixtures found under {FIXTURES.relative_to(REPO_ROOT)}")
+        return 2
+
+    DECOMPOSE_DIR.mkdir(parents=True, exist_ok=True)
+    with _pool(len(fixtures)) as pool:
+        results = list(pool.imap_unordered(_worker_decompose, fixtures))
+    results.sort(key=lambda r: r.path.name)
+
+    n = len(results)
+    passed = sum(1 for r in results if r.error is None)
+    failures = [r for r in results if r.error is not None]
+    feats = [(a, b) for r in results if r.error is None for (_, a, b) in r.per_feature]
+    total_feats = len(feats)
+    mean_area = sum(a for a, _ in feats) / total_feats if total_feats else 0.0
+    mean_bnd = sum(b for _, b in feats) / total_feats if total_feats else 0.0
+    n_adq = sum(1 for a, _ in feats if a >= ADEQUATE_COV)
+    pct_adequate = 100.0 * n_adq / total_feats if total_feats else 0.0
+
+    print(f"D2 decompose — {passed}/{n} fixtures scored (cache hit), {total_feats} features")
+    print(f"Mean area IoU {mean_area:.3f}   mean boundary IoU {mean_bnd:.3f}   "
+          f"adequate (area ≥{ADEQUATE_COV:.2f}): {n_adq}/{total_feats} ({pct_adequate:.0f}%)")
+    if failures:
+        print(f"Cache misses / errors ({len(failures)}):")
+        for r in failures:
+            print(f"  {r.path.name}: {r.error}")
+
+    _compose_decompose_grid(results, mean_area, mean_bnd, pct_adequate, passed, n)
+    return 0 if not failures else 1
 
 
 # ─── bench harness ────────────────────────────────────────────────────

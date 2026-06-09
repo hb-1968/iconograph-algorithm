@@ -36,6 +36,7 @@ import cv2
 import numpy as np
 
 from iconograph.application.compress.common import (
+    RingGeom,
     _centroid,
     _detect_holes,
     _fit_circle,
@@ -94,7 +95,7 @@ Kind = Literal["local", "global", "defer"]
 ShapeHint = Literal[
     "half_circle", "ring", "holed", "sunburst",
     "circle", "ellipse", "rectangle", "triangle", "rotated_rect", "rotated_ellipse",
-    "annular_band", "annular_sector",
+    "annular_band", "annular_sector", "gapped_annulus",
 ] | None
 
 
@@ -106,6 +107,7 @@ class Feature:
     color_rgb: tuple[int, int, int]
     best_fit_iou: float                  # best single-primitive IoU (informational)
     shape_hint: ShapeHint                # how the deferred fitter should fit this feature
+    ring_geom: "RingGeom | None" = None   # ring center/radii/angles (annular hints only)
 
 
 @dataclass
@@ -401,11 +403,46 @@ def _resolve_ring(mask: np.ndarray, ox: int, oy: int,
         if not cart.any():
             continue
         bx, by, bw, bh = cv2.boundingRect(cart)
+        if comp.any():
+            inner_r = float(np.flatnonzero(comp.any(axis=0)).min()) / R_BINS * max_r
+            inner_r = min(inner_r, outer_r - 1.0)
+        else:
+            inner_r = 0.0
+        if coverage >= ANNULAR_BAND_COVERAGE:
+            theta0, theta1 = 0.0, 2.0 * math.pi
+        else:
+            present = comp.any(axis=1)
+            if present[0] and present[-1]:                  # sector crosses the θ=0/2π seam
+                absent = np.flatnonzero(~present)
+                t0, t1 = int(absent.max()) + 1, int(absent.min()) + THETA_BINS
+            else:
+                rows = np.flatnonzero(present)
+                t0, t1 = int(rows.min()), int(rows.max())
+            theta0 = t0 / THETA_BINS * 2.0 * math.pi
+            theta1 = t1 / THETA_BINS * 2.0 * math.pi
+        ring_geom = RingGeom(cx + ox, cy + oy, inner_r, outer_r, theta0, theta1)
         feats.append(Feature(
             mask=cart[by:by + bh, bx:bx + bw].copy(),
             bbox=(bx + ox, by + oy, bw, bh),
             kind="global", color_rgb=color, best_fit_iou=0.0, shape_hint=hint,
+            ring_geom=ring_geom,
         ))
+
+    # ≥2 sectors from one ring → a GAPPED RING (Chrome): emit ONE `gapped_annulus` Feature for the
+    # whole ring mask (the gaps stay in the mask) instead of N separate blade-sectors. D2 then builds
+    # Circle(outer) − Circle(inner) − a thin rect per detected gap (the user's redline). Gated on ≥2
+    # sectors, so single-sector rings (whatsapp / signal) and full bands are unchanged.
+    if sum(1 for f in feats if f.shape_hint == "annular_sector") >= 2:
+        cols = polar.any(axis=0)
+        inner_r = float(np.flatnonzero(cols).min()) / R_BINS * max_r if cols.any() else 0.0
+        inner_r = min(inner_r, outer_r - 1.0)
+        bx, by, bw, bh = cv2.boundingRect(mask)
+        return [Feature(
+            mask=mask[by:by + bh, bx:bx + bw].copy(),
+            bbox=(bx + ox, by + oy, bw, bh),
+            kind="global", color_rgb=color, best_fit_iou=0.0, shape_hint="gapped_annulus",
+            ring_geom=RingGeom(cx + ox, cy + oy, inner_r, outer_r, 0.0, 2.0 * math.pi),
+        )]
     return feats
 
 

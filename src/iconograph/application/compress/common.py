@@ -69,9 +69,31 @@ class RotatedEllipse:
     angle: float                          # degrees, clockwise
 
 
+@dataclass(frozen=True)
+class RoundedRectangle:
+    cx: float
+    cy: float
+    w: float                              # FULL width  (cv2.minAreaRect convention)
+    h: float                              # FULL height
+    angle: float                          # degrees, cv2.minAreaRect convention
+    corner_radius: float                  # ≥ 0; clamped to ≤ min(w, h)/2 at raster time
+
+
 Primitive = (
     Circle | Rectangle | Triangle | Ellipse | RotatedRectangle | RotatedEllipse
+    | RoundedRectangle
 )
+
+
+@dataclass(frozen=True)
+class RingGeom:
+    """L2 polar-unroll ring geometry, threaded to the annular fitter (full-image px)."""
+    cx: float
+    cy: float
+    inner_r: float                        # 0.0 if solid (no inner hole)
+    outer_r: float
+    theta0: float                         # sector bounds, radians (warpPolar y-down); band → (0, 2π)
+    theta1: float
 
 
 def iou_analytical(roi: np.ndarray, fit: np.ndarray, true_fit_area: float) -> float:
@@ -161,6 +183,8 @@ def _fit_ellipse(
 ROT_RECT_MIN_ASPECT = 2.0                 # rotated rect only when elongated
 ROT_ELLIPSE_POLY_TOL = 0.02
 ROT_ELLIPSE_MAX_VERTICES = 8
+ROUNDRECT_MIN_SOLIDITY = 0.85             # rounded-rect fit only on a near-convex region (a ring/star's area gap is spurious)
+ROUNDRECT_MIN_RADIUS_FRAC = 0.10          # corner_radius below this × short-side → ~sharp; None so _fit_rotated_rect wins
 
 
 def _fit_rotated_rect(
@@ -177,6 +201,31 @@ def _fit_rotated_rect(
         cx=float(cx), cy=float(cy), w=float(rw), h=float(rh), angle=float(angle)
     )
     return prim, fit, float(rw * rh)
+
+
+def _fit_rounded_rect(
+    contour: np.ndarray, h: int, w: int
+) -> tuple[RoundedRectangle, np.ndarray, float] | None:
+    """Min-area rotated rectangle WITH rounded corners. corner_radius from the box-vs-contour area gap
+    (a rounded rect of w×h has area w·h − (4−π)r², so r = sqrt(gap/(4−π))). Returns None when the
+    region isn't elongated, isn't near-convex (a ring/star's gap is spurious), or is effectively sharp
+    (r < ROUNDRECT_MIN_RADIUS → caller falls back to _fit_rotated_rect). Same 3-tuple as the siblings."""
+    rect = cv2.minAreaRect(contour)
+    (cx, cy), (rw, rh), angle = rect
+    if min(rw, rh) <= 0 or max(rw, rh) / min(rw, rh) < ROT_RECT_MIN_ASPECT:
+        return None
+    c_area = cv2.contourArea(contour)
+    hull_area = cv2.contourArea(cv2.convexHull(contour))
+    if hull_area <= 0 or c_area / hull_area < ROUNDRECT_MIN_SOLIDITY:   # concave → not a rounded rect
+        return None
+    gap = max(0.0, rw * rh - c_area - (rw + rh))                       # − minAreaRect's ≈½px padding (≈ perimeter)
+    r = math.sqrt(gap / (4.0 - math.pi)) if gap >= 1.0 else 0.0
+    r = min(r, min(rw, rh) / 2.0)
+    if r < ROUNDRECT_MIN_RADIUS_FRAC * min(rw, rh):                    # ~sharp / negligible rounding → _fit_rotated_rect wins
+        return None
+    prim = RoundedRectangle(cx=float(cx), cy=float(cy), w=float(rw), h=float(rh),
+                            angle=float(angle), corner_radius=float(r))
+    return prim, _raster_part(prim, h, w), float(rw * rh - (4.0 - math.pi) * r * r)
 
 
 def _fit_rotated_ellipse(
@@ -269,6 +318,29 @@ def _extent_ok(mask: np.ndarray, min_feat: int) -> bool:
     return min(w, h) >= min_feat
 
 
+ROUNDED_ARC_DELTA = 2     # degrees per ellipse2Poly step for rounded-rect corners (fixed → H8 determinism)
+
+
+def _rounded_rect_poly(cx: float, cy: float, w: float, h: float, angle: float,
+                       r: float) -> np.ndarray:
+    """Filled outline of a ROTATED rounded rectangle as an (N,1,2) int32 polygon for fillPoly: 4 corner
+    quarter-arcs (cv2.ellipse2Poly, fixed ROUNDED_ARC_DELTA → deterministic) at the inset corners,
+    concatenated in order and rotated as one. corner_radius clamped to ≤ min(w,h)/2 (else the arc
+    centres cross and the polygon bow-ties)."""
+    r = max(0.0, min(r, w / 2.0, h / 2.0))
+    hw, hh = w / 2.0, h / 2.0
+    corners = (((hw - r, -hh + r), -90, 0), ((hw - r, hh - r), 0, 90),
+               ((-hw + r, hh - r), 90, 180), ((-hw + r, -hh + r), 180, 270))
+    arcs = [cv2.ellipse2Poly((int(round(icx)), int(round(icy))),
+                             (max(1, int(round(r))), max(1, int(round(r)))), 0, a0, a1, ROUNDED_ARC_DELTA)
+            for (icx, icy), a0, a1 in corners]
+    local = np.vstack(arcs).astype(np.float64)
+    th = math.radians(angle)
+    rot = np.array([[math.cos(th), -math.sin(th)], [math.sin(th), math.cos(th)]])
+    world = (rot @ local.T).T + np.array([cx, cy])
+    return world.round().astype(np.int32).reshape(-1, 1, 2)
+
+
 def _raster_part(p: Primitive, h: int, w: int) -> np.ndarray:
     """Rasterize one primitive to an (h, w) uint8 {0,255} mask."""
     m = np.zeros((h, w), dtype=np.uint8)
@@ -292,10 +364,29 @@ def _raster_part(p: Primitive, h: int, w: int) -> np.ndarray:
         box = ((float(p.cx), float(p.cy)),
                (max(1.0, float(p.w)), max(1.0, float(p.h))), float(p.angle))
         cv2.fillPoly(m, [cv2.boxPoints(box).astype(np.int32)], 255)
+    elif isinstance(p, RoundedRectangle):
+        cv2.fillPoly(m, [_rounded_rect_poly(p.cx, p.cy, p.w, p.h, p.angle, p.corner_radius)], 255)
     elif isinstance(p, Triangle):
         pts = np.array([p.v1, p.v2, p.v3], dtype=np.int32).reshape(-1, 1, 2)
         cv2.fillPoly(m, [pts], 255)
     return m
+
+
+def _half_plane_rect(a, b, outside_dir: np.ndarray, h: int, w: int) -> RotatedRectangle:
+    """A huge rotated rectangle covering the half-plane on the `outside_dir` side of line a→b — the
+    spill-carve / sector-cut primitive (subtract). Lifted from decompose.py (H5: generic CSG geometry,
+    shared by the spill-carve and the annular sector cuts)."""
+    a = np.asarray(a, float)
+    b = np.asarray(b, float)
+    u = b - a
+    u = u / (np.linalg.norm(u) + 1e-9)
+    nrm = np.array([-u[1], u[0]])
+    if float(np.dot(nrm, outside_dir)) < 0:
+        nrm = -nrm
+    diag = float(np.hypot(h, w))
+    mid = (a + b) / 2.0 + nrm * (diag / 2.0)
+    angle = float(np.degrees(np.arctan2(u[1], u[0])))
+    return RotatedRectangle(cx=float(mid[0]), cy=float(mid[1]), w=2.0 * diag, h=diag, angle=angle)
 
 
 def _compound_mask(parts: list[Part] | tuple[Part, ...], h: int, w: int) -> np.ndarray:
@@ -317,6 +408,67 @@ def _compound_iou(
     return _iou_bool(_compound_mask(parts, h, w), target)
 
 
+# ── boundary-aware scoring (contour fidelity) ───────────────────────────
+# Pure area IoU hides corner/edge error (a sharp rect scores ~0.93 against a
+# rounded "pill"; an ellipse scores high against a square). Boundary IoU
+# (Cheng 2021) restricts the IoU to a d-px band along each boundary, so wrong
+# corners/edges register. Fused with area IoU by min() — the honest harsher
+# number, no blend weight (mirrors L1's _axis_symmetry min-of-two-IoUs). It
+# reads RASTERIZED boundaries only, so it is immune to D1 run-typing.
+# Deterministic (H8): cv2.erode + numpy, no RNG.
+BOUNDARY_FRAC = 0.02     # boundary-band width as a fraction of the bbox diagonal (Cheng 2021 default)
+MIN_BAND_PX = 8          # target band below this ⇒ degenerate → fall back to area IoU
+
+
+def _band_width(target: np.ndarray) -> int:
+    """Boundary-band width d = BOUNDARY_FRAC × bbox diagonal (Cheng 2021's dilation-ratio form)."""
+    _x, _y, w, h = cv2.boundingRect(target)
+    return max(2, int(round(BOUNDARY_FRAC * math.hypot(w, h))))
+
+
+def _boundary_band(m: np.ndarray, d: int) -> np.ndarray:
+    """The d-px rim of a binary mask: m AND-NOT erode(m, d) (uint8 {0,255})."""
+    se = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    eroded = cv2.erode(m, se, iterations=int(d))
+    return m & ~eroded
+
+
+def _boundary_iou(a: np.ndarray, b: np.ndarray, d: int) -> float:
+    """IoU restricted to the d-px boundary bands of a and b (Cheng 2021 Boundary IoU). Degenerate
+    fallback to full-mask area IoU when either band is below MIN_BAND_PX OR equals its whole mask
+    (erosion wiped a thin interior, so the band IS the body) — otherwise a rim would be scored
+    against a whole body, deflating the result. Every caller (scoring + the subtractor pick)
+    inherits this guard (H5)."""
+    band_a, band_b = _boundary_band(a, d), _boundary_band(b, d)
+    na, nb = int(np.count_nonzero(band_a)), int(np.count_nonzero(band_b))
+    if (na < MIN_BAND_PX or nb < MIN_BAND_PX
+            or na == int(np.count_nonzero(a)) or nb == int(np.count_nonzero(b))):
+        return _iou_bool(a, b)
+    return _iou_bool(band_a, band_b)
+
+
+def _compound_boundary_iou(
+    parts: list[Part] | tuple[Part, ...], target: np.ndarray, h: int, w: int,
+    d: int | None = None,
+) -> float:
+    """Boundary IoU of a construction's compound mask against target (d auto from target)."""
+    if d is None:
+        d = _band_width(target)
+    return _boundary_iou(_compound_mask(parts, h, w), target, d)
+
+
+def _compound_score(
+    parts: list[Part] | tuple[Part, ...], target: np.ndarray, h: int, w: int
+) -> tuple[float, float, float]:
+    """(area_iou, boundary_iou, score) of a construction vs target, where score = min(area, boundary)
+    — the honest harsher number (no blend weight). Boundary falls back to area when the target's
+    boundary band is degenerate (a tiny/thin feature whose band is the whole mask)."""
+    recon = _compound_mask(parts, h, w)
+    area = _iou_bool(recon, target)
+    boundary = _boundary_iou(recon, target, _band_width(target))   # self-handles degenerate bands
+    return area, boundary, min(area, boundary)
+
+
 def _offset(p: Primitive, ox: int, oy: int) -> Primitive:
     """Translate a primitive from crop-local to full-image coordinates."""
     if isinstance(p, Circle):
@@ -329,6 +481,9 @@ def _offset(p: Primitive, ox: int, oy: int) -> Primitive:
         return Rectangle(x=p.x + ox, y=p.y + oy, w=p.w, h=p.h)
     if isinstance(p, RotatedRectangle):
         return RotatedRectangle(cx=p.cx + ox, cy=p.cy + oy, w=p.w, h=p.h, angle=p.angle)
+    if isinstance(p, RoundedRectangle):
+        return RoundedRectangle(cx=p.cx + ox, cy=p.cy + oy, w=p.w, h=p.h,
+                                angle=p.angle, corner_radius=p.corner_radius)
     return Triangle(
         v1=(p.v1[0] + ox, p.v1[1] + oy),
         v2=(p.v2[0] + ox, p.v2[1] + oy),

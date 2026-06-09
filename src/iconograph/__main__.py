@@ -79,6 +79,11 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="VARIANT",
         help="render multiple proposed methodologies side-by-side",
     )
+    p_testbed.add_argument(
+        "--panels",
+        action="store_true",
+        help="decompose: 4-panel qualitative strip [target | D1 | D2 | old L3 beam] per fixture",
+    )
 
     return parser
 
@@ -104,6 +109,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "testbed" and args.stage == "L2_feature_segment":
         from iconograph.testbed import run_l2_feature_segment_testbed
         return run_l2_feature_segment_testbed()
+    if args.command == "testbed" and args.stage == "decompose":
+        from iconograph.testbed import run_decompose_testbed
+        return run_decompose_testbed(panels=args.panels)
     return _not_implemented(args.command)
 
 
