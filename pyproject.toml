@@ -11,6 +11,9 @@ dependencies = [
     "scikit-learn",
 ]
 
+[project.optional-dependencies]
+diff = ["torch"]   # diff_fit refiner only — lazily imported; CPU wheel suffices (no CUDA/ROCm on this box)
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

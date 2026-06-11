@@ -79,9 +79,24 @@ class RoundedRectangle:
     corner_radius: float                  # ≥ 0; clamped to ≤ min(w, h)/2 at raster time
 
 
+@dataclass(frozen=True)
+class Wedge:
+    """Filled circular sector (pie slice): circle(c, r) ∩ angular span [a0, a1].
+    Angles in DEGREES, cv2 y-down convention (0° = +x, increasing clockwise on
+    screen — same convention as the rotated primitives' angles). a1 is ALWAYS
+    > a0 (sweep = a1 − a0) and may exceed 360 to cross the 0° seam: cv2.ellipse
+    does not modulo-normalize, so 350→30 means a huge arc, 350→390 means 40°.
+    Normalize at construction sites, never at raster time."""
+    cx: float
+    cy: float
+    r: float
+    a0: float
+    a1: float
+
+
 Primitive = (
     Circle | Rectangle | Triangle | Ellipse | RotatedRectangle | RotatedEllipse
-    | RoundedRectangle
+    | RoundedRectangle | Wedge
 )
 
 
@@ -173,6 +188,33 @@ def _fit_ellipse(
     ), fit, true_area
 
 
+def _fit_arc_circle(points: np.ndarray) -> tuple[Circle, float] | None:
+    """Kasa least-squares circle through an arc run's dense points + RMSE (px).
+    Solves [2x 2y 1]·[a b c]ᵀ = x²+y² (np.linalg.lstsq, float64): center (a, b),
+    r = sqrt(c + a² + b²). cv2 has no LSQ circle fit — minEnclosingCircle is a
+    BOUNDING circle, not a least-squares one, and cv2.fitEllipse is ill-conditioned
+    on partial arcs (a half-circle run balloons). PURE numerics — the caller owns
+    the policy gates (bbox cap, centre escape, RMSE acceptance). None when the run
+    is too short, collinear (rank-deficient), or degenerate. Deterministic (H8)."""
+    if len(points) < 5:
+        return None
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    a_mat = np.column_stack([2.0 * pts[:, 0], 2.0 * pts[:, 1], np.ones(len(pts))])
+    b_vec = pts[:, 0] ** 2 + pts[:, 1] ** 2
+    sol, _res, rank, _sv = np.linalg.lstsq(a_mat, b_vec, rcond=None)
+    if rank < 3:                                          # collinear run — circle undefined
+        return None
+    cx, cy, c = float(sol[0]), float(sol[1]), float(sol[2])
+    r2 = c + cx * cx + cy * cy
+    if not np.isfinite(r2) or r2 <= 0.0:
+        return None
+    r = math.sqrt(r2)
+    if not (np.isfinite(cx) and np.isfinite(cy)) or r < 1.0:
+        return None
+    rmse = float(np.sqrt(np.mean((np.hypot(pts[:, 0] - cx, pts[:, 1] - cy) - r) ** 2)))
+    return Circle(cx=cx, cy=cy, r=r), rmse
+
+
 # --------------------------------------------------------------------------- #
 # Rotated-primitive fitters (lifted from L2 so L1/L2/L3 share one definition,
 # H5). Each returns (Primitive, rasterized mask, analytical area) | None — the
@@ -185,6 +227,8 @@ ROT_ELLIPSE_POLY_TOL = 0.02
 ROT_ELLIPSE_MAX_VERTICES = 8
 ROUNDRECT_MIN_SOLIDITY = 0.85             # rounded-rect fit only on a near-convex region (a ring/star's area gap is spurious)
 ROUNDRECT_MIN_RADIUS_FRAC = 0.10          # corner_radius below this × short-side → ~sharp; None so _fit_rotated_rect wins
+ROUNDRECT_MAX_RADIUS_FRAC = 0.45          # corner_radius above this × short-side → ≈ a circle; the rrect-annular caller
+#                                           rejects such a shell so a true circular ring (youtube) keeps its Circle annulus
 
 
 def _fit_rotated_rect(
@@ -204,15 +248,17 @@ def _fit_rotated_rect(
 
 
 def _fit_rounded_rect(
-    contour: np.ndarray, h: int, w: int
+    contour: np.ndarray, h: int, w: int, min_aspect: float = ROT_RECT_MIN_ASPECT
 ) -> tuple[RoundedRectangle, np.ndarray, float] | None:
     """Min-area rotated rectangle WITH rounded corners. corner_radius from the box-vs-contour area gap
     (a rounded rect of w×h has area w·h − (4−π)r², so r = sqrt(gap/(4−π))). Returns None when the
-    region isn't elongated, isn't near-convex (a ring/star's gap is spurious), or is effectively sharp
-    (r < ROUNDRECT_MIN_RADIUS → caller falls back to _fit_rotated_rect). Same 3-tuple as the siblings."""
+    region isn't elongated enough (aspect < min_aspect — the default blocks near-square blobs, but the
+    rrect-annular caller passes 1.0 to admit a squircle), isn't near-convex (a ring/star's gap is
+    spurious), or is effectively sharp (r < ROUNDRECT_MIN_RADIUS → caller falls back to
+    _fit_rotated_rect). Same 3-tuple as the siblings."""
     rect = cv2.minAreaRect(contour)
     (cx, cy), (rw, rh), angle = rect
-    if min(rw, rh) <= 0 or max(rw, rh) / min(rw, rh) < ROT_RECT_MIN_ASPECT:
+    if min(rw, rh) <= 0 or max(rw, rh) / min(rw, rh) < min_aspect:
         return None
     c_area = cv2.contourArea(contour)
     hull_area = cv2.contourArea(cv2.convexHull(contour))
@@ -268,6 +314,15 @@ Op = Literal["add", "subtract"]
 class Part:
     primitive: Primitive
     op: Op                                # "add" | "subtract"
+    group: int = 0                        # CSG group: subtracts scope to their own group, groups then
+    #                                       union. Default 0 = one global group = the flat (∪add)−(∪sub)
+    #                                       every existing construction relies on. Distinct groups let a
+    #                                       union of per-shape annuli (outer−inner) keep their woven
+    #                                       interiors (react's 3 orbit rings) instead of carving each
+    #                                       other away under a single global subtract. NEGATIVE group ⇒
+    #                                       the whole group's compound mask is carved FROM the positive
+    #                                       groups' union (a counter whose own construction contains
+    #                                       subtracts — recursive hole decomposition, mastodon's m).
 
 
 def _min_feature_px(s: int) -> int:
@@ -366,6 +421,13 @@ def _raster_part(p: Primitive, h: int, w: int) -> np.ndarray:
         cv2.fillPoly(m, [cv2.boxPoints(box).astype(np.int32)], 255)
     elif isinstance(p, RoundedRectangle):
         cv2.fillPoly(m, [_rounded_rect_poly(p.cx, p.cy, p.w, p.h, p.angle, p.corner_radius)], 255)
+    elif isinstance(p, Wedge):
+        # filled partial-angle ellipse = the true pie INCLUDING the center; axes int ≥ 1
+        cv2.ellipse(
+            m, (int(round(p.cx)), int(round(p.cy))),
+            (max(1, int(round(p.r))), max(1, int(round(p.r)))),
+            0, float(p.a0), float(p.a1), 255, -1,
+        )
     elif isinstance(p, Triangle):
         pts = np.array([p.v1, p.v2, p.v3], dtype=np.int32).reshape(-1, 1, 2)
         cv2.fillPoly(m, [pts], 255)
@@ -390,15 +452,28 @@ def _half_plane_rect(a, b, outside_dir: np.ndarray, h: int, w: int) -> RotatedRe
 
 
 def _compound_mask(parts: list[Part] | tuple[Part, ...], h: int, w: int) -> np.ndarray:
-    """OR every add part, then AND-NOT every subtract part (order-independent)."""
-    union = np.zeros((h, w), dtype=np.uint8)
-    for part in parts:
-        if part.op == "add":
-            union |= _raster_part(part.primitive, h, w)
-    for part in parts:
-        if part.op == "subtract":
-            union &= ~_raster_part(part.primitive, h, w)
-    return union
+    """Per-GROUP CSG: within each group OR its adds then AND-NOT its subtracts; then OR the
+    POSITIVE groups and AND-NOT the NEGATIVE groups (group < 0 ⇒ the whole group's compound
+    mask carves the result — how a counter whose own construction needs subtracts, e.g. a
+    letterform arch = ring − inner − half-plane, is negated; there is no add-back otherwise).
+    A subtract only carves its OWN group, so a union of per-shape annuli keeps each shape's
+    interior (react's woven orbit rings). Order-independent and, when every part is in the
+    default group 0, byte-identical to the old flat (∪add)−(∪sub)."""
+    out = np.zeros((h, w), dtype=np.uint8)
+    neg = np.zeros((h, w), dtype=np.uint8)
+    for g in sorted({part.group for part in parts}):
+        union = np.zeros((h, w), dtype=np.uint8)
+        for part in parts:
+            if part.group == g and part.op == "add":
+                union |= _raster_part(part.primitive, h, w)
+        for part in parts:
+            if part.group == g and part.op == "subtract":
+                union &= ~_raster_part(part.primitive, h, w)
+        if g >= 0:
+            out |= union
+        else:
+            neg |= union
+    return out & ~neg
 
 
 def _compound_iou(
@@ -406,6 +481,53 @@ def _compound_iou(
 ) -> float:
     """IoU of a construction's rasterized mask against a target mask."""
     return _iou_bool(_compound_mask(parts, h, w), target)
+
+
+PRUNE_TOL = 0.001        # _post_prune free pass: drop a part if removing it costs < this min-IoU
+STRUCT_PRUNE_STEP = 0.02  # _post_prune budget pass: a structure-first removal may cost up to this
+#                           min-IoU per step (the structured-over-fidelity trade, bounded per part)
+
+
+def _post_prune(parts: list["Part"], target: np.ndarray, h: int, w: int,
+                target_n: int | None = None) -> list["Part"]:
+    """Greedy hard-score cleanup. FREE pass: drop any part whose removal costs
+    < PRUNE_TOL of min(area, boundary) IoU — kills redundant pileup (refine-loop
+    triangle tails, degenerate slivers a soft optimizer flattened) without touching
+    load-bearing structure. Then, when `target_n` is given and the construction is
+    still larger, a BUDGET pass: repeatedly remove the part whose removal hurts
+    least, while each step costs ≤ STRUCT_PRUNE_STEP — clean few-part structure is
+    worth bounded fidelity (the chrome-annulus doctrine); stop when the cheapest
+    removal exceeds the step budget (genuinely irreducible sprawl stays oversized
+    for the caller's cap to judge). Deterministic (H8): area/index ordering, stable
+    arg-max. Shared by the trace, the recursive hole carve, and the diff refiner (H5)."""
+    if len(parts) <= 1:
+        return parts
+    base = _compound_score(parts, target, h, w)[2]
+    order = sorted(range(len(parts)),
+                   key=lambda i: (int(np.count_nonzero(_raster_part(parts[i].primitive, h, w))), i))
+    keep = list(parts)
+    for idx in order:
+        if len(keep) <= 1:
+            break
+        if parts[idx] not in keep:
+            continue
+        trial = [p for p in keep if p is not parts[idx]]
+        sc = _compound_score(trial, target, h, w)[2]
+        if sc >= base - PRUNE_TOL:
+            keep = trial
+            base = max(base, sc)
+    if target_n is not None:
+        while len(keep) > max(1, target_n):
+            best_i, best_sc = -1, -1.0
+            for i in range(len(keep)):
+                sc = _compound_score(keep[:i] + keep[i + 1:], target, h, w)[2]
+                if sc > best_sc:
+                    best_sc, best_i = sc, i
+            if best_sc < base - STRUCT_PRUNE_STEP:
+                break
+            keep = keep[:best_i] + keep[best_i + 1:]
+            base = best_sc
+    return keep
 
 
 # ── boundary-aware scoring (contour fidelity) ───────────────────────────
@@ -427,9 +549,13 @@ def _band_width(target: np.ndarray) -> int:
 
 
 def _boundary_band(m: np.ndarray, d: int) -> np.ndarray:
-    """The d-px rim of a binary mask: m AND-NOT erode(m, d) (uint8 {0,255})."""
-    se = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    eroded = cv2.erode(m, se, iterations=int(d))
+    """The d-px rim of a binary mask: m AND-NOT erode(m, d) (uint8 {0,255}).
+    One erode with a (2d+1)² RECT kernel — byte-identical to d iterations of the 3×3
+    (rect SEs compose exactly), but ~d× faster; the iterated form dominated stage-3
+    profiles (boundary IoU is called per candidate per prune trial)."""
+    k = 2 * int(d) + 1
+    se = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    eroded = cv2.erode(m, se)
     return m & ~eroded
 
 
@@ -484,6 +610,8 @@ def _offset(p: Primitive, ox: int, oy: int) -> Primitive:
     if isinstance(p, RoundedRectangle):
         return RoundedRectangle(cx=p.cx + ox, cy=p.cy + oy, w=p.w, h=p.h,
                                 angle=p.angle, corner_radius=p.corner_radius)
+    if isinstance(p, Wedge):
+        return Wedge(cx=p.cx + ox, cy=p.cy + oy, r=p.r, a0=p.a0, a1=p.a1)
     return Triangle(
         v1=(p.v1[0] + ox, p.v1[1] + oy),
         v2=(p.v2[0] + ox, p.v2[1] + oy),
@@ -492,8 +620,9 @@ def _offset(p: Primitive, ox: int, oy: int) -> Primitive:
 
 
 def _offset_part(part: Part, ox: int, oy: int) -> Part:
-    """Translate a Part's primitive to full-image coordinates."""
-    return Part(primitive=_offset(part.primitive, ox, oy), op=part.op)
+    """Translate a Part's primitive to full-image coordinates (carrying its CSG group, so a grouped
+    construction — react's woven orbit rings — survives the offset instead of flattening to group 0)."""
+    return Part(primitive=_offset(part.primitive, ox, oy), op=part.op, group=part.group)
 
 
 def _cand_inscribed_circle(
