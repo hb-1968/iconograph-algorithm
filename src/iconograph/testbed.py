@@ -108,7 +108,14 @@ def _worker_init() -> None:
 
 
 def _pool(n_items: int):
-    nproc = max(1, min(os.cpu_count() or 1, n_items))
+    # ICONOGRAPH_JOBS pins the worker count; otherwise use HALF the cores so the box
+    # stays responsive and CPU/thread consumption is bounded to half (a 16-core host →
+    # 8 workers). Each worker is single-threaded (cv2.setNumThreads(1)), so this is the
+    # full thread budget. GPU offload is unavailable on this box (RX 580 / no ROCm) —
+    # CPU-parallel is the perf lever (see project_hardware memo).
+    env = os.environ.get("ICONOGRAPH_JOBS")
+    cap = max(1, int(env)) if env else max(1, (os.cpu_count() or 2) // 2)
+    nproc = max(1, min(cap, n_items))
     return mp.get_context("fork").Pool(processes=nproc, initializer=_worker_init)
 
 

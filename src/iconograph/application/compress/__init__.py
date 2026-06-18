@@ -18,9 +18,13 @@ becomes a `Deferral` instead of a forced low-quality shape.
 from iconograph.application.compress.align import align
 from iconograph.application.compress.common import (
     Part,
+    Polygon,
     RotatedEllipse,
     RotatedRectangle,
+    RoundedRectangle,
+    Wedge,
 )
+from iconograph.application.compress.render import render, render_debug
 from iconograph.application.compress.L2_feature_segment import (
     Feature,
     FeatureSegmentation,
@@ -59,7 +63,12 @@ __all__ = [
     "Ellipse",
     "RotatedRectangle",
     "RotatedEllipse",
+    "RoundedRectangle",
+    "Wedge",
+    "Polygon",
     "Part",
+    "render",
+    "render_debug",
     "segment_features",
     "draw_feature_overlay",
     "Feature",

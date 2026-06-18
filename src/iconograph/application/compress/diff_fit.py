@@ -33,7 +33,11 @@ import cv2
 import numpy as np
 import torch
 
+from iconograph.application.compress._torch_common import _torch_determinism
+
 from iconograph.application.compress.common import (
+    ANGLE_SNAP_DEG,
+    SYM_PAIR_IOU,
     Circle,
     Ellipse,
     Part,
@@ -47,9 +51,13 @@ from iconograph.application.compress.common import (
     _compound_mask,
     _extent_ok,
     _iou_bool,
+    _mirror_axis,
     _offset_part,
     _post_prune,
     _raster_part,
+    _reflect_part,
+    _reflection_m,
+    _snap,
 )
 
 # ── knobs ───────────────────────────────────────────────────────────────
@@ -66,14 +74,14 @@ GATE_INIT_WARM = 2.5     # warm-start existence logit (σ ≈ 0.92)
 GATE_INIT_SPAWN = 0.5    # spawned-part logit (σ ≈ 0.62) — must earn its keep
 GATE_KEEP = 0.5          # decode keeps a part iff σ(gate) ≥ this
 DIFF_MAX_PARTS = 24
-ANGLE_SNAP_DEG = 1.5     # decode: angle within this of 0 (mod 90°) → exact axis-aligned type
 PLATEAU_WIN = 50         # plateau stop: improvement < PLATEAU_EPS over this many steps
 PLATEAU_EPS = 1e-4
 MAX_SPAWN = 6            # discrete adds per spawn round
 SPAWN_ROUNDS = 2         # optimize → spawn → optimize
 SPAWN_ASPECT = 2.0       # elongated residual component → capsule-ish RotatedRectangle
-SYM_MIN_IOU = 0.90       # mask-vs-reflected-mask IoU to accept a mirror axis
-SYM_PAIR_IOU = 0.50      # part-vs-reflected-partner raster IoU to deduplicate a mirrored pair
+# ANGLE_SNAP_DEG / SYM_MIN_IOU / SYM_PAIR_IOU + the mirror helpers (_snap,
+# _reflection_m, _mirror_axis, _reflect_part) now live in common.py (H5 lift —
+# shared with the R1 renderer's symmetrization, which must not import torch)
 
 _EPS = 1e-9
 _F64 = torch.float64
@@ -257,14 +265,6 @@ def _encode_part(p: Part, s: float, gate_init: float) -> _Enc:
     return _Enc(kind, p.op, p.group, _t(params), _t(ang) if ang is not None else None, gate)
 
 
-def _snap(theta: float) -> tuple[bool, int]:
-    """(within ANGLE_SNAP_DEG of a multiple of 90°?, that multiple's parity —
-    1 means the 90° leg, i.e. swap the in-plane extents)."""
-    per = math.pi / 2.0
-    k = round(theta / per)
-    return abs(theta - k * per) <= math.radians(ANGLE_SNAP_DEG), k % 2
-
-
 def _decode_part(e: _Enc, s: float, h: int, w: int, min_feat: int) -> Part | None:
     """Exact full-res Part, or None when σ(gate) < GATE_KEEP (pruned) or the decoded
     raster fails _extent_ok (the min-size rule every generator obeys). Near-axis-
@@ -391,100 +391,7 @@ def _spawn(parts: list[Part], target: np.ndarray, min_feat: int,
     return out
 
 
-# ── mirror symmetry (vscode-class glyphs) ───────────────────────────────
-def _reflection_m(px: float, py: float, ux: float, uy: float) -> np.ndarray:
-    """2×3 affine reflecting across the line through (px, py) with unit dir (ux, uy)
-    (Householder R = 2uuᵀ − I; translation keeps the line invariant)."""
-    r2 = 2.0 * np.array([[ux * ux, ux * uy], [ux * uy, uy * uy]], np.float64) - np.eye(2)
-    p = np.array([px, py], np.float64)
-    t = p - r2 @ p
-    return np.hstack([r2, t.reshape(2, 1)])
-
-
-def _mirror_axis(target: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
-    """Best of {vertical, horizontal, PCA major, PCA minor} axes through the centroid,
-    accepted iff reflect-and-IoU ≥ SYM_MIN_IOU. Returns (point, unit_dir) or None."""
-    m = cv2.moments(target, binaryImage=True)
-    if m["m00"] == 0.0:
-        return None
-    cx, cy = m["m10"] / m["m00"], m["m01"] / m["m00"]
-    theta = 0.5 * math.atan2(2.0 * m["mu11"], m["mu20"] - m["mu02"])
-    best: tuple[np.ndarray, np.ndarray] | None = None
-    best_iou = SYM_MIN_IOU
-    for ux, uy in ((0.0, 1.0), (1.0, 0.0),
-                   (math.cos(theta), math.sin(theta)),
-                   (-math.sin(theta), math.cos(theta))):
-        mat = _reflection_m(cx, cy, ux, uy)
-        ref = cv2.warpAffine(target, mat, (target.shape[1], target.shape[0]),
-                             flags=cv2.INTER_NEAREST, borderValue=0)
-        iou = _iou_bool(target, ref)
-        if iou > best_iou:
-            best_iou = iou
-            best = (np.array([cx, cy], np.float64), np.array([ux, uy], np.float64))
-    return best
-
-
-def _reflect_pt(x: float, y: float, p: np.ndarray, u: np.ndarray) -> tuple[float, float]:
-    r2 = 2.0 * np.outer(u, u) - np.eye(2)
-    q = p + r2 @ (np.array([x, y], np.float64) - p)
-    return float(q[0]), float(q[1])
-
-
-def _reflect_part(part: Part, p: np.ndarray, u: np.ndarray) -> Part:
-    """Analytic mirror of one Part across the axis (point p, unit dir u). A direction
-    at angle φ reflects to 2β − φ (β = axis angle); reflected near-axis-aligned
-    angles snap back to the exact axis-aligned types."""
-    beta = math.degrees(math.atan2(u[1], u[0]))
-    pr = part.primitive
-
-    def _ref_angle(angle: float) -> float:
-        return (2.0 * beta - angle) % 180.0
-
-    if isinstance(pr, Circle):
-        x, y = _reflect_pt(pr.cx, pr.cy, p, u)
-        out: object = Circle(cx=x, cy=y, r=pr.r)
-    elif isinstance(pr, (Ellipse, RotatedEllipse)):
-        ang0 = pr.angle if isinstance(pr, RotatedEllipse) else 0.0
-        x, y = _reflect_pt(pr.cx, pr.cy, p, u)
-        na = _ref_angle(ang0)
-        snapped, parity = _snap(math.radians(na))
-        if snapped:
-            rx, ry = (pr.ry, pr.rx) if parity else (pr.rx, pr.ry)
-            out = Ellipse(cx=x, cy=y, rx=rx, ry=ry)
-        else:
-            out = RotatedEllipse(cx=x, cy=y, rx=pr.rx, ry=pr.ry, angle=na)
-    elif isinstance(pr, Rectangle):
-        ccx, ccy = pr.x + pr.w / 2.0, pr.y + pr.h / 2.0
-        x, y = _reflect_pt(ccx, ccy, p, u)
-        na = _ref_angle(0.0)
-        snapped, parity = _snap(math.radians(na))
-        if snapped:
-            wd, ht = (pr.h, pr.w) if parity else (pr.w, pr.h)
-            out = Rectangle(x=int(round(x - wd / 2.0)), y=int(round(y - ht / 2.0)),
-                            w=int(round(wd)), h=int(round(ht)))
-        else:
-            out = RotatedRectangle(cx=x, cy=y, w=float(pr.w), h=float(pr.h), angle=na)
-    elif isinstance(pr, RotatedRectangle):
-        x, y = _reflect_pt(pr.cx, pr.cy, p, u)
-        out = RotatedRectangle(cx=x, cy=y, w=pr.w, h=pr.h, angle=_ref_angle(pr.angle))
-    elif isinstance(pr, RoundedRectangle):
-        x, y = _reflect_pt(pr.cx, pr.cy, p, u)
-        out = RoundedRectangle(cx=x, cy=y, w=pr.w, h=pr.h, angle=_ref_angle(pr.angle),
-                               corner_radius=pr.corner_radius)
-    elif isinstance(pr, Wedge):
-        x, y = _reflect_pt(pr.cx, pr.cy, p, u)
-        half = (pr.a1 - pr.a0) / 2.0
-        nb = (2.0 * beta - (pr.a0 + pr.a1) / 2.0) % 360.0
-        a0 = (nb - half) % 360.0
-        out = Wedge(cx=x, cy=y, r=pr.r, a0=a0, a1=a0 + 2.0 * half)
-    else:
-        v1 = _reflect_pt(pr.v1[0], pr.v1[1], p, u)
-        v2 = _reflect_pt(pr.v2[0], pr.v2[1], p, u)
-        v3 = _reflect_pt(pr.v3[0], pr.v3[1], p, u)
-        out = Triangle(v1=v1, v2=v2, v3=v3)
-    return Part(out, part.op, part.group)
-
-
+# ── mirror symmetry (vscode-class glyphs) — core helpers lifted to common.py ──
 def _dedupe_mirror(parts: list[Part], p: np.ndarray, u: np.ndarray,
                    h: int, w: int) -> list[Part]:
     """Drop a part whose reflection duplicates an already-kept part — its twin is
@@ -509,9 +416,7 @@ def refine_candidates(seeds: list[list[Part]], target: np.ndarray, min_feat: int
     uint8 canvas decompose_shape built. The caller wraps each result via
     _decomp_from_parts so it competes in _arbitrate on hard scores — soft scores are
     never compared or returned."""
-    torch.manual_seed(SEED)                      # defense in depth — nothing below draws RNG
-    torch.use_deterministic_algorithms(True)
-    torch.set_num_threads(1)
+    _torch_determinism(SEED)                     # defense in depth — nothing below draws RNG
 
     # Optimize on a bbox crop, not the (mostly padding) decompose canvas — the grid
     # budget goes to the shape, roughly doubling effective resolution. ox/oy map

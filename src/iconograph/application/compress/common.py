@@ -94,9 +94,27 @@ class Wedge:
     a1: float
 
 
+@dataclass(frozen=True)
+class Polygon:
+    """Arbitrary closed polygon (≥3 vertices, canvas px coords, pixel-center
+    convention like every other primitive). RENDER-TIER ONLY: produced by the
+    stage-3 R1 renderer's degree ladder (straighten.py) — no deterministic
+    fitter constructs one, and Polygon-bearing Parts never enter the diff_fit
+    seed pool or the L3 baseline (their primitive dispatches would reject it).
+    Dormant for the decomposer by design, same pattern as Wedge before its
+    producer. Rasterized at half-pixel precision (fillPoly shift=1). fillPoly is
+    OUTLINE-INCLUSIVE with round-half-up vertex placement: integer-corner boxes
+    (a..b) fill pixels a..b exactly (b−a+1 wide), and fractional edges round
+    outward — so producers emit geometry INSET by ~0.5 px per edge (straighten.py
+    does) to land on the pixel-centers-inside coverage rule. The render tier's
+    grid snapping targets integer vertex coordinates, the crisp case.
+    pts is a tuple of tuples (not ndarray) to stay frozen/hashable."""
+    pts: tuple[tuple[float, float], ...]
+
+
 Primitive = (
     Circle | Rectangle | Triangle | Ellipse | RotatedRectangle | RotatedEllipse
-    | RoundedRectangle | Wedge
+    | RoundedRectangle | Wedge | Polygon
 )
 
 
@@ -431,6 +449,13 @@ def _raster_part(p: Primitive, h: int, w: int) -> np.ndarray:
     elif isinstance(p, Triangle):
         pts = np.array([p.v1, p.v2, p.v3], dtype=np.int32).reshape(-1, 1, 2)
         cv2.fillPoly(m, [pts], 255)
+    elif isinstance(p, Polygon):
+        # shift=2 fixed point: coords ×4 → quarter-pixel precision. Never LINE_AA
+        # (gray fringe corrupts {0,255}). shift=1 would quantize x.3/x.7 onto the
+        # x.5 round-half-up ties of the outline-inclusive fill, bloating right/
+        # bottom edges by a pixel; quarter-px keeps fractional vertices off ties.
+        pts = (np.asarray(p.pts, dtype=np.float64) * 4.0).round().astype(np.int32).reshape(-1, 1, 2)
+        cv2.fillPoly(m, [pts], 255, shift=2)
     return m
 
 
@@ -451,6 +476,30 @@ def _half_plane_rect(a, b, outside_dir: np.ndarray, h: int, w: int) -> RotatedRe
     return RotatedRectangle(cx=float(mid[0]), cy=float(mid[1]), w=2.0 * diag, h=diag, angle=angle)
 
 
+def _compound_from_masks(items: list[tuple["Op", int, np.ndarray]] | tuple,
+                         h: int, w: int) -> np.ndarray:
+    """The grouped-CSG algebra over PRE-RASTERIZED member masks — the single
+    source of truth _compound_mask delegates to (H5). Exists so raster-only
+    members (the R1 renderer's mirror-flipped followers, which have no exact
+    Part) can join a compound without forking the algebra.
+    items: (op, group, (h, w) uint8 mask) per member."""
+    out = np.zeros((h, w), dtype=np.uint8)
+    neg = np.zeros((h, w), dtype=np.uint8)
+    for g in sorted({g for _op, g, _m in items}):
+        union = np.zeros((h, w), dtype=np.uint8)
+        for op, gg, m in items:
+            if gg == g and op == "add":
+                union |= m
+        for op, gg, m in items:
+            if gg == g and op == "subtract":
+                union &= ~m
+        if g >= 0:
+            out |= union
+        else:
+            neg |= union
+    return out & ~neg
+
+
 def _compound_mask(parts: list[Part] | tuple[Part, ...], h: int, w: int) -> np.ndarray:
     """Per-GROUP CSG: within each group OR its adds then AND-NOT its subtracts; then OR the
     POSITIVE groups and AND-NOT the NEGATIVE groups (group < 0 ⇒ the whole group's compound
@@ -459,21 +508,8 @@ def _compound_mask(parts: list[Part] | tuple[Part, ...], h: int, w: int) -> np.n
     A subtract only carves its OWN group, so a union of per-shape annuli keeps each shape's
     interior (react's woven orbit rings). Order-independent and, when every part is in the
     default group 0, byte-identical to the old flat (∪add)−(∪sub)."""
-    out = np.zeros((h, w), dtype=np.uint8)
-    neg = np.zeros((h, w), dtype=np.uint8)
-    for g in sorted({part.group for part in parts}):
-        union = np.zeros((h, w), dtype=np.uint8)
-        for part in parts:
-            if part.group == g and part.op == "add":
-                union |= _raster_part(part.primitive, h, w)
-        for part in parts:
-            if part.group == g and part.op == "subtract":
-                union &= ~_raster_part(part.primitive, h, w)
-        if g >= 0:
-            out |= union
-        else:
-            neg |= union
-    return out & ~neg
+    return _compound_from_masks(
+        [(p.op, p.group, _raster_part(p.primitive, h, w)) for p in parts], h, w)
 
 
 def _compound_iou(
@@ -612,6 +648,8 @@ def _offset(p: Primitive, ox: int, oy: int) -> Primitive:
                                 angle=p.angle, corner_radius=p.corner_radius)
     if isinstance(p, Wedge):
         return Wedge(cx=p.cx + ox, cy=p.cy + oy, r=p.r, a0=p.a0, a1=p.a1)
+    if isinstance(p, Polygon):
+        return Polygon(pts=tuple((x + ox, y + oy) for x, y in p.pts))
     return Triangle(
         v1=(p.v1[0] + ox, p.v1[1] + oy),
         v2=(p.v2[0] + ox, p.v2[1] + oy),
@@ -623,6 +661,154 @@ def _offset_part(part: Part, ox: int, oy: int) -> Part:
     """Translate a Part's primitive to full-image coordinates (carrying its CSG group, so a grouped
     construction — react's woven orbit rings — survives the offset instead of flattening to group 0)."""
     return Part(primitive=_offset(part.primitive, ox, oy), op=part.op, group=part.group)
+
+
+def _scale(p: Primitive, f: float) -> Primitive:
+    """Scale a primitive about the ORIGIN by factor f (coordinate-space rescale,
+    the canvas→target-grid mapping of the render tier). Mirrors _offset's per-kind
+    dispatch. Angles are scale-invariant; Rectangle's int fields round after
+    scaling (sub-half-pixel error at the supersampled reference resolution)."""
+    if isinstance(p, Circle):
+        return Circle(cx=p.cx * f, cy=p.cy * f, r=p.r * f)
+    if isinstance(p, Ellipse):
+        return Ellipse(cx=p.cx * f, cy=p.cy * f, rx=p.rx * f, ry=p.ry * f)
+    if isinstance(p, RotatedEllipse):
+        return RotatedEllipse(cx=p.cx * f, cy=p.cy * f, rx=p.rx * f, ry=p.ry * f, angle=p.angle)
+    if isinstance(p, Rectangle):
+        return Rectangle(x=int(round(p.x * f)), y=int(round(p.y * f)),
+                         w=max(1, int(round(p.w * f))), h=max(1, int(round(p.h * f))))
+    if isinstance(p, RotatedRectangle):
+        return RotatedRectangle(cx=p.cx * f, cy=p.cy * f, w=p.w * f, h=p.h * f, angle=p.angle)
+    if isinstance(p, RoundedRectangle):
+        return RoundedRectangle(cx=p.cx * f, cy=p.cy * f, w=p.w * f, h=p.h * f,
+                                angle=p.angle, corner_radius=p.corner_radius * f)
+    if isinstance(p, Wedge):
+        return Wedge(cx=p.cx * f, cy=p.cy * f, r=p.r * f, a0=p.a0, a1=p.a1)
+    if isinstance(p, Polygon):
+        return Polygon(pts=tuple((x * f, y * f) for x, y in p.pts))
+    return Triangle(
+        v1=(p.v1[0] * f, p.v1[1] * f),
+        v2=(p.v2[0] * f, p.v2[1] * f),
+        v3=(p.v3[0] * f, p.v3[1] * f),
+    )
+
+
+def _scale_part(part: Part, f: float) -> Part:
+    """Scale a Part's primitive about the origin, carrying op and CSG group."""
+    return Part(primitive=_scale(part.primitive, f), op=part.op, group=part.group)
+
+
+# ── mirror symmetry (lifted from diff_fit.py per H5 — shared by the diff
+# refiner's grid-reflection tying and the R1 renderer's symmetrization; pure
+# numpy/cv2, NO torch, so render.py can import without pulling the refiner) ──
+ANGLE_SNAP_DEG = 1.5     # reflect/decode: angle within this of 0 (mod 90°) → exact axis-aligned type
+SYM_MIN_IOU = 0.90       # mask-vs-reflected-mask IoU to accept a mirror axis
+SYM_PAIR_IOU = 0.50      # part-vs-reflected-partner raster IoU to call two parts a mirrored pair
+
+
+def _snap(theta: float) -> tuple[bool, int]:
+    """(within ANGLE_SNAP_DEG of a multiple of 90°?, that multiple's parity —
+    1 means the 90° leg, i.e. swap the in-plane extents)."""
+    per = math.pi / 2.0
+    k = round(theta / per)
+    return abs(theta - k * per) <= math.radians(ANGLE_SNAP_DEG), k % 2
+
+
+def _reflection_m(px: float, py: float, ux: float, uy: float) -> np.ndarray:
+    """2×3 affine reflecting across the line through (px, py) with unit dir (ux, uy)
+    (Householder R = 2uuᵀ − I; translation keeps the line invariant)."""
+    r2 = 2.0 * np.array([[ux * ux, ux * uy], [ux * uy, uy * uy]], np.float64) - np.eye(2)
+    p = np.array([px, py], np.float64)
+    t = p - r2 @ p
+    return np.hstack([r2, t.reshape(2, 1)])
+
+
+def _mirror_axis(target: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    """Best of {vertical, horizontal, PCA major, PCA minor} axes through the centroid,
+    accepted iff reflect-and-IoU ≥ SYM_MIN_IOU. Returns (point, unit_dir) or None."""
+    m = cv2.moments(target, binaryImage=True)
+    if m["m00"] == 0.0:
+        return None
+    cx, cy = m["m10"] / m["m00"], m["m01"] / m["m00"]
+    theta = 0.5 * math.atan2(2.0 * m["mu11"], m["mu20"] - m["mu02"])
+    best: tuple[np.ndarray, np.ndarray] | None = None
+    best_iou = SYM_MIN_IOU
+    for ux, uy in ((0.0, 1.0), (1.0, 0.0),
+                   (math.cos(theta), math.sin(theta)),
+                   (-math.sin(theta), math.cos(theta))):
+        mat = _reflection_m(cx, cy, ux, uy)
+        ref = cv2.warpAffine(target, mat, (target.shape[1], target.shape[0]),
+                             flags=cv2.INTER_NEAREST, borderValue=0)
+        iou = _iou_bool(target, ref)
+        if iou > best_iou:
+            best_iou = iou
+            best = (np.array([cx, cy], np.float64), np.array([ux, uy], np.float64))
+    return best
+
+
+def _reflect_pt(x: float, y: float, p: np.ndarray, u: np.ndarray) -> tuple[float, float]:
+    r2 = 2.0 * np.outer(u, u) - np.eye(2)
+    q = p + r2 @ (np.array([x, y], np.float64) - p)
+    return float(q[0]), float(q[1])
+
+
+def _reflect_part(part: Part, p: np.ndarray, u: np.ndarray) -> Part:
+    """Analytic mirror of one Part across the axis (point p, unit dir u). A direction
+    at angle φ reflects to 2β − φ (β = axis angle); reflected near-axis-aligned
+    angles snap back to the exact axis-aligned types."""
+    beta = math.degrees(math.atan2(u[1], u[0]))
+    pr = part.primitive
+
+    def _ref_angle(angle: float) -> float:
+        return (2.0 * beta - angle) % 180.0
+
+    if isinstance(pr, Circle):
+        x, y = _reflect_pt(pr.cx, pr.cy, p, u)
+        out: object = Circle(cx=x, cy=y, r=pr.r)
+    elif isinstance(pr, (Ellipse, RotatedEllipse)):
+        ang0 = pr.angle if isinstance(pr, RotatedEllipse) else 0.0
+        x, y = _reflect_pt(pr.cx, pr.cy, p, u)
+        na = _ref_angle(ang0)
+        snapped, parity = _snap(math.radians(na))
+        if snapped:
+            rx, ry = (pr.ry, pr.rx) if parity else (pr.rx, pr.ry)
+            out = Ellipse(cx=x, cy=y, rx=rx, ry=ry)
+        else:
+            out = RotatedEllipse(cx=x, cy=y, rx=pr.rx, ry=pr.ry, angle=na)
+    elif isinstance(pr, Rectangle):
+        ccx, ccy = pr.x + pr.w / 2.0, pr.y + pr.h / 2.0
+        x, y = _reflect_pt(ccx, ccy, p, u)
+        na = _ref_angle(0.0)
+        snapped, parity = _snap(math.radians(na))
+        if snapped:
+            wd, ht = (pr.h, pr.w) if parity else (pr.w, pr.h)
+            out = Rectangle(x=int(round(x - wd / 2.0)), y=int(round(y - ht / 2.0)),
+                            w=int(round(wd)), h=int(round(ht)))
+        else:
+            out = RotatedRectangle(cx=x, cy=y, w=float(pr.w), h=float(pr.h), angle=na)
+    elif isinstance(pr, RotatedRectangle):
+        x, y = _reflect_pt(pr.cx, pr.cy, p, u)
+        out = RotatedRectangle(cx=x, cy=y, w=pr.w, h=pr.h, angle=_ref_angle(pr.angle))
+    elif isinstance(pr, RoundedRectangle):
+        x, y = _reflect_pt(pr.cx, pr.cy, p, u)
+        out = RoundedRectangle(cx=x, cy=y, w=pr.w, h=pr.h, angle=_ref_angle(pr.angle),
+                               corner_radius=pr.corner_radius)
+    elif isinstance(pr, Wedge):
+        x, y = _reflect_pt(pr.cx, pr.cy, p, u)
+        half = (pr.a1 - pr.a0) / 2.0
+        nb = (2.0 * beta - (pr.a0 + pr.a1) / 2.0) % 360.0
+        a0 = (nb - half) % 360.0
+        out = Wedge(cx=x, cy=y, r=pr.r, a0=a0, a1=a0 + 2.0 * half)
+    elif isinstance(pr, Polygon):
+        # straightened forms (R1 render tier); reverse winding so the reflected
+        # polygon keeps the original orientation convention
+        out = Polygon(pts=tuple(reversed([_reflect_pt(x, y, p, u) for x, y in pr.pts])))
+    else:
+        v1 = _reflect_pt(pr.v1[0], pr.v1[1], p, u)
+        v2 = _reflect_pt(pr.v2[0], pr.v2[1], p, u)
+        v3 = _reflect_pt(pr.v3[0], pr.v3[1], p, u)
+        out = Triangle(v1=v1, v2=v2, v3=v3)
+    return Part(out, part.op, part.group)
 
 
 def _cand_inscribed_circle(

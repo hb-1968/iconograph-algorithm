@@ -32,6 +32,47 @@ flowchart TB
     class FT deferred
 ```
 
+## Current status & pressing issues
+
+_Last full-set verification: 30/30 fixtures, 15-core run (`ICONOGRAPH_JOBS` caps workers;
+default leaves one core free)._
+
+**Built / verified**
+- **Stages 1–2 complete** (categorize, preprocess) and **stage-3 upstream** (L0 align, L1
+  classify, L2 segment) — all pass their contract checks across the fixture set.
+- **Stage 3 — compress** is the active focus and deepest stage: the D1–D3 contour decomposer
+  + the R1 render tier. **Full n=30 set verified:** decompose **30/30** scored, mean area
+  **0.963** / boundary **0.804**, 59/60 features adequate (baseline, no regression); R1
+  **renders 30/30 without crash** (microsoft-edge / react / youtube fully clean; the rest carry
+  honest per-cell feasibility flags — see issue 1).
+- **Stage 4 — refine:** a **mirror-symmetry cleanup pass** exists (harness-driven via
+  `render_debug --cleanup`, not yet pipeline-wired) — fixes gmail@16's render asymmetry,
+  leaves the other seeds byte-identical. Per-part consistency (size-equalization, de-cave) was
+  investigated and found infeasible as a post-pass (see issue 2).
+
+**Pressing issues** (roughly by priority)
+1. **R1 does not ship "all green."** The 5-seed render gate is **~9/15**; the red cells are
+   construction/feasibility-bound (gmail's J-vs-naive LOSS, figma's per-size polish, vscode's
+   raw chevron arms) — NOT crashes. Across the full set the renderer flags drops/violations on
+   most fixtures at small T: these are the renderer honestly reporting cells it can't fully
+   satisfy — the **per-cell geometry polish deferred to stage 5**, not failures.
+2. **figma per-size polish is feasibility-blocked → DEFERRED to stage 5.** The user-provided
+   16×16 ideal and 32px size-consistency cannot be reached in R1: the equal-circles variant is
+   rejected by a cascade of feasibility gates (fidelity floor → `[pocket]` anti-globbing →
+   `[distinct]` → @16 `global_ok`), and forcing it both fails the target AND regresses the
+   reg-group analogue (row_stack@32 win→LOSS). figma is **shippable as-is**; the polish is a
+   stage-5 geometry-refinement matter (see R1 round 11).
+3. **The pipeline is not end-to-end.** `application/pipeline.py` is a stub; the stage-4 cleanup
+   runs only under the testbed. **Stages 5–6 are unimplemented.** `build` does not run end-to-
+   end yet — only the per-stage testbeds work.
+4. **R2 / R3 render tiers deferred** (junction overrepresentation, residual layering) — the
+   thin-stroke / tiny-grid identity losses (claude@16 spikes, vscode@16 X, mastodon residual)
+   live there.
+5. **Two fixtures route incompletely** — electron + vue yield no multi-part L2 Features (open
+   stage-1/2 routing item; see Stage 1 status). They still render, but aren't fully decomposed.
+
+Per-stage detail + the full round-by-round R1 history are below.
+
 ## Pipeline stages
 
 This README documents each stage's **interface** — input contract, output
@@ -296,8 +337,10 @@ whose own construction needs subtracts); default group 0 = flat `(∪add)−(∪
 the renderer overrepresents), residual mask (low-res render tier) }`. Vocabulary includes **Wedge**
 (filled pie sector, `cv2.ellipse` partial-angle raster; `a1 > a0`, may exceed 360°).
 
-**Render tiers — stage 6, NOT built:** R1 idealize/linearize primitives → crisp pixel-art; R2
-overrepresent junctions; R3 low-res nearest-neighbour the residual, layered last.
+**Render tiers:** R1 idealize/linearize primitives → crisp pixel-art — **BUILT, lives in stage 3**
+(`compress/straighten.py` + `compress/render.py`, see §"R1 — render" below; the renders then feed
+stage 4 refinement); R2 overrepresent junctions; R3 low-res nearest-neighbour the residual, layered
+last (R2/R3 deferred).
 
 **Pre-pivot results (historical record — the 25-fixture / 55-feature era):** Apple → `body ellipse − bite + leaf` (0.93; leaf 0.95); Docker
 whale → `hull half-disc (ellipse − waterline carve) + remainder`, the old balloon eliminated (0.79;
@@ -457,15 +500,708 @@ iconograph.l3_debug` (default fixtures: android-head_flat, gmail, obsidian), whi
 a 4-panel strip per fixture (aligned | L2 features | L3 pass-1 | L3 pass-2) to
 `testbed/L3_fit/`; full-testbed wiring is deferred.
 
+#### R1 — render (idealize/linearize onto the pixel grid)
+
+**Status: methodology built + verified on the synthetic set; fixture integration landed
+(2026-06-11).** Stage-3 placement (the renders feed stage-4 refinement); testbed-CLI wiring is the
+next phase. `compress/straighten.py` (degree-ladder geometry) + `compress/render.py` (grid-fit
+search); harness `python -m iconograph.render_debug` (synthetic mode) and
+`python -m iconograph.render_debug --fixtures [stem …]` (real decompositions).
+
+**Contract.** `render(parts: list[Part], canvas_hw, target) -> (target, target) uint8` and
+`render_debug(...) -> RenderResult` (mask + reference + naive baseline + per-part `TweakRecord`s +
+violation/drop report). Input is `Decomposition.parts` in the padded canonical canvas (square, ==
+`Decomposition.shape`); `target` ∈ `HICOLOR_SIZES` (`application/common.py`). Junctions → R2,
+residual → R3, both deferred. Deterministic (H8): fixed candidate order, total tie-breaks, no RNG —
+`render_debug --twice` asserts byte-identical reruns.
+
+**Doctrine.** The Parts are ground truth; each part's *degree of straightening*, per-axis size, and
+placement are tweakable. Jag = staircase aliasing from curves and off-grid diagonals; the renderer
+re-expresses curves as straight edges meeting at single corners (a sole circle at 16 px → a square),
+with the permitted curvature set by the part's **structural role**:
+
+- **Degree ladder** (0 = fully straight … 3 = true curve), per primitive kind: circle/ellipse →
+  area-matched square (`side r√π`, IoU vs disc ≈ 0.83) / octagon / 16-gon / dense 64-gon; rounded-rect
+  → sharp box / chamfer (the chord between arc endpoints — lies inside the arc, composition-safe) /
+  dense true outline; rotated kinds snap angles to {0°, 90°} / 45°-grid / original; wedge → 1-chord /
+  2-chord / 4-chord / dense fan with **(a0, sweep) snapped as a pair** (never a0/a1 independently);
+  triangle → edge-angle 45°-snap within 15° / 8° tolerance, vertices re-derived as line intersections.
+  Sub-1.5-px curvature auto-degenerates to D0 (a capsule at 16 px is a sharp rect).
+- **Raster convention (load-bearing, pinned by the harness self-test):** `cv2.fillPoly` is
+  outline-inclusive with round-half-up vertex placement — an integer-corner box `(a..b)` fills pixels
+  `a..b` exactly; cv2's center+radius drawing covers `2r+1` px. All emitted forms are **inset ~0.5 px
+  per edge** (boxes −1/dim, N-gons −0.5/apothem, triangle edge-lines shifted 0.5 inward) so fills
+  match the pixel-centers-inside coverage rule; `Polygon` rasters at quarter-px fixed point
+  (`shift=2` — half-px quantization lands on round-half-up ties and bloats right/bottom edges).
+  DEG_TRUE forms are *dense polygons* (64-gons, 6°-step arcs) for the same reason: the int-rounded
+  `cv2.circle`/`_rounded_rect_poly` paths cap boundary IoU ≈ 0.69 at T=64.
+- **Roles, inferred structurally** (Parts carry no labels; stage 3 stays frozen): per positive group
+  the largest add = `dominant`, other adds `lobe` (≥ 0.25× dominant) or `accent`; subtracts split
+  `counter` (≥ 0.85 of the bite interior to `erode(add-union, band)`) vs `shave` (bevel/notch — bite
+  touches the boundary band); negative groups are counters wholesale.
+- **Curvature budget** = base extent ladder (`<8 px → D0 | 8–15 → D1 | 16–31 → D2 | 32–63 → D3 |
+  ≥64 → forced true`) + role offset (`dominant/lobe −1, accent 0, shave/counter +1`) — dominant
+  curves straighten hardest, bevels keep more curve. The budget is a *maximum*; degrees above it stay
+  in the candidate set as **escalation** options because the proportionality floor outranks the
+  straightening doctrine (a sole wedge whose D0 45°-snap rotates the sector 20° escalates to D1/D2
+  instead of shipping a misfit).
+- **Jag metric** `J = Σ contours [approxPolyDP(ε=1) vertex count + 0.25·len(off-grid segments)]`
+  (RETR_CCOMP so holes count; CHAIN_APPROX_NONE input). DP absorbs the *perfect* 45° staircase — the
+  optimal digital diagonal — into one segment; the length term catches digitally-straight but
+  visually-stairy slopes (a 30° edge). Normalized `Ĵ = J / boundary px` compares across sizes.
+- **Grid-fit search:** per-part candidates = degree × extent targets ({round±1, floor, ceil} of each
+  axis — anisotropic for adds, because the reference's ≥0.5 tie-inclusive coverage can stretch one
+  axis by a pixel) × snap mode (none / center-to-half-grid / bbox-corner-to-integer). Two passes of
+  dominant-first coordinate descent, lexicographic objective: feasibility → global J ↓ → min(area,
+  boundary) IoU vs the supersampled reference ↑ → lower degree → candidate order. Between the
+  passes, **parent-follow candidates** (the composition clause): subordinates gain variants
+  translated through their group dominant's chosen affine map, so a corner bevel cuts the *snapped*
+  corner, not the absolute grid — this is what makes bevel_rect hit the reference's own J exactly.
+  After both passes, **twin harmonization**: identical-shape siblings (four corner bevels) must not
+  end with mixed degrees because fractional-phase ties broke differently per corner; each uniform
+  degree is tried set-wide (floor checked on the final state only) and the best (J, fidelity) wins.
+- **Reference + baseline:** `R_T` = parts rastered at 4×T → exact numpy box-mean → ≥ 0.5 threshold
+  (NOT `cv2.INTER_AREA`, whose uint8 cast truncates the exactly-half case); the baseline to beat is
+  the INTER_NEAREST downsample of the canonical-res compound mask.
+- **Composition constraints** (the size-compromise clauses): subordinate inflation cap (cand \ orig
+  ≤ 0.35·orig + 2 px); shave **bite-growth** cap (extra parent eaten ≤ 0.30·bite + 2 px past a 1-px
+  tolerance — "the rounding must not exceed the rect it rounds"); **sibling retention** (every add
+  keeps ≥ 0.6× its reference visibility — no feature starves another); the global **proportionality
+  floor** `min(area, boundary) IoU ≥ 0.55 (T≤24) / 0.65 (≤48) / 0.75 (≥64)` — deliberately LOW for
+  now. Infeasible parts fall back to their most faithful form and are flagged; the renderer never
+  crashes.
+- **Min-feature rules** (T=16 regime): dominant/lobe clamp UP, never drop; sub-min shaves/accents
+  DROP (a 2-px bevel is noise stealing silhouette pixels); counters force-merge if ≥ 1 px of
+  surrounding material survives, else drop (annulus → disc is the legal extreme-T degradation). A
+  post-render **island-integrity audit** drops negative-group islands that fused with the body
+  (recorded, so the topology audit sees a 1:1-accounted drop).
+
+**Round 2 — symmetrization + label collapse + wedge suppression.** Diagnosis (user, on the round-1
+fixture strips): the naive baseline often *looks* better because it preserves the mirror/radial
+symmetry the constructions inherently carry, while per-part snapping breaks it — and the jag metric
+is blind to symmetry. Three mechanisms, all arbitrated honestly:
+
+- **Symmetrization.** The construction's mirror axis is detected once at canonical res (the
+  `_mirror_axis` helper lifted from diff_fit to `common.py` — H5; near-vertical/horizontal only,
+  a diagonal mirror cannot be enforced on an integer raster), snapped to the half-px grid at target
+  scale, and the whole construction rigidly shifted onto it. Parts pair by reflection-matching at
+  canonical res (discord = on-axis body + 5 mirror pairs); each FOLLOWER renders as the **exact
+  integer raster flip** of its leader about the snapped axis — pixel-exact symmetry by construction.
+  Never rasterize reflected polygons: fillPoly's round-half-up tie bias is not mirror-equivariant,
+  so even an analytically exact reflection can land one pixel off its twin. On-axis (self-paired)
+  parts keep only flip-invariant candidates (the round±1 parity targets guarantee one exists).
+  Drops are pair-coherent. **Local mirror pairs** (vscode's two X bars — no global axis) get the
+  same flip machinery about their own snapped pair axis. A fired axis REPLACES the plain search
+  (arbitrating symmetric-vs-not on (J, fid) would recreate the blindness); a plain fallback ships
+  only when the symmetric render misses the floor. Reported as `sym = IoU(render, flip(render))`.
+- **Distinctness (the constraint symmetrization exposed).** Retention measures *coverage*, not
+  identity — a feature absorbed into a sibling is still "covered", and pairing lets one choice move
+  both twins at once, so the jag-first objective fuses identity-bearing twins (figma's stacked
+  circles, vscode's X). Feasibility therefore also requires every add to keep ≥ `RETAIN_FRAC` of
+  its EXCLUSIVE territory (pixels only it covers among the true forms).
+- **Label collapse** (the user's "convolution"): at T ≤ `COLLAPSE_MAX_T = 32`, each positive group's
+  add-set offers a collapsed variant — ONE label fitted to the group silhouette `M_g = (∪ adds)
+  AND-NOT (∪ shave solos)` at canonical res (shaves ABSORBED into the silhouette, counters RETAINED
+  to re-carve the label: discord's eyes are non-negotiable). Fitter pool = the L1/decompose single-
+  primitive fitters + `_fit_rounded_rect(min_aspect=1.0)` for squircle faces; gate: canonical
+  `min(area, boundary)` ≥ `COLLAPSE_MIN_IOU = 0.80` (the figma guard — a five-lobe column never
+  clears it). **Radial families** (hub + ≥6 equidistant uniform-spaced blades, re-detected
+  geometrically from the Part list) also offer a `star_polygon` label (straighten.py; 2n vertices,
+  phase snapped MODULO the pitch 360/n, never the absolute 45° grid) gated on AREA IoU only — the
+  star is an idealization whose boundary is deliberately simplified; its honest boundary test is the
+  target-scale arbitration. Variants run the SAME pair-aware search and compete with the multi-part
+  incumbent on `(feasible, J, −fid, n_parts)` — fewer parts breaks J ties (parsimony); a collapsed
+  face whose counters force-merge away is INFEASIBLE by the topology clause. Absorbed parts get
+  1:1-accounted records; ref/naive always come from the ORIGINAL parts.
+- **Wedge doctrine (user):** strict pixel-detail; a wedge's rotation is a SUPPRESSIBLE degree of
+  freedom — orientation-normalized candidate bases (a0 snapped to the 45° grid, sweep preserved)
+  are offered at EVERY chord-detail level and listed first, decoupling the ladder's (angle-grid ×
+  chord-count) coupling; the floor arbitrates when the rotation is identity-bearing.
+
+**Round 3 — the digital-line doctrine, anti-globbing, pronouncedness, build symmetry (BUILT).**
+User critique of the round-2 strips identified four deeper failures; one inverts a core metric
+assumption:
+
+- **The digital-line doctrine (J₂).** The decomposable unit downstream is the **pixel run**, not the
+  geometric chord: stage-4 refinement's tools (stray-pixel snap, isolated-pixel removal, min-feature)
+  all threshold at ≥ 2 px, so a 1-px 45° staircase — which the DP-based J treats as FREE — is the
+  *worst* boundary structure: every 1×1 tooth decomposes as a stray pixel or a 1-px line. This is why
+  straight edges matter fundamentally, and why gmail's naive beat the round-2 render. J₂ keeps the DP
+  vertex count and adds a staircase term from the raw chain code: per maximal staircase region,
+  penalize **n_dd = the count of consecutive diagonal-diagonal move pairs** beyond a K₄₅ = 3 chamfer
+  allowance (a pure 45° run of L moves costs L−1; a clean 2:1 line costs 0; "straight edges that form
+  from single corners" = short chamfers stay free). The on-grid angle set widens to the digital slope
+  grid Θ = {0, ±26.57°, ±45°, ±63.43°, 90°} (runs ≥ 2). Calibration gates before anything else:
+  J₂(gmail naive) < J₂(gmail round-2 render); a hand-built 2:1-V M beats naive; small-octagon cells
+  keep their ordering. All recorded J numbers are metric-relative — gates restate as ratios under the
+  SAME metric, old→new recorded side-by-side in the transition only. Vocabulary follows: slope-grid
+  snaps everywhere a 45°-grid snap exists today (45° stays — the rule is reachability + honest
+  pricing of the 2:1/1:2 siblings); the D1 circle form becomes a chamfered square (45° edges capped
+  at K₄₅); a staircase-escalation clause keeps the budget from deadlocking against the new penalty.
+- **Anti-globbing.** Distinctness protects each part's ink; nothing protects shared BACKGROUND — a
+  glob assembles from individually-legal allowances meeting in the middle (claude's mass, vscode's
+  swallowed tails, figma@16). Two constraints, both newly-violated semantics: **separation** (adds
+  whose true target solos are non-8-adjacent must stay non-adjacent) and **pocket retention**
+  (negative-space pockets = components of close(R_T, 3×3) AND-NOT R_T with area ≥ 3 px — vscode's
+  open wedges — keep ≥ 0.5 of their pixels background; also enforced in the final arbitration, which
+  is how a collapse variant honestly beats a globbed incumbent), plus anti-globbing's DUAL — a
+  **connectivity clause** (never newly fragment beyond the reference's component count: separation
+  carving must not split a connected mark, measured the hard way on vscode@16). Sub-pixel gaps
+  (claude@16's inter-blade < 1 px) are unrepresentable — constraints correctly don't fire; the
+  degradation is **blade decimation** (keep every 2nd blade, drops recorded 1:1, gap
+  representability judged OUTSIDE the hub neighborhood) competing as a family variant.
+- **Pronounced significant feature geometry.** A subordinate's tiny-T identity is its **protrusion
+  profile**, not its area: discord's wings should render *narrower and less tilted* — less accurate,
+  more true to the style. Mechanics: narrow+straighten candidates for elongated subordinates (width
+  down to min-feature, length preserved, harder angle snaps — nothing offers narrowing today); a
+  pronouncedness floor (protrusion depth via distance transform ≥ 0.6× its reference depth, for
+  features with d_ref ≥ 1.5 px); inflation extended to LOBES (the forced-extension bug-class); and
+  narrowed candidates trade retention down to 0.4 *iff* pronouncedness holds.
+- **Build symmetry (both flavors).** Repeat-regularity: twin harmonization extends from
+  uniform-degree to uniform-(degree, fx, fy) — twins must render identical up to placement; radial
+  families gain comb-snapped spacing harmonization (offered, arbitrated). A final-mask audit removes
+  AND records unclaimed sub-min-feature components (the stray-pixel class) — sym must be exactly 1.0
+  when an axis fired. An EXPECTED_SYM table in the harness audits detected-vs-expected axis fires
+  per case; gate constants loosen only against a named miss.
+- **render_fit (test-time differentiable tweak refiner, diff_fit sibling).** Optimizes per-LEADER
+  deltas only (Δpos ± 2 px, per-axis log-scale [0.95, 1.05]; NO angle — angles are doctrine; NO
+  existence gates — drops stay 1:1-accounted) over polygon SDFs at a ~64-px grid against the
+  pre-threshold float coverage map; loss = band-weighted soft IoU + W_SEP·(soft occupancy over
+  pocket masks) + a prior pulling toward the deterministic incumbent. Soft-optimize → decode (snap
+  to the crisp grids) → re-score HARD through the full feasibility battery and the same arbitration
+  as one more candidate run; soft scores never escape. Fires only when the deterministic result is
+  flagged (violations, globbing infeasibility, J₂ ratio > 0.95, or fid within 0.05 of the floor);
+  torch absent → silent skip.
+
+**Round-3 measured results (per-cell truth; ALL J numbers below are J₂ — never compare to the
+round-1/2 J₁ numbers above).** Synthetic grid (13 cases × {16, 32}): **24/26 jag wins, median Ĵ
+ratio 0.597, floor-or-drop 25/26, topo 26/26, sym-audit 26/26, violations 4.** Determinism:
+`--twice` byte-identical (26/26 synthetic full grid pre-connectivity; 12/12 subset on the final
+build incl. the new cases; discord fixture ×2). The new cases vs
+their before-strips: `long_diag` 0.974/0.893 → **0.550/0.472** (the V renders as clean 2:1 runs —
+the doctrine's core win), `tab_body` tab-DROPPED → **kept + pronounced** (0.499/0.431, sym 1.0),
+`asterisk6` @16 star6 collapse 0.559 / @32 star6 wins as a recorded 1.186 LOSS (a clean symmetric
+star honestly out-keys six jaggier rotated blades — the "six distinct blades" expectation was
+mis-calibrated against the J-first arbitration), `thin_x` @16 1.054 LOSS with fid 0.515 < floor
+(0.75-px-wide bars — the representability edge; local pair fires, accent preserved). The sym-audit
+caught and fixed a real bug: 4-fold-symmetric shapes made `_mirror_axis`'s strict argmax land on
+the PCA DIAGONAL (nested_counter) — `_sym_prep` now re-tests axis-aligned mirrors before rejecting,
+and nested_counter@16 keeps its island with sym 1.000, zero drops.
+Fixtures (5 × {16, 32}): **discord** 0.667/0.574, sym 1.000, fid 0.790/0.701 (@32 strongly improved
+— the wings render from narrowed/snapped candidates); **vscode** 0.615/0.636, fid 0.689/0.688, violations 0 (an earlier
+round-3 build FRAGMENTED the mark at 16 — a floating left chunk where separation carved
+connectivity, a regression the silhouette metrics rewarded; fixed by the CONNECTIVITY clause:
+`global_ok` forbids newly fragmenting beyond the reference's component count — anti-globbing's
+dual, and the absolute battery enforces it at arbitration too); **gmail** @32 **0.631** with the V as clean 2:1 runs (the doctrine case) but @16 **1.169
+LOSS** (fid up 0.639→0.742; the naive's short 45° V sits INSIDE the K45 chamfer allowance — free —
+while the chunky 2-px-step V pays DP vertices: a real metric edge at tiny sizes, documented);
+**claude** decimates 12→6 blades at both sizes (@16 0.640/fid 0.550 — a defensible 6-spoke
+simplification; @32 0.869/fid **0.490 below floor, viol 7** — the organic narrowest gaps trip the
+decimation test, open item); **figma** guard holds (gates did not fire), 0.612/0.287.
+
+**Round-3 open items:** (a) gmail@16's chamfer-allowance interplay (naive's sub-K45 45° V is
+metric-free; consider a tiny-T notch vocabulary or K45 sensitivity under H1); (b) claude's
+decimation aggressiveness (fused-pair majority over-fires on organic spacing — @32 fid 0.490 and
+viol 7 is too much identity to spend, and the decimated strips read sparse; evidence-gate a
+fused-fraction or per-gap test); (c) thin_x@16 stays sub-floor (0.75-px bars are below honest
+representability — R2-tier overrepresentation territory); (d) the gmail@32 V-notch leaves a small
+symmetric uncarved wart (claimed by the dominant, so the final-mask audit correctly keeps it — a
+refiner/vocabulary nit); (e) vscode's sym reads 0.936/0.989 with the axis fired — UNPAIRED
+asymmetric parts legitimately float, so "sym must be exactly 1.0" holds only when every live part
+is paired or self-paired (doctrine note).
+
+**Round 4 — extrapolated symmetry + removal on globbing (BUILT, `!fc`).** Two user directives:
+*"Features can be 'removed' if they produce globbing, such as with Claude's spurs"* and *"take the
+geometry and 'extrapolate' symmetries due to the heavy globbing"* (claude), with *"Figma's lower
+resolution also suffers — it loses recognizability"*. Locked decisions: the **FEASIBILITY rule**
+(a render that breaks a DETECTED family's regularity is infeasible — offering symmetric variants
+is not enough, because claude's lopsided cross has LOWER raw jag than a clean star, so regular
+forms can only win through the feasibility term); figma = regularity + **round/rounded identity**
+(a non-dominant Circle keeps ≥ the octagon, an RRect keeps its chamfer — the pill's cut corner IS
+the upper half of figma's armpit dent); claude = uniform **12 spokes @32 / 6 @16**, the depth
+following the same evidence as decimation. Mechanics: `_subrep_pairs` per-gap evidence (ring-
+quantized fused-span fraction ≥ GAP_FUSE_FRAC, np.bincount over a radius map — library-scout
+rejected warpPolar at T ≤ 32) replaces the fused-majority decimation gate, **closing round-3 open
+item (b)** (claude@16 fires, @32 does not, asterisk6 never did); **family-harmonized comb
+variants** (uniform median-dim blades on the comb, inward hub overlap so attachment isn't raster
+phase, D1 slope-grid angle floor — D0 axis-aligns a comb into a '#'); the **translational
+`regularize` variant** from `_regularity_groups` (≥3-member same-kind size groups + STRUCTURAL
+alignment — concentric members and pitch-only accidents like vscode's X are excluded; radial
+blades skipped: a family owns its blades); all extrapolated/decimated/removal variants are
+**searched against their OWN reference** (`_run` ref-substitution; `fid_ref` floor waiver, area-
+only for comb runs; full-reference fidelity stays in the arbitration key and the report; variant
+topology gets the canonical escape); the **idealized-candidate lock** (extrapolated runs keep only
+degree + raster phase: isotropic ±1px parity sizes, half-px snaps, no parent-follow drift) plus a
+**background-SPILL cap** (the ideal is known — don't paint meaningfully outside it; open-corner
+negative space like figma's step has no pocket to guard it); comb-scale battery relaxations
+(aggregate pockets at POCKET_RETAIN_REF, 2×POCKET_MIN floor, sub-min-feature identity skips,
+newly-violated floor semantics) **scoped to family runs only** — leaking them to figma was exactly
+what let its silhouette step fill; and **phase-B removal**: `_global_fail` class tags + offender
+attribution feed accent-only, twin-closed, REMOVE_MAX_FRAC-capped removal variants, constructed
+only when nothing is feasible, absorbed-accounted (claude's blades are LOBES — family-ladder
+territory, never per-part removal). Harness: `asterisk12` (organic ±6° jittered 12-comb) and
+`row_stack` (figma-analogue grid) synthetics, EXPECTED_REG audit (radial: claude/asterisk6/
+asterisk12; group: figma/row_stack; none elsewhere), `live`/`extr` fid_ref columns.
+
+**Round-4 measured results (per-cell truth, J₂ ratios).** The named cases land on extrapolated
+winners with zero violations: **claude@16 Ĵ 0.617**, harmonize 12→6 blades (fid_ref **0.783** vs
+the 6-comb's own reference, full-ref fid 0.524, 6 removed blades recorded, 55 px) — a clean
+uniform 6-spoke star instead of the round-3 lopsided cross; **claude@32 Ĵ 0.790**, harmonize 12
+blades (fid_ref **0.702**, full-ref 0.483) — 12 distinguishable uniform spokes on slope-grid
+angles (vs round-3's fid 0.490/viol 7 sparse glob; the ratio is higher than round 3's 0.869
+because the comb keeps 12 thin blades where the glob flattened them — doctrine over metric);
+**figma@16 Ĵ 0.706**, regularize (fid 0.629, was 0.584-as-blob) — chamfered pill, distinct right
+bump with the armpit dent, open step, bottom foot (the user's "unrecognizable" complaint;
+recognizability was rebuilt from identity floors + the spill cap, and the Ĵ ratio worsened from
+the blob's 0.427 — the blob was jag-optimal); **figma@32 Ĵ 0.531** (incumbent, viol 2 recorded —
+armpit + round circle present, round-identity floor active; round-3's 0.287 was the squared-
+circle render the user rejected). Synthetics: asterisk12 = 6-spoke @16 (live 0.713) / 12-spoke
+@32 (extr 0.695); row_stack@16 incumbent passes the reg audit, @32 carries viol 2 (open item).
+Guards held throughout: **asterisk6/thin_x/long_diag/tab_body cells identical to round 3**;
+discord 0.667/0.574, gmail 1.169 LOSS/0.631, vscode 0.615/0.636 viol 0 — byte-level round-3
+parity; figma mirror-axis guard holds. Full synthetic grid (15 × {16,24,32,64} = 60 cells):
+jag wins 53/60, median Ĵ 0.640, floor-or-drop 59/60, topo-or-drop 58/60, sym-audit 60/60,
+reg-audit 60/60; the round-identity floor deliberately costs lobe_union@24/@32 their jag wins
+(1.118/1.070 LOSS — the circle lobe stays octagonal instead of squaring, the figma trade
+accepted per-cell). Determinism: `--twice` byte-identical, grid + all five fixtures.
+
+**Round-4 open items:** (a) row_stack@32 ships the incumbent with viol 2 (its regularize variant
+trips the per-pocket veto under the locked candidates — the synthetic's pill/circle notches sit
+at the representability edge); (b) asterisk12@16 carries one recorded violation on the winning
+6-comb (a blade fallback — [other]-class, sub-min-feature search noise); (c) the gmail@16 K45
+interplay carries over from round 3 unchanged (thin_x@16's sub-floor, the other carry-over,
+is CLOSED by round 5's L-corner doctrine, with its visual form recorded open as round-5 item (e)); (d) figma@32 ships the
+incumbent as least-bad (viol 2 recorded; visually sound — armpit and round circle present): its
+regularize variant is also infeasible under the locked candidates (battery [pocket] on its own
+reference, fid_ref 0.626 < 0.65) — the per-pocket veto at the 0.5 bar is tight for snapped
+geometry at 32; revisit under H1 if more grid-class fixtures join the set; (e) **thin_x@16's
+visual form** (round-5 grader finding): the user-locked double-corner reduction renders
+faithfully and feasibly but reads closer to an H-frame than the drawn X at near-square
+proportions — the diagonal lean is traded for run purity; the user adjudicates the form on the
+strip (a possible refinement: per-stroke reductions that keep opposite diagonal lean through the
+shared center rather than the single shared-band collapse).
+
+**Round 5 — the L-corner doctrine (BUILT, `!fc`).** The user hand-drew the 16×16 ideal for a thin
+X — *"symmetrical, diagonals reduced into L corners for minimal jank and heavy 1px stepping"* —
+and generalized it: *"use this as a rendering basis for the current rendering curves on diagonals
+like VSCode and so on."* The missing vocabulary rung: D0 axis-aligns a thin diagonal away
+entirely, D1's Θ-slope still staircases at ~1px width; round 5 renders the stroke as the COARSEST
+digital line — axis runs joined by single corners. `straighten.stroke_axis_runs` builds the forms
+("l"/"lr" single-corner; "z" = the drawn flat-X form, dominant run through the center + tip stubs;
+"z2" = the user-locked double-corner form for near-square strokes — tip treads + center band +
+risers at the span quartiles, keeping a crossing pair's four corners distinct where the flat form
+would degenerate into a serifed 'I'). Crossing strokes (center cluster ≤ 0.3×span) share ONE band
+on the crossing center, quartile breaks symmetric about it (stroke-relative breaks produce
+pinwheel chirality, not the drawn mirror X). The reduction competes both as d=0 candidates and as
+the **`axisreduce` extrapolated variant** (ref-substituted — candidate forms alone can never beat
+the most-faithful fallback in sub-floor territory, and "less accurate but more true to the style"
+is the point), with three hard-won integration rules: ROLES INHERITED (re-inference on 1px forms
+made the accent square the dominant), SYM CONSTRUCTIVE (detection off — the grid-snapped mirror
+polygons raster tie-free; the pair machinery's half-px axis detection was itself the last
+asymmetry source), and EXACT-AS-BUILT rendering for Polygon parts in ref-runs (f=1, no snaps —
+per-part snap fallbacks broke the mirror). The width duality: 1px runs build at width 1.6
+(half-thickness 0.3 → quarter-px 0.25), so the raster keeps 1px while the ≥0.5-coverage reference
+sees 0.6 — at width 1.0 the reference is EMPTY (zero-thickness polyline), at 0.49 the quarter-px
+0.5 tie fattens every run to 2px. Radial-family blades are always excluded (comb territory).
+
+**Round-5 measured results (per-cell truth, J₂ ratios).** **thin_x@16 Ĵ 0.474** (was the 1.054
+LOSS — round-3 open item (c)'s sub-floor staircase CLOSED): the axisreduce variant wins FEASIBLY
+(viol 0, extr **0.778**, full-ref fid 0.282 reported beside it), zero staircase, exact
+constructive symmetry, the four corner stubs distinct — but VISUAL TRUTH (grader finding, open
+item (e) below): at thin_x's near-square proportions the assembled axis-run form reads closer to
+an **H-frame than the drawn X** — the user-locked double-corner construction is rendered
+faithfully, yet the diagonal lean is traded for run purity, and the naive staircase arguably
+reads more X-like; whether this form is the intended ideal at these proportions is the user's
+strip call, recorded OPEN rather than asserted; **thin_x@24 Ĵ 0.425** (extr 0.810) also takes
+the reduction; @32 the feasible Θ-staircase incumbent wins
+honestly (0.978) and @64 keeps its pre-existing 1.052 LOSS. vscode and gmail are byte-identical to
+round 4 — their feasible incumbents beat the L-variant on the honest key (the basis is OFFERED
+everywhere; fidelity arbitrates), and gmail's V is negative space (no qualifying add strokes).
+Full grid (15 × {16,24,32,64}): jag wins **54/60** (up from 53), median Ĵ 0.622, floor-or-drop
+**60/60**, topo-or-drop 59/60, violations 16 (down from 18), sym-audit 60/60, reg-audit 60/60;
+remaining losses: lobe_union@24/@32 (the round-identity trade), notch_rect@24, capsule@64,
+asterisk6@32 (star wins honestly), thin_x@64 — all pre-existing or doctrine-deliberate, none new.
+Fixtures (5 × {16,32}): every cell at round-4 parity (discord 0.667/0.574, gmail 1.169 LOSS/0.631,
+vscode 0.615/0.636, claude 0.617/0.790, figma 0.706/0.531), reg-audit 10/10, mirror-axis guard
+holds. Determinism: `--twice` byte-identical, 0 mismatches across the grid and all five fixtures.
+
+**Round 6 — proportion honesty, run-≥2 geometric extensions, the 5-fixture gate (BUILT, `!fc`).**
+Three directives: *"the globbing and overproportions on the VSCode are not particularly good"*;
+*"at higher resolutions there is a style loss as the Logos go to focus on using the 1px diagonal
+formations (many bumps) instead of using geometric extensions"*; *"make sure it runs perfectly on
+the 5 fixtures here before it is shipped onto the full fixture set."* User rulings locked this
+round: uniform 1-px 45° staircases at high res are **avoided unless completely necessary**
+(hierarchy: axis runs / run-≥2 slopes ±26.57°/±63.43° first, uniform 45° only when run-≥2 fails
+the floors, irregular true-angle only as recorded fallback); the gate covers the five seeds ×
+**T ∈ {16, 24, 32} exclusively**. Measured root causes: a thin ~50° bar's solo J at 32 is **2.0**
+as a 63.43° run-2 line vs 28.0 at uniform 45° vs 31.6 at true angle — the metric already ranks
+the ruling, but the run-2 form was NEVER OFFERED (`snap_slope` goes to the nearest Θ member = 45°,
+and the escalation clause then hands the part to true angle); `TRI_SNAP_TOL` D1 = 8° left Θ DEAD
+ZONES (max grid distance 13.285°) where gmail's V (~72-82°) and vscode's chevron hypotenuses kept
+true angles while recording deg=1; vscode@16 spilled 30/121 px (25%) outside its reference
+(dominant chose f=1.23 — the jag-first key buys −J with +1-px columns; nothing policed it);
+gmail's V counters SHRANK to f=0.68 for jag (under-carving was unpoliced); gmail@24/32 carried a
+3×2 detached sliver the round-3 stray audit skipped (claimed by the dominant AND min-dim ==
+min-feature, not below).
+
+Built: **(a)** the run-≥2 rung — `SLOPE_GRID_RUN2` = Θ∖{45°}, `snap_slope_run2` /
+`snap_triangle_run2` (grid param threaded through `_snap_triangle`; shared float members make the
+D1 re-snap idempotent), extra `_candidates` bases for elongated 45°-zone diagonal adds + the
+**`slopereg`** ref-substituted variant (T ≥ 32 — round 5's L-corner doctrine owns thin diagonals
+at 16/24, where the slopereg form measured fid_ref 0.289/0.544 and would have displaced the
+locked doctrine on raw J; `enable_sym=False` — the pair-flip phase cost 0.682→0.564 of fid_ref;
+fid_ref AREA-ONLY when every substituted part is a thin stroke, the round-4 comb doctrine;
+radial blades excluded — comb pitch outranks the slope grid). **(b)** `TRI_SNAP_TOL` D1 → 13.5
+(full-Θ coverage; `competition`'s edges verified inside the old tolerance — unaffected).
+**(c)** the **baseline-relative proportion guard** (incumbent runs): per-(part, degree) f=1 twin
+floors — extra spill-outside-ref (adds) / extra uncarved-in-ref-empty (subtracts; `_bite_ok`
+polices over-carving, nothing policed UNDER-carving) beyond the twin ≤ max(2, 0.10·ink).
+Followers get FLIPPED f=1 twins vs their own true form (the pair-flip phase error is constant
+across candidates and must cancel — gmail's mirrored V counters failed every candidate against
+the leader's baseline). Straightening quantization is free by construction (circle@16's square
+spills its corners at f=1 too). Rotated sub-min-feature-width strokes exempt via `_local_dims`
+(extents[] and solo-bboxes are blind to stroke width on rotated geometry — long_diag's 1.5-px
+bars). Ref-runs are EXCLUDED: they already carry the round-4 idealized-candidate lock +
+`SPILL_FRAC_REF`, and stacking the guard there broke figma's regularize equilibrium. **(d)** the
+**claimed-stray clause**: final-mask components ≤ min-feature² lying ≥ `STRAY_OUT_FRAC`=0.6
+outside the reference are removed + 1:1-recorded + tagged `[stray]` (a new feasibility class)
+even when a live part claims them — unless a claimer is itself a sub-min-feature-width stroke
+(claude@16's 1-px comb blades legitimately raster in min-feature-sized fragments); the unclaimed
+branch keeps round-3 semantics byte-identical. **(e)** **absolute-extent snap-harmonization**:
+size-group members match (d, round(fx·ex_i), round(fy·ey_i)) with free ≤0.5 snaps — the round-4
+ratio-tuple matcher was structurally a NO-OP for perturbed groups (equal ratios → unequal pixels,
+equal pixels → unequal ratios; figma's r=26.3/26.0/25.7 circles could never harmonize).
+**(f)** the **gate surface**: `render_debug` fixture defaults = all five seeds; per-cell gate
+table (Jratio/viol/strays/topo/floor/reg → PASS/FAIL) — the silhouette-TOPOLOGY column exists
+because a persisting detached blob is invisible to every other column. Probed and **REVERTED**:
+a newly-violated-or-worsened soften of `distinct_ok`'s own-hard check (it never freed figma's
+spine — the regularize fid_ref floor blocks that cell regardless — and it drifted claude@16's
+comb blades and thin_x@16's accent into battery failures; own-hard is doctrine).
+
+**Round-6 measured results.** Synthetic grid (15 × {16,24,32,64}): jag wins **55/60** (up from
+54 — thin_x@64's 1.052 LOSS, the grid's last, closed at **0.134**), median Ĵ **0.587** (from
+0.622), floor-or-drop 60/60, **topo-or-drop 59/60 (= baseline parity; it stood at 58/60
+mid-round — the proportion guard rejected asterisk6@64's blade-inflating candidates and the
+star fragmented (1,0)→(3,0), a grader-caught regression fixed by exempting radial-family
+blades from the guard: family machinery polices them, and only at 64 do blades clear the
+min-feature width where no harmonization re-fuses)**, violations 18 (16 + the three new
+single-viol blemishes − row_stack@32's −1), sym/reg audits 60/60, `--twice` 0 mismatches.
+Cells moved (9): thin_x@32 **0.978 → 0.306** (slopereg: STAIR 30 → 0, extr 0.682; one accent
+floor viol recorded) and @64 **1.052 LOSS → 0.134** (extr 0.751, STAIR 86 → 3);
+competition@16/24 fid **0.558→0.674 / 0.563→0.764** (the proportion guard holding shapes
+honest, small ratio cost at 16) and @32 0.983→0.971; row_stack@32 viol 2→1 + fid 0.652→0.669
+(harmonized equal circles; ratio 0.387→0.537 — the regularity trade); annulus@24 0.433→0.450
+(raster-phase); new single-viol blemishes long_diag@24 and row_stack@16 (per-part fallbacks
+under the guard, renders unchanged or improved); asterisk6@64 is byte-identical to baseline
+after the exemption. **Fixture gate (5 × {16,24,32}): 10/15 green**, determinism 15/15, reg-audit 15/15:
+discord 0.790/0.805/0.574 all green (the @16 ratio paid 0.667→0.790 for proportion honesty —
+fid 0.790→0.819); claude 0.617/0.833/0.790 all green (byte-parity at 16/32); figma@16 0.706
+green, **figma@24 0.756 newly green** (was viol 1 — the harmonization fix), figma@32 RED
+(viol 1: the spine's distinct deadlock in the incumbent + the regularize variant still floored
+at fid_ref 0.632 < 0.65 with battery [pocket] — round-4 open item (d) continued; circles now
+EQUAL, viol 2→1); **vscode@24 0.365 / @32 0.507 green — the named complaint resolved on strips**
+(chevron hypotenuses render as uniform Θ digital lines, body proportioned, bump trains gone);
+vscode@16 RED (0.524 with viol 5 + a render hole: the axisreduce X arms + retention-squeezed
+lobes leave a checkered crossing — needs the round-5 crossing-band coupling extended to
+mixed-body constructions, not knobs); gmail@32 0.614 (fid 0.664→0.674, **the sliver REMOVED**,
+topology restored 1:1, [stray] honesty record ships as viol 1) and gmail@16 1.353 / @24 1.213
+RED (the V and bars are now proportion-honest and visually clean on strips — square corners,
+restored V, no blob — but the M's naive raster is exceptionally clean (J 16/20) and R1's
+construction pays corner/junction vertices the naive doesn't; closing these needs construction
+simplification at tiny T — e.g. dropping the sub-representable corner-rounding shaves — not
+constraint tuning). **The 5-fixture gate is NOT met (10/15): per the directive, R1 does NOT ship
+to the full fixture set this round.**
+
+**Round-6 open items:** (a) gmail@16/24 J-vs-naive LOSS — construction-level (corner-shave
+simplification; possibly slopereg-for-subtract-triangle V arms, currently add-only);
+(b) vscode@16 crossing integrity under axisreduce + proportion (5 internal fallbacks);
+(c) figma@32 regularize floor (fid_ref 0.632 vs 0.65 + battery [pocket] at 32 — the per-cell
+relief that round 4 deferred); (d) the gmail [stray] violation is an honesty record — the
+underlying counter-tip meet is unfixed (the sliver is removed from the mask, recorded 1:1);
+(e) thin_x@32's slopereg ships one accent floor viol (the accent's own exclusivity in the
+substituted frame); (f) round-5 item (e) — thin_x@16's H-frame-vs-X — now has a competing data
+point: the slopereg X (two 63.43° run-2 strokes) measured J 8.8 at 16 but fid_ref 0.289 with
+sym off; if the user prefers a leaning X at 16 over the locked L-corner form, slopereg-at-16
+with constructive symmetry is the candidate path.
+
+**Round 7 — the represented-geometry heuristic (BUILT, `!fc`).** Two user directives, one
+principle: *"The render policy seems inconsistent for the top pill at 16×16 — it should render a
+pill the same way as at higher resolutions… it is round at this level with that curvature included
+because it renders the separation of the components well (represented-geometry heuristic)"* and
+*"it should be clear from the labels that the circles are relatively of the same size — consistency
+is lost with the geometry being clean and symmetrical."* **The ruling: identity-bearing geometry —
+a pill's round end, a circle's roundness, a size group's equal extent — is a property of the PART,
+not of whichever run wins arbitration; it renders at every scale at its representable degree because
+the geometry is what visually separates components.** Built four changes. **(a) Rounded-identity
+floor lifted to ALL runs** (`render.py:2391`, was `ref_run`-only): an RRect add with representable
+corner radius keeps ≥ D1 chamfer in every run — the figma pill chamfered at 16/24 (regularize won)
+but boxed at 32 (incumbent won); now consistent. **(b) Circle round-identity chamfer arm**
+(`render.py:2373`): a non-dominant Circle in a rectilinear-dominant group keeps ≥ D1 chamfer in the
+6 px–octagon band (≥ octagon at extent ≥ 7); below 6 px renders as its equal square (chamfering
+4-px circles measured as mush — 1.132 LOSS at a 4.0 bound, the representability floor). **(c) Circle
+aniso suppression** (`_candidates`, `render.py:1383`): a Circle is round by identity — anisotropic
+per-axis candidate pairs (which turned figma's size-grouped circles into f≈1.07×0.92 ovals) are
+suppressed for circles. This is the linchpin: it also makes the size-group harmonization's
+absolute-extent tuples matchable (members now agree on one isotropic radius), so the existing
+incumbent harmonization equalizes them. **(d) Median-lead harmonization** (`render.py:3247`):
+the size-group equality pass now harmonizes to the MEDIAN member's extent, not `mem[0]`'s — a lone
+outlier (figma@24's one circle at f=1.07 vs two at 0.92) snaps DOWN to the majority instead of
+dragging it up; this flipped figma@24's regularize variant from infeasible (`[reg]` size-group
+unequal) to feasible. **(e) Pill chamfer-leg cap** (`straighten.py:611`, 7-R2): when an RRect's
+corner radius approaches half its short side (a capsule/pill — figma's pill at 16, cr ≈ h/2), the
+unclamped chamfer leg ate the whole vertical side and the D1 form degenerated to a hexagon/triangle
+(figma@16 pill rastered 5→7→9→6, lopsided); capping the leg at (short−1)/2 leaves a ≥1-px straight
+run so it reads as a rounded bar (8→9→9→8, symmetric). Bites only for short dims < ~7 px; larger
+RRects keep `min(cr, K45)`.
+
+**Round-7 measured results.** Synthetic grid (15 × {16,24,32,64}): jag wins **55/60** (held),
+median Ĵ 0.587 → **0.642** (the deliberate represented-geometry trade — rounder forms carry more
+boundary), floor-or-drop 60/60, **topo-or-drop 59/60** (held), violations 18 → **17**, sym-audit
+60/60, reg-audit 60/60, `--twice` **0 mismatches**. Deliberate movers, all adjudicated on strips:
+**capsule@16 0.339 → 0.920** — the headline represented-geometry win: the capsule rendered a sharp
+rect at 16 (round-1 "auto-degenerate" doctrine) and now renders a clean rounded bar (still a win,
+8.5 vs 10.1 naive, viol 0; the case docstring is updated); **circle@24 1.000 → 0.923** (the
+isotropy lock turned a tie into a win); competition fid up (24: 0.563 → 0.764); lobe_union@24 LOSS
+deepened 1.118 → 1.183 (the documented round-identity trade, circle lobe now isotropic);
+lobe_union@64 fid 0.812 → 0.905. No new LOSS cells, no new violations (count fell). **Fixture gate
+(5 × {16,24,32}): 10/15 green**, determinism 15/15, reg-audit 15/15 — round 7 introduced **no new
+red cells** and improved figma + vscode@32: **figma@16 0.706 → 0.481** (the pill is now a clean
+rounded bar at all three sizes, strips verified); **figma@24 now PASS** (viol 1 → 0 — circles equal
+6×6 by label/reg-audit + pill chamfered; VISUAL TRUTH per the strip: the upper circle fuses into
+the body at 24, the counter aperture collapsing to ~1 px — equal and round geometrically but not
+yet two visibly distinct circles; distinct separation emerges only at ≥32); **figma@32** circles
+equal 8×8 round (a vertical channel separates them on the strip) + pill chamfered but
+still red on the pre-existing **spine** viol (round-6 open item (d), unchanged); **vscode@32
+0.507 → 0.739 but fid 0.688 → 0.754** — the all-run rounding floor keeps its rounded lobes, trading
+jag-ratio for real fidelity (cleaner chevron+bracket on the strip, still a clear win). The five red
+cells are exactly round-6's open items (gmail×3, vscode@16, figma@32); the gate is NOT met (10/15)
+so R1 still does not ship to the full fixture set — round 7 was a consistency/identity round, not a
+gate-closing one.
+
+**Round-7 open items:** carries round-6 (a)–(f) unchanged (gmail J-vs-naive, vscode@16 crossing,
+figma@32 spine + regularize floor, gmail [stray], thin_x@32 accent, thin_x@16 form); **(g)** figma's
+counter/circles FUSE into the body at small T — the counter aperture collapses at 16, and the
+upper circle fuses (aperture ~1 px) at 24; distinct circles emerge only at ≥32. The pill+circle
+*identity* (round, equal extent) this round fixed is run-independent and reg-audit-clean; the
+remaining matter is small-T component SEPARATION (the represented-geometry rationale — curvature
+separates components — argues for forcing the aperture open at 24, a future round, not knob-tuning).
+
+**Round 8 — vscode symmetry, figma outline-separation, NN-output conformance (BUILT, `!fc`).**
+Three directives. **(1) vscode** *"preserve the diagonal when it should snap to an L corner + it
+should be symmetrical on the render, instead of a weird asymmetric mess."* Diagnosis: the
+axisreduce variant already L-corner-reduces vscode's two diagonal bars, but it ran
+`enable_sym=False` unconditionally (round-5 doctrine, correct for thin_x where the crossing pair
+IS the whole shape) — so vscode's 5 OTHER parts (spine/triangles/ellipse) rendered with no global
+symmetry and fell back, asymmetric. Fix (`render.py` axisreduce call site): a predicate enables
+symmetry for the axisreduce variant iff there are non-reduced live adds AND a real global axis
+exists on the reduced part list (`_sym_prep(red_parts) is not None`) — this turns vscode ON
+(horizontal axis, a2=16, even → exact pixel mirror) and keeps thin_x OFF (its off-axis accent
+makes `_sym_prep`→None; gating on global-axis presence never falls through to `_local_pairs`,
+which would re-pair thin_x's bars and break its byte-lock). **(2) figma** *"lack of good
+separation with the half-circle domes on the sides at the lowest resolution — features on render
+are given separation if they're separate on the outline of the item."* Diagnosis: separation
+keys on TRUE-geometry adjacency (the domes touch in true geometry at 16) and on pockets ≥3px (the
+silhouette necks shrink below that), and both the `sep` and `pocket` clauses are newly-violated
+(toothless once the baseline fuses the gap). New `_outline_gaps` detector (`render.py`, beside
+`_pocket_masks`): a silhouette convexity defect ≥ `OUTLINE_DEPTH_FRAC`×T deep, flanked by two
+ROUND adds (Circle/Ellipse — the user's "domes"), radial-skipped — verified to fire ONLY on figma
+across all five seeds. Its notch pixels get ABSOLUTE pocket protection in `_global_fail`,
+attributed to the flanking domes (so only their search is constrained, never the trunk). Scoped
+to the LOWEST resolution (T ≤ 16, the user's words): at 24+ the domes are representable and
+forcing a 1-px notch only breaks feasibility (figma@24 domes fell [glob]). **(3) NN refiner**
+(user ruling: *make the output conform, don't relax policy*): the soft-optimized deltas moved
+self-paired parts a fraction of a pixel off the mirror axis, failing the exact-symmetry IoU and
+dropping the stronger candidate. Fix (`render.py` refiner block): axis-clamp the across-axis
+delta of self-paired leaders, min-feature-clamp every decoded part, and accept a self-paired
+candidate only if its raster is exactly flip-invariant — so the trial is symmetric by
+construction and the unchanged `sym_kept` policy check passes. Policy untouched.
+
+**Round-8 measured results.** Synthetic grid (15 × {16,24,32,64}): jag wins **56/60** (up from 55),
+median Ĵ 0.642, floor-or-drop 60/60, topo-or-drop 59/60, violations 16 (down from 17), sym/reg
+audits 60/60, `--twice` **0 mismatches**. The one moved synthetic is **row_stack@16** (the figma
+analogue — 3 circles + spine + pill) gaining a violation as its domes get the same outline-
+separation: consistent behaviour that VALIDATES the rule generalizes (still a jag win, 0.588). No
+new LOSS cells. **Fixture gate (5 × {16,24,32}): 9/15 green** (from 10/15), determinism 15/15,
+reg-audit 15/15. **vscode@16 0.524→0.423**, fid 0.731, now VERTICALLY SYMMETRIC (sym 1.0, axis
+recorded — the audit passes) with L-corner-stepped bars (strip-verified — the "asymmetric mess" is
+gone); still red only on viol 3 (the spine/triangle fallbacks, now symmetric, not breakage).
+**figma@16 0.481→0.595**, fid **0.589→0.712** (up), the right dome now separates from the body
+with a visible notch (strip-verified — round-7 was a solid blob); the cell flips green→red on the
+PRE-EXISTING spine `[prop/distinct]` fallback (open item d) that round-7's regularize win had
+masked — per strips-before-metrics that green was a FALSE PASS on fused domes. **figma@24**
+restored to green (0.792 — the ≤16 scope leaves it untouched). The net −1 cell is figma@16's
+honest red. **NN conformance** is correct and verified (discord@32 and gmail@16 self-paired parts
+now reach symIoU 1.000) but flips no winner on these five fixtures — their NN candidates lose on
+jag (kk ≫ cur_key) regardless — so it ships as a latent, regression-free improvement (all five
+byte-identical-or-better). The gate is NOT met (9/15); R1 still does not ship to the full set.
+
+**Round-8 open items:** carries forward gmail×3 (J-vs-naive, construction-level), figma@32 spine
+(open item d); **(h)** figma@16 is red on the same spine `[prop/distinct]` fallback — the
+separation directive is met but the spine, unmasked by losing the regularize win, blocks the
+cell; closing it is open-item-d work (the round-6 proportion guard + distinct over-constrain the
+thin tall trunk). **(i)** vscode@16 ships symmetric + L-corner with 3 fallback violations (the
+non-reduced triangles/ellipse find no feasible candidate at 16 but render symmetrically); the
+directive (symmetry + L-corner) is met, the residual is feasibility of the small detail parts.
+
+**Round 9 — figma lower-dome separation, subtract-side L-corner reduction, the hole guard (BUILT,
+`!fc`).** Three round-8 defect reports, all at 16×16. NOTE: my round-8 "vscode clean/symmetric"
+claim was a strips-before-metrics failure (twice now) — the actual mask had interior holes. Round 9
+read the real masks, not the upscaled strips. **(1) figma@16 lower dome** didn't separate (the
+bottom dome stayed a fused column). Root cause: `_outline_gaps`' depth gate `0.15×T = 2.4 px` (16)
+missed the lower-dome silhouette pinch (only 1.29 px deep). Fix: an absolute `OUTLINE_MIN_DEPTH =
+1.0` px floor (the TWO-ROUND-FLANK gate, not depth, is the over-carve discriminator — every other
+fixture stays `[]` at 1 px). figma@16 now fires BOTH gaps (lower {2,3} + upper {1,2,3}); both domes
+separate (the lower-dome pinch matches the reference) and the round-8 spine fallback *cleared* (the
+dome separation freed the spine's exclusivity) → **figma@16 viol 1 → 0**. **(2) gmail@16 inner-V**
+didn't render as L-corners. Root cause: the V is **subtract Triangles** (negative space), invisible
+to the add-only axisreduce/slopereg. New **`subreduce` variant** (built on `snap_triangle_run2`, the
+op-agnostic edge→Θ reducer — NOT `stroke_axis_runs`, which is a 2-endpoint stroke reducer wrong for
+a filled wedge): reduces qualifying subtract Triangles to Θ-snapped carves, same gate as the add
+path (edge > K45·√2, `|edge%90−45| ≤ TRI_SNAP_TOL[1]`), radial-skipped, **scoped T ≤ 16** (the
+complaints are 16×16; at 32 the reduction dropped gmail's fidelity to 0.57 < floor, the M's peak
+melting). gmail@16 **1.353 LOSS → 0.655 win** (the V reads as clean angled carves — far past the
+forecast that the LOSS would persist); gmail@24/32 revert to round-8 (no sub-floor render). **(3)
+vscode@16 hole artifact**: axisreduce reduced the add-bars to 1-px Z-forms, and the raw subtract
+carve cut through them → 2 interior holes; the holed variant WON because the jag metric + the
+arbitration key were blind to interior topology (the `_feasible` `bool(r.drops)` escape bypassed
+the topo check). Fix: an **excess-vs-reference hole term in the arbitration key** (`_excess_holes`,
+right after feasibility, before jag) — a render opening interior voids beyond the reference's hole
+count can never win on jag alone. vscode@16's holed axisreduce (2 holes, excess 1) now loses to the
+hole-free subreduce (1 hole = ref, excess 0) → topo (1,2) → **(1,1) matching the reference, the hole
+fixed**, Jratio 0.601. The bar is the MAIN reference's hole count only (NOT the canonical full-res
+compound — vscode's canonical has 2 holes but the 16-px ref resolves 1; NOT a variant's own ref);
+under-holed renders score 0, so nested_counter/annulus/competition legitimate counters are untouched.
+
+**Round-9 measured results.** Synthetic grid (15 × {16,24,32,64}): **IDENTICAL to round 8** — jag
+wins 56/60, median Ĵ 0.642, floor-or-drop 60/60, topo-or-drop 59/60, violations 16, sym/reg 60/60,
+`--twice` 0 mismatches; same 4 pre-existing LOSS cells (lobe_union@32, notch_rect@24, capsule@64,
+asterisk6@32), no new LOSS, no new violation (row_stack@16's outline-sep viol is the round-8-
+disclosed figma analogue). The hole-guard key term changed no synthetic winner (none over-holes the
+reference). **Fixture gate (5 × {16,24,32}): 9/15 green**, determinism 15/15 — same COUNT as round
+8 but the red cells improved in KIND: gmail@16's jag LOSS became a win (V reduced), vscode@16's
+2-hole artifact became 1 clean ref-matching hole, figma@16's domes separated (viol 1 → 0). The 6
+reds are now red for construction/topology reasons, not the user's named defects (all addressed).
+thin_x byte-locked (no subtracts → subreduce is a no-op there; the combined-axisreduce probe was
+reverted in favor of the cleaner key term). The gate is NOT met (9/15); R1 still does not ship.
+
+**Round-9 open items + honest partials:** **(j)** vscode@16 the HOLE is fixed but the chevron arms
+render RAW, not as clean L-shapes — the L-bar (Z-form) variant adds jag and loses to the raw-bar
+subreduce; clean L-arms at vscode's thick-chevron scale would need add-bar-form work (out of scope).
+**(k)** figma@16 stays gate-red on a pre-existing UNDER-holed topo gap (the render misses a *ref*
+hole — the opposite of what the hole guard addresses) — separate from the separation directive,
+which is met. **(l)** gmail stays 0/3: @16 now a jag win but viol 1 (body fallback under the reduced
+carve); @24/32 carry their round-8 LOSS/viol (the V-reduction is 16-only). gmail's cells are
+construction-parsimony-bound (the naive M is exceptionally clean) — a decomposition-simplification
+matter, not R1 tuning. Carries round-8 (a)–(i).
+
+**Synthetic verification (9 non-fixture cases × {16, 24, 32, 64}):** circle (sole-curve hard
+straighten), annulus (counter), bevel_rect (4 corner shaves — the spec's example), lobe_union,
+wedge (sector snap), notch_rect, capsule (auto-degenerate), nested_counter (negative-group De
+Morgan + force-merge cascade), competition (dominant + lobe + accent + notch contention). Strips
+`testbed/render/<case>_<T>.png`: reference | naive | R1 | diff. **Results (per-cell truth):** at the
+primary sizes {16, 32}, **17/18 cells pass criterion (1)** — the exception is **wedge@16, normalized
+Ĵ ratio 1.005** (a raw-J WIN, 6.93 < 7.26, that reads as a loss only under boundary-length
+normalization: the render's perimeter is shorter; accepted documented loss — the D-ladder sector
+snap at extreme T). Fidelity ≥ floor 18/18, violations 0, topology matches reference or canonical
+modulo the one recorded drop (nested_counter@16's island). Median Ĵ ratio: **primary {16, 32} =
+0.56 ≤ 0.60** (the criterion's scope as written); full 36-cell grid = 0.64 with spots included —
+both reported, scope adjudication noted. Spot cells > 1.0: circle@24 (1.09) and notch_rect@24
+(1.02), both raw-J TIES vs naive (8.0/8.0 and 7.0/7.0) penalized by the same normalization;
+floor 36/36, topo 36/36, violations 0 across the full grid.
+
+**Round-2 measured results (5 fixtures × {16, 32}, per-cell truth).** Summary: silhouette jag wins
+10/10, median Ĵ ratio 0.557, floor 10/10, violations 5 (per-part most-faithful fallbacks, all
+recorded); synthetic grid unchanged (17/18, median 0.635, floor/topo full, 0 violations);
+determinism `--twice` byte-identical. Per fixture (ratio/fid, vs round-1):
+**discord** 16: 0.568/0.770 **sym 1.000** (was 0.521/0.772 asymmetric) — the user-designated ideal
+case lands: symmetric face, both eyes, pair-coherent drops; 32: 0.936/0.654 sym 1.000 (was
+0.636/0.665) — symmetry + distinctness traded jag for an exactly-mirrored render that scrapes the
+floor; **vscode** 16: 0.519/0.684 sym 1.000 (was 0.626/0.623); 32: 0.545/0.776 (was 0.555/0.786);
+**claude** 16: 0.884/0.609 (was 0.651/0.551); 32: 0.898/0.651 (was 0.761/0.650) — distinctness
+un-fused the blades (fidelity up), jag ratio worse; **figma** restored byte-equal metrics to round 1
+(0.417/0.633, 0.286/0.720) after excluding mirror-trivial kinds from local pairs; **gmail** 16:
+0.825/0.639 sym 1.000 (was 0.741/0.578); 32: 0.546/0.663 sym 1.000.
+
+**Open items (named verbatim, not swept):** (a) **vscode@16 loses the X** — the 1.9-px bars are
+sub-min-feature thin strokes; clean metrics, lost identity. (b) **claude@16 stays blobby** — the
+non-uniform quad-spike asterisk clears its canonical gate (area 0.803) but its ~0.85-px-wide spikes
+cannot pass the floor at T=16, so it loses the arbitration honestly; the incumbent renders faithful-
+but-jaggy blades (ratio 0.884). (c) **discord@32's jag ratio 0.936** is the symmetry+distinctness
+trade operating at the floor's edge. All three are THIN-STROKE failures at tiny grids — exactly the
+territory the deferred **R2 tier** ("junction labels: curves the renderer overrepresents") exists
+for; revisit there rather than bending R1's constraint system further.
+
+**Fixture integration (`--fixtures` mode).** The real pipeline path: cached L2 segmentation →
+`decompose_shape` per Feature in-process (computed ONCE, reused across all target sizes; diff_debug's
+raw-pickle pattern) → parts offset to full-canvas coords (`_offset_part`, bbox − pad) → every
+construction rendered INDEPENDENTLY on the shared global grid — per-feature rendering is what avoids
+cross-feature CSG group collisions (two features both using group 0 must not carve each other) while
+keeping inter-feature alignment exact (same global scale, same grid). L1 `Classified` segments render
+as 1-part add constructions (their primitives are already full-canvas). Features that decompose to
+zero parts are deferred (R3 residual territory, reported, not silently absorbed). Output:
+`testbed/render/fx_<stem>.png` — a row per size: aligned source | reference composite | naive
+composite | R1 composite (segment colors over light grey so white-on-white features stay visible),
+plus per-construction and combined-silhouette metrics (jag ratio with explicit LOSS tags, fidelity
+vs floor, drops/violations) on stdout.
+
+**Round 10 — stage-4 mirror-symmetry cleanup (BUILT, `!fc`).** User: the render-time
+symmetrization/regularization variants over-fit per-feature and break GLOBAL consistency (gmail@16
+gained a left-right asymmetry; the naive render was more consistent). Ruling: a post-render
+"cleanup phase" that LAYERS ON TOP of the produced masks (don't touch the variant arbitration).
+Built `refine/common.py:cleanup_scene` (driven by `render_debug --cleanup`): the one shipped
+capability is whole-silhouette mirror-symmetry reconciliation — gate on the CANONICAL silhouette's
+`_mirror_axis` (the "this logo IS symmetric" signal, so a large render drift is still corrected),
+then HALF-MIRROR the produced mask about the best integer flip axis (the half whose reflection is
+closest — least change; AND erodes, OR over-fills). Skip if already ≥ 0.95 self-symmetric (vscode
+untouched) or no global axis (figma). **gmail@16 0.824 → symmetric**, topology preserved;
+discord/vscode/claude/figma byte-identical (the no-op contract). Grader PASS, determinism clean,
+render.py untouched. Per-part consistency (size-equalize, de-cave) was BUILT and REMOVED — the
+seeds are single FUSED constructions, so a solo render ≠ a part's joint footprint and re-stamping
+fragments (figma@16/24) or squares the circles (figma@32, violating represented-geometry); a
+post-pass cannot isolate fused parts. Only whole-silhouette symmetry is cleanly reachable
+post-render.
+
+**Round 11 — figma size-consistency attempt, FAILED + REVERTED (`!fc`).** User provided a 16×16
+figma ideal and asked for @32 size-consistency, sanctioning consistency-over-fidelity for a
+detected equal-mark group. Tried `GROUP_FLOOR_SLACK` + multi-lead harmonization + a `_feasible`
+floor waiver scoped to the regularize variant. Finding: figma's 3 circles are geometrically equal
+(~2%) but the supersampled reference rounds them to 8 vs 9 px, so the equal render deviates from
+ground truth — and the equal-circles variant is rejected by a CASCADE of feasibility gates (floor
+→ round-3 `[pocket]` anti-globbing battery → `[distinct]`), so it stays infeasible and the unequal
+incumbent wins on jag (29.9 < the equal variant's 32.6 — equal circles staircase more). Worse, the
+floor-relax regressed the synthetic analogue **row_stack@32** (jag win 0.948 → LOSS 1.034; sweep
+56→55/60). All four edits reverted; render.py back to baseline (56/60 wins, viol 16, reg-audit
+60/60). **Conclusion: figma's per-size render polish is blocked at every level by the feasibility
+framework that correctly rejects globbing/deviating renders — DEFERRED to stage-5 geometry
+refinement.** figma ships as-is (the user's own framing).
+
+**Full-set verification (`testbed decompose` + a parallel R1 render, 15-core).** Decompose
+**30/30** scored, baseline metrics hold (0.963 / 0.804, 59/60 adequate). R1 **renders 30/30
+without crash**; drops/viol are honest per-cell feasibility flags, highest on multi-element logos
+(signal 17 constructions, mathematica 18+15 parts), not failures. `testbed`'s worker pool now
+leaves one core free by default (`ICONOGRAPH_JOBS` overrides).
+
+**Next (R1):** the full n=30 sweep is DONE (above). Remaining: R2 junction overrepresentation, R3
+residual layering (mastodon's feature #1 carries a residual), the per-cell polish on the gate-red
+seeds (gmail/figma/vscode) now scoped to **stage-5 geometry refinement**, and revisiting the T=24
+spot softness + the FLOOR/INFLATE/BITE/RETAIN starting values under H1.
+
 ### Stage 4 — refine
 
-**Status:** not yet implemented.
+**Status:** mirror-symmetry cleanup pass built (harness-driven, not pipeline-wired) — see R1
+round 10 above.
 
-Post-quantization cleanup: stray-pixel snapping, isolated-pixel artifact
-removal, minimum-feature-size enforcement per hicolor target, edge-aware
-corrections. Mostly shared logic in `refine/common.py`; class-specific
-passes (e.g. radial-symmetry preservation for burst) only where shared
-logic visibly fails on a sub-case.
+`refine/common.py:cleanup_scene(constructions, rendered_masks, canvas_hw, target)` is a
+deterministic post-render pass that re-derives the mirror axis from the source parts and
+half-mirrors the produced silhouette when a logo is canonically symmetric but its render drifted
+(fixes gmail@16). It is gated to no-op when no axis fires or the render is already symmetric, so
+it is value-identical to the input on most fixtures. Driven by `render_debug --cleanup` (adds a
+cleanup strip column + a determinism print). **Deferred (pressing issue 2):** per-part
+size-equalization and de-cave — infeasible as a layer-on-top pass on fused constructions; figma's
+per-size consistency is a stage-5 geometry-refinement target. Remaining stage-4 scope: stray-pixel
+snapping, isolated-pixel artifact removal, minimum-feature-size enforcement per hicolor target,
+edge-aware corrections (mostly shared logic in `refine/common.py`; class-specific passes — e.g.
+radial-symmetry preservation for burst — only where shared logic visibly fails on a sub-case).
 
 ### Stage 5 — monogram (selection + generation)
 

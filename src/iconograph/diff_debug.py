@@ -47,6 +47,9 @@ from iconograph.application.compress.decompose import decompose_shape  # noqa: E
 from iconograph.application.compress.diff_fit import refine_candidates  # noqa: E402
 from iconograph.application.compress.L2_feature_segment import Feature  # noqa: E402
 from iconograph.cache import CACHE_ROOT  # noqa: E402
+from iconograph.debug_common import hstack as _hstack  # noqa: E402
+from iconograph.debug_common import labeled as _labeled  # noqa: E402
+from iconograph.debug_common import shrink  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = REPO_ROOT / "fixtures"
@@ -63,27 +66,8 @@ _UNDER = (230, 25, 75)     # missed target — red
 _OVER = (67, 99, 216)      # construction spill — blue
 
 
-def _labeled(panel: np.ndarray, text: str) -> np.ndarray:
-    out = panel.copy()
-    cv2.rectangle(out, (0, 0), (out.shape[1] - 1, 20), (255, 255, 255), -1)
-    cv2.putText(out, text, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (20, 20, 20), 1, cv2.LINE_AA)
-    return out
-
-
-def _hstack(panels: list[np.ndarray], sep: int = 3) -> np.ndarray:
-    bar = np.full((panels[0].shape[0], sep, 3), 0xCC, np.uint8)
-    out: list[np.ndarray] = []
-    for i, panel in enumerate(panels):
-        out.append(panel)
-        if i < len(panels) - 1:
-            out.append(bar)
-    return np.hstack(out)
-
-
 def _shrink(img: np.ndarray) -> np.ndarray:
-    s = PANEL_H / img.shape[0]
-    return cv2.resize(img, (max(1, int(round(img.shape[1] * s))), PANEL_H),
-                      interpolation=cv2.INTER_AREA)
+    return shrink(img, PANEL_H)
 
 
 def _target_panel(target: np.ndarray) -> np.ndarray:

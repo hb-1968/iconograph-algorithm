@@ -8,6 +8,10 @@ stage 3 reaching into preprocess/common.py).
 import cv2
 import numpy as np
 
+# Fedora hicolor target sizes — the per-target grids stage 3's render tier (R1),
+# stage 4's min-feature enforcement, and stage 6's fill-maximization all work over.
+HICOLOR_SIZES: tuple[int, ...] = (16, 22, 24, 32, 48, 64, 128, 256)
+
 
 def frame_with_margin(img: np.ndarray, margin_frac: float = 0.10) -> np.ndarray:
     """Crop img to content bbox; center on a square white canvas with

@@ -31,6 +31,7 @@ from iconograph.application.compress import align, segment_prim_classify  # noqa
 from iconograph.application.compress.L2_feature_segment import Feature, segment_features  # noqa: E402
 from iconograph.application.compress.contour_parse import draw_shape_overlay, parse_shape  # noqa: E402
 from iconograph.cache import cached  # noqa: E402
+from iconograph.debug_common import labeled as _label  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = REPO_ROOT / "fixtures"
@@ -69,13 +70,6 @@ def _load(p: Path):
         aligned = cached(p, "align", _do_align, pre)
         sc = cached(p, "segment_prim_classify", _do_spc, aligned)
         return sc, cat, aligned
-
-
-def _label(panel: np.ndarray, text: str) -> np.ndarray:
-    out = panel.copy()
-    cv2.rectangle(out, (0, 0), (out.shape[1] - 1, 20), (255, 255, 255), -1)
-    cv2.putText(out, text, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (20, 20, 20), 1, cv2.LINE_AA)
-    return out
 
 
 def _process(p: Path) -> None:

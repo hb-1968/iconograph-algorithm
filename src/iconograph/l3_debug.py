@@ -52,6 +52,8 @@ from iconograph.application.compress.L3_fit import (  # noqa: E402
     fit_features,
 )
 from iconograph.cache import cached  # noqa: E402
+from iconograph.debug_common import hstack as _hstack  # noqa: E402
+from iconograph.debug_common import labeled as _labeled  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = REPO_ROOT / "fixtures"
@@ -99,25 +101,6 @@ def _load(p: Path):
         aligned = cached(p, "align", _do_align, pre)
         sc = cached(p, "segment_prim_classify", _do_spc, aligned)
         return sc, cat, aligned
-
-
-def _labeled(panel: np.ndarray, text: str) -> np.ndarray:
-    """A white caption bar with text across the top of one panel."""
-    out = panel.copy()
-    cv2.rectangle(out, (0, 0), (out.shape[1] - 1, 20), (255, 255, 255), -1)
-    cv2.putText(out, text, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (20, 20, 20), 1, cv2.LINE_AA)
-    return out
-
-
-def _hstack(panels: list[np.ndarray], sep: int = 3) -> np.ndarray:
-    """Horizontally stack equal-height panels with thin separators."""
-    bar = np.full((panels[0].shape[0], sep, 3), 0xCC, np.uint8)
-    out: list[np.ndarray] = []
-    for i, panel in enumerate(panels):
-        out.append(panel)
-        if i < len(panels) - 1:
-            out.append(bar)
-    return np.hstack(out)
 
 
 def _pass1_overlay(aligned: np.ndarray, fs, min_feat: int) -> tuple[np.ndarray, int]:
