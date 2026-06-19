@@ -987,6 +987,8 @@ RETAIN_FRAC = 0.60        # every add keeps ≥ this × its reference visibility
 SYM_AXIS_TOL_DEG = 3.0    # accept only near-vertical/horizontal mirror axes
 COLLAPSE_MIN_IOU = 0.80   # canonical fit gate — the "well-approximates" test
 COLLAPSE_MAX_T = 32       # collapse is a tiny-grid degradation strategy
+CUBIFY_MAX_T = 24         # feed resolution: T <= this renders via the pixel-cubify
+#                           operator (cubify.py) instead of geometry straightening
 RADIAL_MIN_BLADES = 6     # radial-family detection (claude has 12)
 RADIAL_DIST_CV = 0.15     # blade center-distance CV about the hub
 RADIAL_GAP_CV = 0.40      # angular-gap CV (mirrors _fit_rot_spurs' gate)
@@ -2351,6 +2353,27 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
     topo_canon_v = _topology(_compound_mask(parts, h, w))
     pockets = _pocket_masks(ref)          # anti-globbing: the protected background
     naive_jag = jag_score(naive)          # the refiner fire-gate's ratio anchor
+
+    # Feed-resolution dispatch: T <= 24 renders via the pixel-cubify operator
+    # (naive raster -> 1px-brush local search), NOT geometry straightening. The
+    # decomposition/roles/pockets above become cubify's constraints; the geometry
+    # _run/arbitration machinery below is retained only for T > 24 (synthetic
+    # regression). Lazy import breaks the render<->cubify cycle.
+    if target <= CUBIFY_MAX_T:
+        from .cubify import cubify
+        cmask = cubify(parts, canvas_hw, target)
+        return RenderResult(
+            mask=cmask, ref=ref, naive=naive, records=[],
+            jag=jag_score(cmask), jag_naive=naive_jag,
+            jag_norm=jag_norm(cmask), jag_norm_naive=jag_norm(naive),
+            area_iou=_iou_bool(cmask, ref),
+            boundary_iou=_boundary_iou(cmask, ref, band),
+            floor=floor,
+            topo_render=_topology(cmask),
+            topo_ref=topo_ref_v, topo_canon=topo_canon_v,
+            staircase=_staircase_total(cmask),
+        )
+
     coverage = reference_coverage(parts, canvas_hw, target)   # refiner target
     # radial family per positive group (spacing harmonization + decimation)
     radial = None

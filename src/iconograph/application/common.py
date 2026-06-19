@@ -10,7 +10,11 @@ import numpy as np
 
 # Fedora hicolor target sizes — the per-target grids stage 3's render tier (R1),
 # stage 4's min-feature enforcement, and stage 6's fill-maximization all work over.
-HICOLOR_SIZES: tuple[int, ...] = (16, 22, 24, 32, 48, 64, 128, 256)
+# Locked to the 16/24 feed resolution (user ruling): the pixel-cubify render owns
+# T ≤ 24, and these are the sizes fed onward to stage-4 refinement. The geometry
+# render path is retained for T > 24 (synthetic regression only) but production
+# never requests those sizes.
+HICOLOR_SIZES: tuple[int, ...] = (16, 24)
 
 
 def frame_with_margin(img: np.ndarray, margin_frac: float = 0.10) -> np.ndarray:

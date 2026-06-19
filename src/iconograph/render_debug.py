@@ -195,7 +195,9 @@ from iconograph.application.compress.common import (  # noqa: E402
     _scale_part,
 )
 from iconograph.application.compress.decompose import decompose_shape  # noqa: E402
+from iconograph.application.compress.label_clean import clean_labels  # noqa: E402
 from iconograph.application.compress.render import (  # noqa: E402
+    CUBIFY_MAX_T,
     _topology,
     floor_for,
     jag_norm,
@@ -212,11 +214,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DUMP_DIR = REPO_ROOT / "testbed" / "render"
 
 DEFAULT_SIZES = (16, 24, 32, 64)
-# round 6 — the shipping gate is the FULL seed set at T ∈ {16, 24, 32}
-# (user ruling: "16, 24, 32 exclusively"); synthetics keep 64 as the
-# regression guard
+# Feed-resolution lock (user ruling): the fixture gate is the seed set at
+# T ∈ {16, 24} — the only sizes fed onward to stage-4 refinement, and the
+# sizes the pixel-cubify render owns. Synthetics keep 32/64 in DEFAULT_SIZES
+# as the geometry-path (T > 24) regression guard.
 DEFAULT_FIXTURES = ("discord", "gmail", "vscode", "claude", "figma")
-GATE_SIZES = (16, 24, 32)
+GATE_SIZES = (16, 24)
 
 # Round-3 axis-fire audit: what symmetry machinery SHOULD detect per case.
 # "axis" = global mirror axis must fire; "pairs" = local mirror pairs only;
@@ -427,6 +430,9 @@ def _fixture_constructions(stem: str):
     cdir = CACHE_ROOT / stem
     fs = pickle.loads((cdir / "L2_feature_segment.pkl").read_bytes())
     aligned = pickle.loads((cdir / "align.pkl").read_bytes())
+    # stage-1 routing ('standard'|'inverted'|'burst') — the label-cleaner's sub-case
+    # signal (WS2). seg.shape_hint is the per-segment refinement, passed below.
+    sub_case = pickle.loads((cdir / "categorize.pkl").read_bytes()).routing
     S = int(fs.image_shape[0])
     min_feat = _min_feature_px(S)
     cons: list[tuple[list[Part], tuple[int, int, int], str]] = []
@@ -441,6 +447,13 @@ def _fixture_constructions(stem: str):
         t0 = time.time()
         d = decompose_shape(seg.mask, min_feat, seg.shape_hint,
                             ring=seg.ring_geom, bbox_xy=(seg.bbox[0], seg.bbox[1]))
+        # WS2 label-cleaner: prune/merge/re-fit/normalize/re-select before render.
+        # Rebuild the SAME padded target the decomposer scored against
+        # (decompose.py builds target from seg.mask at d.pad / d.shape).
+        _th, _tw = seg.mask.shape[:2]
+        _src = np.zeros(d.shape, np.uint8)
+        _src[d.pad:d.pad + _th, d.pad:d.pad + _tw] = seg.mask
+        d = clean_labels(d, _src, sub_case, min_feat)
         dt = time.time() - t0
         if d.residual is not None:
             n_residual += 1
@@ -485,6 +498,24 @@ def _color_panel(layers: list[tuple[np.ndarray, tuple[int, int, int]]],
     return np.pad(canvas, ((22, 0), (0, 0), (0, 0)), constant_values=255)
 
 
+def _sig_topology(mask: np.ndarray, min_feat: int) -> tuple[int, int]:
+    """(components, SIGNIFICANT holes) — holes whose bounding box spans >= min_feat in
+    BOTH dimensions. The cubify topology audit at the feed resolution uses this so a thin
+    radial mark's resolution-dependent 1px inter-blade gaps (rasterization noise, not real
+    topology — claude's sunburst) don't count as holes, while a representable counter
+    (figma) still would. Holes via border flood-fill of the inverted mask."""
+    m = (mask > 0).astype(np.uint8)
+    comps = cv2.connectedComponents(m, connectivity=8)[0] - 1
+    pad = cv2.copyMakeBorder(m * 255, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    inv = cv2.bitwise_not(pad)
+    ffm = np.zeros((pad.shape[0] + 2, pad.shape[1] + 2), np.uint8)
+    cv2.floodFill(inv, ffm, (0, 0), 0)          # border-connected bg → 0
+    nh, _lbl, st, _c = cv2.connectedComponentsWithStats(inv[1:-1, 1:-1], connectivity=8)
+    holes = sum(1 for i in range(1, nh)
+                if min(int(st[i, cv2.CC_STAT_WIDTH]), int(st[i, cv2.CC_STAT_HEIGHT])) >= min_feat)
+    return comps, holes
+
+
 def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
                      cleanup: bool = False, outline: bool = False) -> list[dict]:
     if not (CACHE_ROOT / stem / "L2_feature_segment.pkl").exists():
@@ -495,6 +526,13 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
     if not cons:
         print(f"{stem}: nothing to render")
         return []
+    # composited canonical-res topology — the reference degenerates at tiny T (a thin
+    # ring's hole, a sunburst's inter-blade gaps), so matching the canonical topology is
+    # as correct as matching the reference's (mirrors the synthetic path's ref-or-canon).
+    canon_full = np.zeros((S, S), np.uint8)
+    for parts, _c, _l in cons:
+        canon_full |= _compound_mask(parts, S, S)
+    topo_canon_comp = _topology(canon_full)
     stats: list[dict] = []
     rows: list[np.ndarray] = []
     for t in sizes:
@@ -606,15 +644,36 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
                 f"restroke IoU{fid:.2f}"))
         rows.append(hstack(row_panels))
         exp_reg = EXPECTED_REG.get(stem)
-        reg_audit_ok = exp_reg is None or (reg_det_stem or "none") == exp_reg
+        # cubify (T <= CUBIFY_MAX_T) renders at the pixel level and does not classify
+        # radial/group regularity — the reg audit is a geometry-path check, skipped here.
+        reg_audit_ok = (t <= CUBIFY_MAX_T or exp_reg is None
+                        or (reg_det_stem or "none") == exp_reg)
         if not reg_audit_ok:
             print(f"  {stem:<14} T={t:<3} REG-AUDIT expected {exp_reg} "
                   f"got {reg_det_stem or 'none'}")
         # round 6 — gate column: a detached blob (gmail@24/32's sliver) is a
         # silhouette TOPOLOGY mismatch; drops escape like _feasible's
-        topo_cell_ok = _topology(ren) == _topology(ref) or drops > 0
+        if t <= CUBIFY_MAX_T:
+            # cubify represents labels at the feed resolution — pass on EITHER the
+            # SIGNIFICANT topology matching (filters sub-min-feature rasterization holes —
+            # claude's 1px blade gaps) OR the plain topology matching ref/canon (the
+            # label-driven square ring + triangle matches the canonical structure).
+            mft = _min_feature_px(t)
+            topo_cell_ok = (_sig_topology(ren, mft) == _sig_topology(ref, mft)
+                            or _topology(ren) in (_topology(ref), topo_canon_comp)
+                            or drops > 0)
+        else:
+            topo_cell_ok = (_topology(ren) in (_topology(ref), topo_canon_comp)
+                            or drops > 0)
+        # The cubify render (T <= CUBIFY_MAX_T) REPRESENTS labels, it does not pixel-fit
+        # the round raster (user ruling) — a square ring barely overlaps a circle ring, so
+        # area IoU is the WRONG floor there. A structurally-correct cubified render
+        # (topology matches the reference / canonical truth) satisfies the floor regardless
+        # of IoU; the geometry path (T > 24) keeps the fidelity floor.
+        floor_ok = (fid >= floor or drops > 0
+                    or (t <= CUBIFY_MAX_T and topo_cell_ok))
         stats.append({"name": stem, "t": t, "ratio": ratio, "fid": fid,
-                      "floor_ok": fid >= floor or drops > 0,
+                      "floor_ok": floor_ok,
                       "jag_win": ratio <= 1.0, "viol": viol, "drops": drops,
                       "strays": strays, "topo_ok": topo_cell_ok,
                       "axis_fired": axis_fired,
@@ -680,7 +739,9 @@ def _process(name: str, builder, sizes: tuple[int, ...], degrees: bool,
         if not sym_audit_ok:
             extra += f"  SYM-AUDIT expected {exp} got {detected}"
         exp_reg = EXPECTED_REG.get(name)
-        reg_audit_ok = exp_reg is None or (reg_det or "none") == exp_reg
+        # cubified sizes (T <= CUBIFY_MAX_T) don't classify regularity — skip the audit
+        reg_audit_ok = (t <= CUBIFY_MAX_T or exp_reg is None
+                        or (reg_det or "none") == exp_reg)
         if not reg_audit_ok:
             extra += f"  REG-AUDIT expected {exp_reg} got {reg_det or 'none'}"
         if reg_det:
@@ -723,7 +784,8 @@ def _gate_table(all_stats: list[dict]) -> None:
     Green iff no LOSS, viol 0, strays 0, floor-or-drop, reg-audit ok.
     Sym has no per-fixture expectation — the figma mirror guard prints
     separately. Visual strip sign-off stays a human step (H1)."""
-    print("\ngate table (round 6 — fixtures x {16,24,32}):")
+    gsizes = sorted({s["t"] for s in all_stats})
+    print(f"\ngate table (feed res — fixtures x {{{','.join(map(str, gsizes))}}}):")
     print(f"  {'fixture':<10} {'T':>3}  {'Jratio':>10}  {'viol':>4}  "
           f"{'strays':>6}  {'topo':>4}  {'floor':>5}  {'reg':>3}  verdict")
     green = 0
@@ -778,7 +840,9 @@ def main(argv: list[str] | None = None) -> int:
     argv = [a for a in argv
             if a not in ("--twice", "--degrees", "--fixtures", "--cleanup",
                          "--outline", "--serial")]
-    sizes = DEFAULT_SIZES
+    # Feed-resolution lock: fixtures render + gate at {16, 24} only; the synthetic
+    # sweep keeps {16, 24, 32, 64} as the geometry-path (T > 24) regression guard.
+    sizes = GATE_SIZES if fixtures else DEFAULT_SIZES
     if "--sizes" in argv:
         i = argv.index("--sizes")
         sizes = tuple(int(x) for x in argv[i + 1].split(","))
