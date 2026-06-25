@@ -21,6 +21,14 @@ decomposition returns no parts are deferred (R3 residual territory, reported).
     python -m iconograph.render_debug circle annulus     # specific shapes
     python -m iconograph.render_debug --fixtures         # default fixtures (discord, gmail, claude)
     python -m iconograph.render_debug --fixtures vscode  # specific fixture stems
+    python -m iconograph.render_debug --final            # assemble + deliver the
+                                                         #   FINAL render products
+                                                         #   (source | final@16 |
+                                                         #   final@24), one clean row
+                                                         #   per fixture + a combined
+                                                         #   gallery → testbed/render/
+                                                         #   final/ . --final --all for
+                                                         #   the full dataset.
     python -m iconograph.render_debug --sizes 16,32      # specific target sizes
     python -m iconograph.render_debug --degrees          # + per-degree ladder panels (H7,
                                                          #   synthetic mode only)
@@ -212,6 +220,8 @@ from iconograph.application.refine.common import (  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DUMP_DIR = REPO_ROOT / "testbed" / "render"
+FINAL_DIR = DUMP_DIR / "final"     # --final: assembled render products (the
+#                                    deliverable + stage-4 refine's input)
 
 DEFAULT_SIZES = (16, 24, 32, 64)
 # Feed-resolution lock (user ruling): the fixture gate is the seed set at
@@ -541,14 +551,18 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
             again = [r1_render(parts, (S, S), t) for parts, _c, _l in cons]
             same = all(np.array_equal(a.mask, b.mask) for a, b in zip(rrs, again))
             print(f"  determinism({stem}@{t}): {'IDENTICAL' if same else 'MISMATCH'}")
+        # cross-construction separation: re-open 1px divots between source-separate
+        # constructions that fused at the feed res (slack's pinwheel). The composite mask
+        # + R1 panel use the divoted masks; per-construction r.* metrics stay from rrs.
+        dmasks = _separate_divots([r.mask for r in rrs], cons, S)
         ren = np.zeros((t, t), np.uint8)
         ref = np.zeros((t, t), np.uint8)
         nai = np.zeros((t, t), np.uint8)
         viol = drops = strays = 0
         axis_fired = False
         reg_det_stem = None
-        for (parts, _c, label), r in zip(cons, rrs):
-            ren |= r.mask
+        for idx, ((parts, _c, label), r) in enumerate(zip(cons, rrs)):
+            ren |= dmasks[idx]
             ref |= r.ref
             nai |= r.naive
             viol += len(r.violations)
@@ -599,7 +613,7 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
             labeled(_color_panel([(r.naive, c) for r, (_p, c, _l) in zip(rrs, cons)], t),
                     f"naive  J{jag_score(nai):.0f}"),
             # ASCII captions only — cv2.putText's Hershey fonts render non-ASCII as ??
-            labeled(_color_panel([(r.mask, c) for r, (_p, c, _l) in zip(rrs, cons)], t),
+            labeled(_color_panel([(dm, c) for dm, (_p, c, _l) in zip(dmasks, cons)], t),
                     f"R1  J{jag_score(ren):.0f}  fid{fid:.2f}  "
                     f"Jratio {ratio:5.3f}{' LOSS' if ratio > 1.0 else ''}"),
         ]
@@ -682,6 +696,119 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
     Image.fromarray(np.vstack(rows), "RGB").save(
         DUMP_DIR / f"fx_{stem}.png", "PNG", optimize=True)
     return stats
+
+
+# ── final render product (assembled deliverable; stage-4 refine's input) ──
+
+
+SEP_MIN_CONS = 4   # divots fire only on OVERREPRESENTED multi-element marks (>= this many
+#                    constructions — slack's 8-pill pinwheel). A 2-3 piece glyph (adobe's
+#                    A + i-stem + i-dot) is NOT force-separated: the i-dot stays attached to
+#                    its stem (user: 'dot attached to stem'). A size guard can't do this —
+#                    at 16px slack's short pills are the SAME size as the i-dot — so the
+#                    discriminator is piece COUNT (the user's 'overrepresented' principle).
+
+
+def _separate_divots(masks: list[np.ndarray], cons, S: int) -> list[np.ndarray]:
+    """Re-open 1px divots between constructions that are SEPARATE in the source but whose
+    rendered masks fused at the feed resolution (slack's 8 pinwheel pills 'glob together
+    for no good reason'). Gated to OVERREPRESENTED marks (>= SEP_MIN_CONS constructions);
+    a 2-3 piece glyph is left as rendered. Source-separate iff CANONICAL footprints are
+    8-disconnected at canvas res (unambiguous, before the feed-res downsample globs the
+    gaps — slack's gaps are sub-pixel in the reference at 16, so a reference-based test
+    under-separates). Where such a pair's rendered masks touch, the contact pixels are
+    cleared from the later (area-sorted smaller, drawn on top) construction so each label
+    keeps a >=1px gap; pairs that genuinely abut in the source are left fused. (H8)."""
+    if len(masks) < SEP_MIN_CONS:
+        return masks
+    k = np.ones((3, 3), np.uint8)
+    canon = [_compound_mask(parts, S, S) for parts, _c, _l in cons]
+    out = [m.copy() for m in masks]
+    for i in range(len(masks)):
+        di = cv2.dilate(masks[i], k)
+        ci = cv2.dilate(canon[i], k)
+        for j in range(i + 1, len(masks)):
+            if np.any((ci > 0) & (canon[j] > 0)):
+                continue                              # abut in source — preserve the join
+            contact = (di > 0) & (masks[j] > 0)
+            if np.any(contact):
+                out[j] = out[j].copy()
+                out[j][contact] = 0
+    return out
+
+
+def assemble_render(cons, S: int, target: int):
+    """Add all the render pieces together for ONE target size.
+
+    cons: [(parts, color_rgb, label), ...] from _fixture_constructions (decomposed
+    + label-cleaned once, target-independent). Renders every construction
+    INDEPENDENTLY on the shared (S, S) grid (per-feature, no cross-feature CSG
+    group collisions — the strip path's contract) and composites the
+    per-construction R1 masks in segment order (area-sorted upstream → smaller
+    features draw on top) into one final color icon.
+
+    Returns (masks, icon): masks = per-construction (target, target) uint8 {0,255}
+    R1 masks; icon = (target, target, 3) uint8 composited render. The tuple
+    (cons, masks, (S, S), target) is exactly what stage-4
+    refine.common.refine_outline consumes — this function IS the seam refine
+    touches up next."""
+    rrs = [r1_render(parts, (S, S), target) for parts, _c, _l in cons]
+    masks = _separate_divots([r.mask for r in rrs], cons, S)
+    icon = np.full((target, target, 3), _FX_BG, np.uint8)
+    for m, (_p, c, _l) in zip(masks, cons):
+        icon[m > 0] = c
+    return masks, icon
+
+
+def _final_product(stem: str, sizes: tuple[int, ...], twice: bool):
+    """Deliver the FINAL render product for one fixture: a single clean row
+    `aligned source | final@T ...` (no reference/naive/diff clutter — the product
+    the user critiques), saved standalone to testbed/render/final/<stem>.png.
+    Returns the row image (for the combined gallery) or None if uncached/empty."""
+    if not (CACHE_ROOT / stem / "L2_feature_segment.pkl").exists():
+        print(f"{stem}: no cached L2 segmentation under .cache/stages/ — "
+              f"run the testbed/build first")
+        return None
+    S, aligned, cons = _fixture_constructions(stem)
+    if not cons:
+        print(f"{stem}: nothing to render")
+        return None
+    panels = [labeled(_src_panel(aligned), f"{stem} aligned")]
+    for t in sizes:
+        masks, _icon = assemble_render(cons, S, t)
+        if twice:
+            again, _ = assemble_render(cons, S, t)
+            same = all(np.array_equal(a, b) for a, b in zip(masks, again))
+            print(f"  determinism({stem}@{t}): "
+                  f"{'IDENTICAL' if same else 'MISMATCH'}")
+        union = np.zeros((t, t), np.uint8)
+        for m in masks:
+            union |= m
+        panels.append(labeled(
+            _color_panel([(m, c) for m, (_p, c, _l) in zip(masks, cons)], t),
+            f"final@{t}  {len(cons)}pc"))
+        print(f"  {stem:<14} final@{t:<3} {len(cons)} pieces composited  "
+              f"topo {_topology(union)}")
+    row = hstack(panels)
+    FINAL_DIR.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(row, "RGB").save(
+        FINAL_DIR / f"{stem}.png", "PNG", optimize=True)
+    return row
+
+
+def _final_worker(stem: str, sizes: tuple[int, ...], twice: bool):
+    """Pool worker for --final: assemble ONE fixture single-threaded (H8),
+    capturing stdout so the parent prints fixtures in order. Returns
+    (row | None, captured-log); a per-fixture failure is reported and yields
+    None so the batch never dies on one bad fixture."""
+    cv2.setNumThreads(1)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            row = _final_product(stem, sizes, twice)
+    except Exception as e:  # noqa: BLE001 — debug harness: report and continue
+        return None, f"{stem}: ERROR {type(e).__name__}: {e}\n"
+    return row, buf.getvalue()
 
 
 # ── per-case driver ──────────────────────────────────────────────────────
@@ -804,6 +931,13 @@ def _gate_table(all_stats: list[dict]) -> None:
     print(f"  gate: {green}/{len(all_stats)} cells green")
 
 
+def _all_cached() -> list[str]:
+    """Every fixture with a cached L2 segmentation under .cache/stages/ (the full H9
+    dataset), sorted — the `--fixtures --all` target."""
+    return sorted(p.name for p in CACHE_ROOT.iterdir()
+                  if p.is_dir() and (p / "L2_feature_segment.pkl").exists())
+
+
 def _half_cores() -> int:
     """Half the host cores — the bounded thread/CPU budget for the fixture pool (a 16-core
     box → 8). GPU offload is unavailable on this box (RX 580 / no ROCm), so CPU-parallel
@@ -837,12 +971,14 @@ def main(argv: list[str] | None = None) -> int:
     cleanup = "--cleanup" in argv
     outline = "--outline" in argv
     serial = "--serial" in argv
+    want_all = "--all" in argv
+    final = "--final" in argv
     argv = [a for a in argv
             if a not in ("--twice", "--degrees", "--fixtures", "--cleanup",
-                         "--outline", "--serial")]
+                         "--outline", "--serial", "--all", "--final")]
     # Feed-resolution lock: fixtures render + gate at {16, 24} only; the synthetic
     # sweep keeps {16, 24, 32, 64} as the geometry-path (T > 24) regression guard.
-    sizes = GATE_SIZES if fixtures else DEFAULT_SIZES
+    sizes = GATE_SIZES if (fixtures or final) else DEFAULT_SIZES
     if "--sizes" in argv:
         i = argv.index("--sizes")
         sizes = tuple(int(x) for x in argv[i + 1].split(","))
@@ -850,8 +986,43 @@ def main(argv: list[str] | None = None) -> int:
     cv2.setNumThreads(1)
     _selftest()
     all_stats: list[dict] = []
+    if final:
+        # Assemble + deliver the final render products: one clean
+        # `source | final@T ...` row per fixture, plus a combined gallery.
+        # Same fixture selection as --fixtures (stems / --all / default seeds).
+        wanted = _all_cached() if want_all else (argv if argv else list(DEFAULT_FIXTURES))
+        rows: list[np.ndarray] = []
+        if serial or len(wanted) <= 1:
+            for stem in wanted:
+                try:
+                    row = _final_product(stem, sizes, twice)
+                except Exception as e:  # noqa: BLE001 — report and continue
+                    print(f"{stem}: ERROR {type(e).__name__}: {e}")
+                    row = None
+                if row is not None:
+                    rows.append(row)
+        else:
+            njobs = max(1, min(_half_cores(), len(wanted)))
+            print(f"  [parallel: {njobs} workers (half of {os.cpu_count()} cores), "
+                  f"each single-threaded for H8 determinism]")
+            work = [(stem, sizes, twice) for stem in wanted]
+            with mp.get_context("fork").Pool(njobs) as pool:
+                for row, log in pool.starmap(_final_worker, work):
+                    print(log, end="")          # starmap preserves order → in-order
+                    if row is not None:
+                        rows.append(row)
+        if rows:
+            FINAL_DIR.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(np.vstack(rows), "RGB").save(
+                FINAL_DIR / "final_products.png", "PNG", optimize=True)
+            print(f"\nfinal products → {FINAL_DIR.relative_to(REPO_ROOT)}/"
+                  f"final_products.png  (+ per-fixture <stem>.png, "
+                  f"{len(rows)} fixtures)")
+        else:
+            print("no final products produced")
+        return 0
     if fixtures:
-        wanted = argv if argv else list(DEFAULT_FIXTURES)
+        wanted = _all_cached() if want_all else (argv if argv else list(DEFAULT_FIXTURES))
         if serial or len(wanted) <= 1:
             for stem in wanted:
                 try:

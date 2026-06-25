@@ -399,6 +399,67 @@ def snap_triangle_run2(p: Triangle) -> tuple[tuple[float, float], ...] | None:
     return _snap_triangle(p, RUN2_TRI_TOL, grid=SLOPE_GRID_RUN2)
 
 
+def _snap_polygon(verts: tuple[tuple[float, float], ...], tol: float,
+                  grid: tuple[float, ...] | None = None
+                  ) -> tuple[tuple[float, float], ...] | None:
+    """N-gon generalization of _snap_triangle (kept SEPARATE from the byte-locked
+    triangle path): snap each edge direction within tol° of a Θ member (snap_slope)
+    or a `grid` member, then re-derive every vertex as the intersection of its two
+    adjacent (raster-inset 0.5 px inward) edge lines. None on a near-parallel
+    re-intersection or an area collapse/blowup (0.25..4.0× guard). Used by the
+    cubify triangle-label path for flat-top (4-vertex) silhouettes."""
+    v = [np.asarray(p, float) for p in verts]
+    n = len(v)
+    if n < 3:
+        return None
+    centroid = sum(v) / n
+
+    def _area2(poly) -> float:                       # |shoelace| (winding-agnostic)
+        s = 0.0
+        for i in range(len(poly)):
+            x0, y0 = poly[i]
+            x1, y1 = poly[(i + 1) % len(poly)]
+            s += x0 * y1 - x1 * y0
+        return abs(s)
+
+    lines = []                                       # (point-on-line, unit direction)
+    for i in range(n):
+        a, b = v[i], v[(i + 1) % n]
+        d = b - a
+        theta = math.degrees(math.atan2(d[1], d[0])) % 180.0
+        m = (snap_slope(theta) if grid is None else _snap_to_grid(theta, grid))
+        diff = theta - m
+        diff = diff - 180.0 if diff > 90.0 else (diff + 180.0 if diff < -90.0 else diff)
+        ang = m if abs(diff) <= tol else theta
+        u = np.array([math.cos(math.radians(ang)), math.sin(math.radians(ang))])
+        mid = (a + b) / 2.0
+        nrm = np.array([-u[1], u[0]])                # raster-inset: edge line 0.5 inward
+        if float(np.dot(nrm, centroid - mid)) < 0:
+            nrm = -nrm
+        lines.append((mid + 0.5 * nrm, u))
+    out = []
+    for i in range(n):
+        (p0, u0), (p1, u1) = lines[i - 1], lines[i]  # vertex i = lines (i-1) ∩ (i)
+        det = u0[0] * u1[1] - u0[1] * u1[0]
+        if abs(det) < 1e-9:
+            return None
+        t = ((p1[0] - p0[0]) * u1[1] - (p1[1] - p0[1]) * u1[0]) / det
+        q = p0 + t * u0
+        out.append((float(q[0]), float(q[1])))
+    orig2 = _area2([tuple(x) for x in v])
+    if orig2 > 0 and not (0.25 <= _area2(out) / orig2 <= 4.0):
+        return None
+    return tuple(out)
+
+
+def snap_polygon_run2(verts: tuple[tuple[float, float], ...]
+                      ) -> tuple[tuple[float, float], ...] | None:
+    """Run-≥2 slope snap of an arbitrary closed polygon (the N-gon analogue of
+    snap_triangle_run2 — a flat-top triangle is a 4-gon). None on degenerate
+    re-intersection."""
+    return _snap_polygon(verts, RUN2_TRI_TOL, grid=SLOPE_GRID_RUN2)
+
+
 def stroke_axis_runs(x0: float, y0: float, x1: float, y1: float,
                      width: float, form: str,
                      band_axis: str | None = None,

@@ -45,23 +45,38 @@ default leaves one core free)._
   **0.963** / boundary **0.804**, 59/60 features adequate (baseline, no regression); R1
   **renders 30/30 without crash** (microsoft-edge / react / youtube fully clean; the rest carry
   honest per-cell feasibility flags — see issue 1).
+- **Stage 3 — R1 feed-resolution render (the CUBIFY rework, CURRENT for T ≤ 24; branch
+  `render-cubify`):** at the shipping sizes (`HICOLOR_SIZES = (16, 24)`) the geometry-path
+  arbitration is replaced by a **label-cleaner + pixel-cubify** path that REPRESENTS labels
+  (circle → square, annulus → square ring) rather than IoU-fitting the round raster. The four
+  feed-res critique defects are fixed — adobe coarse triangle, discord axis-blocky (`W_AXIS = 1.5`),
+  slack cross-construction divots, figma neck divots. **Seed gate (5 × {16,24}) 10/10 green**;
+  extended 10-fixture critique set **18/20** (adobe@16 + slack@16 honest partials); all
+  byte-deterministic. Full design: R1 §"render rework".
 - **Stage 4 — refine:** a **mirror-symmetry cleanup pass** exists (harness-driven via
   `render_debug --cleanup`, not yet pipeline-wired) — fixes gmail@16's render asymmetry,
   leaves the other seeds byte-identical. Per-part consistency (size-equalization, de-cave) was
   investigated and found infeasible as a post-pass (see issue 2).
 
 **Pressing issues** (roughly by priority)
-1. **R1 does not ship "all green."** The 5-seed render gate is **~9/15**; the red cells are
-   construction/feasibility-bound (gmail's J-vs-naive LOSS, figma's per-size polish, vscode's
-   raw chevron arms) — NOT crashes. Across the full set the renderer flags drops/violations on
-   most fixtures at small T: these are the renderer honestly reporting cells it can't fully
-   satisfy — the **per-cell geometry polish deferred to stage 5**, not failures.
+1. **R1 ships the SEEDS green at feed res; the geometry path (T > 24) and the non-seed feed-res
+   set don't yet.** The feed-resolution **cubify** path (T ≤ 24 = the shipping sizes) renders the
+   5 seeds **10/10** (× {16,24}) and the 10-fixture critique set **18/20** (adobe@16 + slack@16
+   honest partials). The legacy **geometry path** (T > 24, synthetic regression only) is **~9/15**,
+   and the full n=30 feed-res set was **46/60** at the start of the rework — both still flag
+   drops/violations on complex woven/rotated/multi-part marks. These are the renderer honestly
+   reporting cells it can't fully satisfy at small T, NOT crashes; per the META-FINDING the
+   jag/ref-topo metric also lags the desired separation/blockiness (the strips are the truth), so a
+   **gate recalibration** + per-cell polish is the path, not a fix to "failures." See R1 §"render
+   rework".
 2. **figma per-size polish is feasibility-blocked → DEFERRED to stage 5.** The user-provided
    16×16 ideal and 32px size-consistency cannot be reached in R1: the equal-circles variant is
    rejected by a cascade of feasibility gates (fidelity floor → `[pocket]` anti-globbing →
    `[distinct]` → @16 `global_ok`), and forcing it both fails the target AND regresses the
    reg-group analogue (row_stack@32 win→LOSS). figma is **shippable as-is**; the polish is a
-   stage-5 geometry-refinement matter (see R1 round 11).
+   stage-5 geometry-refinement matter (see R1 round 11). _Distinct from figma's feed-res neck
+   fusion at 16/24, which is now **RESOLVED** at render via the cubify neck divots (R1 §"render
+   rework", critique fix 4) — this issue 2 is the geometry-path T=32 size-consistency only._
 3. **The pipeline is not end-to-end.** `application/pipeline.py` is a stub; the stage-4 cleanup
    runs only under the testbed. **Stages 5–6 are unimplemented.** `build` does not run end-to-
    end yet — only the per-stage testbeds work.
@@ -1185,6 +1200,115 @@ leaves one core free by default (`ICONOGRAPH_JOBS` overrides).
 residual layering (mastodon's feature #1 carries a residual), the per-cell polish on the gate-red
 seeds (gmail/figma/vscode) now scoped to **stage-5 geometry refinement**, and revisiting the T=24
 spot softness + the FLOOR/INFLATE/BITE/RETAIN starting values under H1.
+
+#### R1 — render rework: the feed-resolution CUBIFY paradigm (CURRENT for T ≤ 24)
+
+`HICOLOR_SIZES` is locked to `(16, 24)` (`application/common.py`) — the only sizes that ship.
+At those feed resolutions the geometry-path arbitration of rounds 1–11 (idealize → straighten →
+variant competition) is **REPLACED** by a label-cleaner + pixel-cubify path; the round-by-round
+geometry path is retained ONLY for T > 24 as a synthetic regression. Dispatched in
+`render.render_debug`: `if target <= CUBIFY_MAX_T (=24): return cubify(parts, canvas_hw, target)`.
+The reframe that drove it (user ruling): **"it's NOT about fitting the shapes, it's about
+representing their LABELS."** At 16/24 px a square barely overlaps a circle as 1-px outlines, so
+IoU-vs-the-round-raster is the wrong objective — the render REPRESENTS the decomposition's labels
+(circle → square, annulus → square ring, ...) as clean blocky forms, and the gate's `floor_ok` at
+cubified sizes is STRUCTURE (topology), not IoU.
+
+- **Label-cleaner (`compress/label_clean.py`, WS2).** `clean_labels(decomp, src, sub_case, min_feat)`
+  runs before render (inserted in `render_debug._fixture_constructions` after `decompose_shape`):
+  prune/merge/re-fit Parts (reuse `_post_prune` FREE pass + fitters), drop zero-bite subtracts,
+  re-select the sub-case variant. Each step gated no-regression on `_compound_score[2]`; hard
+  fallback returns the original (H1). A/B on the seeds: 4 cells improved, 0 regressed.
+
+- **Cubify (`compress/cubify.py`, WS3) — HYBRID, two paths.**
+  - **(A) Label-driven** (`_label_render`): a construction that is exactly one round ADD (± one
+    round concentric SUBTRACT) renders straight from geometry — add-bbox-square minus
+    subtract-bbox-square = a square / **square ring**, robust at any size (youtube-music's ring;
+    bbox-squares, NOT area-matched straighten-D0 which collapses a thin annulus). `_triangle_label`
+    is the second early path (see critique fix 1).
+  - **(B) Silhouette pixel-cubify** (everything compound — a head + eyes, an M, an X): a
+    deterministic two-phase greedy 1-px-brush search from the naive raster — **Phase A reconnect**
+    (area-IoU only, monotonic — climbs out of a fragmented naive: youtube's 12 disconnected ring
+    dots), **Phase B cubify** (`jag_score` + `W_ACC·(1−areaIoU)` + soft tie). Move set = straighten
+    (tooth-clear ≤ `TOOTH_MAX` nb / notch-fill ≥ `NOTCH_MIN` nb) + ref-guided reconnect. Guards:
+    anti-glob pocket retention (`_pocket_masks`/`POCKET_RETAIN`) + `_topo_ok` (component-distance to
+    nearer ref/canon must not rise AND holes ≥ min(cur, canon)). **Mirror-pair moves** when
+    `_cubify_axis` (= `_sym_prep`) fires a global axis → exact symmetry (discord/gmail/vscode sym IoU
+    = 1.000), gated to CONNECTED constructions. `_close_to_canon` bridges a fragmented thin ring
+    closed (youtube → closed annulus). Per-primitive cubic forms SHATTER a compound silhouette
+    (bbox-squares fragment, diagonals staircase), so compound labels are represented by cubifying
+    their composed silhouette. Cube **round-identity at T ≤ 24 OVERRIDES represented-geometry**
+    (round → square) — do NOT "restore" roundness at the feed res.
+
+- **The `--final` deliverable seam (`render_debug.assemble_render`).** Renders each construction
+  independently on the shared (S, S) grid (no cross-feature CSG group collisions) and composites the
+  per-construction R1 masks by segment color (area-sorted → smaller draws on top). The tuple
+  `(cons, masks, (S, S), target)` is EXACTLY stage-4 `refine.common.refine_outline`'s input — this
+  IS the render→refine handoff. `--final` emits a clean `source | final@16 | final@24` critique strip
+  to `testbed/render/final/`.
+
+- **Critique fixes (2026-06, the four feed-res defects the user flagged).** Governing principle:
+  **"if a fixture is overrepresented, it must be proportional"** — represent labels cleanly
+  (separated, proportional, coarse), don't pixel-fit a globbed/staircased silhouette.
+  1. **adobe 'A' → coarse digital triangle** (`cubify._triangle_label`, dispatched before the
+     silhouette path): a triangle-dominant silhouette (convex-hull `approxPolyDP` → 3–4 verts,
+     `TRI_AGREE = 0.90` IoU agreement vs the holes-filled solid) renders as a flat-top triangle with
+     every edge snapped to the run-≥2 slope grid (`straighten.snap_polygon_run2` / `snap_triangle_run2`
+     — a new N-gon generalization kept SEPARATE from the byte-locked triangle path), then the counter
+     carved (INTER_AREA-downscaled canonical hole, eroded strictly inside, kept only if topology
+     (1, 1)). Bypasses the `4-1-4-1` staircase. adobe@24 PASS; **adobe@16 honest partial** (the render
+     cleanly separates 'A' from the 'i'; the blurry reference merges them).
+  2. **discord@24 'too curved' → axis-blocky term** (`cubify._staircase_teeth`, added to `_cubic`):
+     `jag_score` is DP-vertex-based and **FOOLED by smooth curves** (a curve's staircase collapses to
+     few vertices = "low jag"), so the 24-px optimum drifts curvier than 16. The term counts ISOLATED
+     diagonal boundary steps (a curve's staircase tooth — a diagonal flanked BOTH sides by axis moves;
+     a straight diagonal RUN is consecutive, so an intentional angular edge — vscode's bracket,
+     telegram's plane, a triangle leg — is spared), weighted `W_AXIS · max(0, (T−16)/8)` so **T=16 is
+     byte-unchanged** (already the "perfect" cube) and **T=24 pursues the SAME blocky goal**.
+     **`W_AXIS = 1.5`** (user-tuned "hardest cube look").
+  3. **slack glob → cross-construction divots** (`render_debug._separate_divots`): re-open 1-px gaps
+     between source-SEPARATE constructions (CANONICAL footprints 8-disconnected — slack's gaps are
+     sub-px in the *reference*, so a reference-gated test under-separates) whose rendered masks fused.
+     Gated `SEP_MIN_CONS = 4` (overrepresented marks only) — KEY DATA: slack's 4 short pills are the
+     SAME pixel size as adobe's i-dot, so piece-COUNT, not size/ratio, is the only clean discriminator.
+     slack@24 PASS; **slack@16 honest partial** (separated but jag-LOSS vs the smooth glob).
+  4. **figma necks → cubify-tier outline separation** (`cubify._stacked_lobes` + `_carve_necks`):
+     figma's left column (top pill → mid circle → bottom circle) fuses into a lumpy blob; the necks
+     are sub-pixel at feed res (240-px lobes ÷ ~100× downscale) and never appear naturally, so the
+     render **IDEALIZES** a deliberate 1-px punch in (cube-round-identity spirit). Detect a run of
+     ≥ `DIVOT_MIN_LOBES (=3)` round ADD lobes (`Circle/Ellipse/RotatedEllipse/RoundedRectangle`,
+     intrinsic-aspect ≤ `DIVOT_MAX_ASPECT (=3)` so claude's thin radial blades are excluded WITHOUT
+     importing radial machinery) stacked along one axis with consecutive boundary-meets (gap window)
+     + perpendicular footprint overlap; punch `DIVOT_DEPTH = 1` px per side at each junction WAIST,
+     scoped to the necking pair's perpendicular window (so the bowl/spine free edges aren't nicked),
+     topology-guarded (component count must not rise → never a SEAM). This is the **cubify-tier
+     (T ≤ 24) counterpart of round-8/9 `_outline_gaps`** (the geometry-tier T > 24 doctrine) — but
+     **geometry-derived from part-pair boxes** instead of convexity-defects (robust where the union
+     outline is convex < 1 px). **`DIVOT_MAX_T = 16`** (user ruling — at T=24 the ~4-px neck column
+     pinches to a prominent 2-px bridge, choppier than the "subtle, not a SEAM" intent, and figma's
+     @24 glob is mild; the clean baseline wins there). figma@16 separated + jag IMPROVED 0.618 → 0.510;
+     figma@24 clean baseline; **both PASS**. Refutes the earlier "blocked at the D2 decomposition"
+     verdict — figma is 5 SEPARATE Parts (the stacked circles are NOT merged; only the top bar is a
+     `_merge_collinear_circles` pill), so the necks ARE in the part geometry; the prior
+     `_punch_top_junction` just used the wrong (silhouette-convexity) detector.
+
+- **Feed-res gate.** **Seed gate (discord/gmail/vscode/claude/figma × {16,24}): 10/10 green**, all
+  byte-deterministic (`--twice` IDENTICAL). Extended 10-fixture set (+ firefox/telegram/medium-m/
+  adobe/slack): **18/20**, the 2 reds being the adobe@16 / slack@16 **honest partials** — the render
+  is visually correct and the metric lags. Full n=30 feed-res set: 46/60 at the start of the rework
+  (cubify tuned on seeds; the 14 non-seed reds are complex woven/rotated/multi-part topology), now
+  being lifted fixture-by-fixture through the critique loop.
+
+- **META-FINDING (drives the gate recalibration).** The gate's `jag` + ref-based `topo` metrics
+  SYSTEMATICALLY penalize the SEPARATION/blockiness the user wants — slack@16 jag-LOSS, adobe@16
+  ref-topo, figma's separation costing jag at 24. In every case the render is VISUALLY CORRECT and
+  the metric lags; per **strips-before-metrics** the strips are the truth, and the gate needs a
+  separation/blockiness-aware recalibration alongside the axis-blocky objective.
+
+- **Next (render rework):** wire stage-4 refine onto the `--final` masks (the handoff seam exists);
+  the gate-metric recalibration; lift the non-seed feed-res cells through the critique loop; R2/R3
+  tiers remain deferred. Tunable knobs surfaced this round: `W_AXIS`, `SEP_MIN_CONS`, `DIVOT_MAX_T`,
+  `DIVOT_DEPTH`, `DIVOT_MIN_LOBES`, `DIVOT_MAX_ASPECT`, `TRI_AGREE`.
 
 ### Stage 4 — refine
 
