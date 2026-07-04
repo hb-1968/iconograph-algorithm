@@ -8,13 +8,34 @@ stage 3 reaching into preprocess/common.py).
 import cv2
 import numpy as np
 
-# Fedora hicolor target sizes — the per-target grids stage 3's render tier (R1),
-# stage 4's min-feature enforcement, and stage 6's fill-maximization all work over.
-# Locked to the 16/24 feed resolution (user ruling): the pixel-cubify render owns
-# T ≤ 24, and these are the sizes fed onward to stage-4 refinement. The geometry
-# render path is retained for T > 24 (synthetic regression only) but production
-# never requests those sizes.
+# Fedora hicolor feed sizes — the per-target grids stage 3's render tier (R1) and
+# stage 4's min-feature enforcement work over. Locked to the 16/24 feed resolution
+# (user ruling): the pixel-cubify render owns T ≤ 24, and these are the sizes fed
+# onward to stage-4 refinement. Stage 5's compose then places each onto its N=T+8
+# output grid (16→24, 24→32). The geometry render path is retained for T > 24
+# (synthetic regression only) but production never requests those sizes.
 HICOLOR_SIZES: tuple[int, ...] = (16, 24)
+
+# 3x3 rect structuring element = the full 8-neighbourhood (incl. diagonals).
+_SE3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
+
+def masks_8adjacent(a: np.ndarray, b: np.ndarray) -> bool:
+    """True iff foreground of `a` touches foreground of `b` under 8-connectivity
+    (sharing an edge OR a diagonal corner). `a`, `b`: same-shape masks (bool or
+    uint8, nonzero = foreground).
+
+    Dilating `a` by the 3x3 SE grows it into its 8-neighbourhood; intersecting
+    with `b` is non-empty exactly when the two are ≤1px apart. So `not
+    masks_8adjacent(x, logo)` is the "x is ≥1px 8-separated from the logo"
+    guarantee used by the stage-5 monogram fitter. Consolidates the 8-adjacency
+    idiom that recurs inline across stages 3-4 (e.g. the `_adjacent` closure in
+    compress/render.py) into one importable helper; stage 5 uses it directly.
+    Converging the pre-existing stage-3/4 inline copies onto this is deferred —
+    it touches determinism-critical upstream code and needs its own byte-identity
+    re-verification (H6), so it is a separate cleanup, not part of this stage.
+    """
+    return bool(np.count_nonzero(cv2.dilate(a.astype(np.uint8), _SE3) & b.astype(np.uint8)))
 
 
 def frame_with_margin(img: np.ndarray, margin_frac: float = 0.10) -> np.ndarray:

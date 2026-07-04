@@ -9,6 +9,7 @@ dependencies = [
     "numpy",
     "Pillow",
     "scikit-learn",
+    "pyphen",   # stage-5 monogram: dictionary hyphenation → syllable onsets (deterministic, H8)
 ]
 
 [project.optional-dependencies]

@@ -39,7 +39,8 @@ Synthetic strip panels per (shape, size): reference | naive NN | R1 render |
 diff (red = missed reference, blue = spill), all nearest-upscaled. Fixture
 strips: one PNG per fixture, a row per size: aligned source | reference
 composite | naive composite | R1 composite (segment colors, light-grey bg so
-white-on-white features stay visible) → testbed/render/fx_<stem>.png.
+white-on-white features stay visible) → testbed/render/fixtures/fx_<stem>.png
+(synthetic shape strips → testbed/render/synthetic/<name>_<size>.png).
 Startup self-test pins the fillPoly raster convention (outline-inclusive,
 round-half-up: an integer-corner box (a..b) fills pixels a..b exactly) — it
 silently corrupts every downstream number if wrong.
@@ -220,8 +221,12 @@ from iconograph.application.refine.common import (  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DUMP_DIR = REPO_ROOT / "testbed" / "render"
-FINAL_DIR = DUMP_DIR / "final"     # --final: assembled render products (the
-#                                    deliverable + stage-4 refine's input)
+# Render strips are filed by CONTEXT (H7 — testbed never accumulates a flat pile):
+SYNTH_DIR = DUMP_DIR / "synthetic"  # synthetic shape regression strips (geometry path,
+#                                     T ∈ {16,24,32,64}) — the default/synthetic mode
+FX_DIR = DUMP_DIR / "fixtures"      # --fixtures: per-fixture feed-res gate strips
+FINAL_DIR = DUMP_DIR / "final"      # --final: assembled render products (the
+#                                     deliverable + stage-4 refine's input)
 
 DEFAULT_SIZES = (16, 24, 32, 64)
 # Feed-resolution lock (user ruling): the fixture gate is the seed set at
@@ -692,9 +697,9 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
                       "strays": strays, "topo_ok": topo_cell_ok,
                       "axis_fired": axis_fired,
                       "reg_audit_ok": reg_audit_ok})
-    DUMP_DIR.mkdir(parents=True, exist_ok=True)
+    FX_DIR.mkdir(parents=True, exist_ok=True)
     Image.fromarray(np.vstack(rows), "RGB").save(
-        DUMP_DIR / f"fx_{stem}.png", "PNG", optimize=True)
+        FX_DIR / f"fx_{stem}.png", "PNG", optimize=True)
     return stats
 
 
@@ -895,9 +900,9 @@ def _process(name: str, builder, sizes: tuple[int, ...], degrees: bool,
         ]
         if degrees:
             panels.extend(_degree_panels(parts, canvas, t))
-        DUMP_DIR.mkdir(parents=True, exist_ok=True)
+        SYNTH_DIR.mkdir(parents=True, exist_ok=True)
         Image.fromarray(hstack(panels), "RGB").save(
-            DUMP_DIR / f"{name}_{t}.png", "PNG", optimize=True)
+            SYNTH_DIR / f"{name}_{t}.png", "PNG", optimize=True)
         stats.append({"name": name, "t": t, "ratio": ratio, "fid": fid,
                       "floor_ok": floor_ok, "jag_win": ratio <= 1.0,
                       "topo_ok": topo_ok, "sym_audit_ok": sym_audit_ok,
@@ -1058,7 +1063,7 @@ def main(argv: list[str] | None = None) -> int:
                                          if fired
                                          else "mirror axis did not fire (OK)"))
             _gate_table(all_stats)
-        print(f"strips → {DUMP_DIR.relative_to(REPO_ROOT)}/fx_<stem>.png")
+        print(f"strips → {FX_DIR.relative_to(REPO_ROOT)}/fx_<stem>.png")
         return 0
     shapes = _shapes()
     wanted = argv if argv else list(shapes)
@@ -1085,7 +1090,7 @@ def main(argv: list[str] | None = None) -> int:
               f"topo-or-drop {topos}/{len(all_stats)}  violations {viols}  "
               f"sym-audit {sym_ok}/{len(all_stats)}  "
               f"reg-audit {reg_ok}/{len(all_stats)}")
-    print(f"strips → {DUMP_DIR.relative_to(REPO_ROOT)}/")
+    print(f"strips → {SYNTH_DIR.relative_to(REPO_ROOT)}/")
     return 0
 
 

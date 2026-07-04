@@ -68,6 +68,7 @@ from iconograph.application.compress.common import (
     _compound_mask,
     _iou_bool,
     _mirror_axis,
+    _nb4count,
     _scale,
     _snap,
 )
@@ -81,6 +82,7 @@ from iconograph.application.compress.render import (
     render_debug,
 )
 from iconograph.application.compress.straighten import translate_prim
+from scipy.signal import find_peaks
 from skimage.morphology import medial_axis
 
 SYM_OK = 0.95                # render already this self-symmetric → leave it (vscode)
@@ -310,6 +312,21 @@ ROT_ELIGIBLE_SYM_IOU = 0.90    # silhouette ≈ its own 90° rotation ⇒ multi-
 ROT_ELIGIBLE_THINNESS = 0.35   # minAreaRect short/long ≤ this ⇒ a single thin stroke (orientation-free)
 
 
+def _self_rot_iou(mask: np.ndarray, angles: tuple[float, ...]) -> float:
+    """Max IoU of `mask` vs its own rotation about its centroid over `angles` (degrees). The single
+    source of truth for the rotational-symmetry / chirality primitive shared by _rotation_eligible
+    (90°) and _label_axes (90/180/270°). INTER_NEAREST integer selection ⇒ H8-safe — NOT the
+    thread-nondeterministic warpPolar/INTER_LINEAR class (feedback_cv2_warppolar_nondeterministic)."""
+    mom = cv2.moments(mask, binaryImage=True)
+    if mom["m00"] == 0.0:
+        return 0.0
+    cx, cy = mom["m10"] / mom["m00"], mom["m01"] / mom["m00"]
+    h, w = mask.shape[:2]
+    return max(_iou_bool(mask, cv2.warpAffine(
+        mask, cv2.getRotationMatrix2D((cx, cy), a, 1.0),
+        (w, h), flags=cv2.INTER_NEAREST, borderValue=0)) for a in angles)
+
+
 def _rotation_eligible(constructions: list[tuple[list[Part], tuple, str]],
                        canvas_hw: tuple[int, int]) -> bool:
     """A mark is rotation-eligible only if it has NO canonical 'up', so rotating it
@@ -326,13 +343,7 @@ def _rotation_eligible(constructions: list[tuple[list[Part], tuple, str]],
     ys, xs = np.nonzero(sil)
     if xs.size == 0:
         return False
-    mom = cv2.moments(sil, binaryImage=True)
-    if mom["m00"] == 0.0:
-        return False
-    cx, cy = mom["m10"] / mom["m00"], mom["m01"] / mom["m00"]
-    rot90 = cv2.warpAffine(sil, cv2.getRotationMatrix2D((cx, cy), 90.0, 1.0),
-                           (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
-    if _iou_bool(sil, rot90) >= ROT_ELIGIBLE_SYM_IOU:        # (a) multi-fold symmetric
+    if _self_rot_iou(sil, (90.0,)) >= ROT_ELIGIBLE_SYM_IOU:  # (a) multi-fold symmetric
         return True
     n_cc, *_ = cv2.connectedComponentsWithStats(sil, connectivity=8)
     if n_cc - 1 == 1:                                         # (b) one component …
@@ -703,3 +714,558 @@ def refine_outline(constructions: list[tuple[list[Part], tuple, str]],
     back, so the centerline cleanup shapes the final fill). Deterministic (H8)."""
     masks = cleanup_scene(constructions, rendered_masks, canvas_hw, target)
     return restroke_outline(constructions, masks, canvas_hw, target)
+
+
+# ── Perimeter outline + diagonal "disjoint" repair (Stage-4 v1, pixel-level) ─────────
+# A DIFFERENT product from the skeleton path above: the user's "outline" here is the 1-px
+# BOUNDARY PERIMETER of the silhouette (a closed loop hugging the edge), NOT the medial-
+# axis centerline. Renders are monochromatic, so the outline is the perimeter of the
+# UNION silhouette (outer edge + every hole/counter ring). A staircased perimeter touches
+# itself only at CORNERS across a diagonal step (8-connected, not 4-connected); the repair
+# ("disjointing") fills ONE pixel per such junction so the loop is FACE-connected. The fill
+# goes on the INTERIOR side of the gap by default (no outward bulge), EXTERIOR only when
+# there is no interior corner. Library-first (H2): cv2.erode for the ring, vectorized numpy
+# 2×2 windows for the junctions (no per-pixel loop). Additive-only ⇒ never opens a seam;
+# a no-diagonal outline is a byte-identical no-op. Deterministic (H8): no RNG.
+
+PERIM_MAX_PASSES = 8       # connect_disjoint fixpoint cap (a fill can expose a new neighbour touch)
+
+
+def silhouette_outline(silhouette: np.ndarray) -> np.ndarray:
+    """1-px INNER boundary ring of a filled mask: every foreground pixel with at least one
+    background 8-neighbour. silhouette: (H,W) uint8 {0,255}. Returns (H,W) uint8 {0,255}.
+
+    `M & ~erode(M)` keeps the outermost layer only — stays inside M's footprint, unlike
+    MORPH_GRADIENT (dilate−erode) which is 2-px and bulges outward. Hole/counter rings come
+    for free (a hole's interior is background, so its rim erodes out). BORDER_CONSTANT 0 is
+    load-bearing: cv2.erode defaults to BORDER_REFLECT_101, under which a pixel touching the
+    canvas edge sees a mirrored foreground neighbour and does NOT erode out — so the
+    silhouette's edge would be missing from the ring (the same convention as _connect_squeeze)."""
+    se = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    eroded = cv2.erode(silhouette, se, borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    return silhouette & ~eroded
+
+
+def _diag_fill(b: np.ndarray, s: np.ndarray) -> np.ndarray:
+    """One vectorized pass: for every 2×2 window of outline `b` that is a DIAGONAL-ONLY touch
+    (two fg on a diagonal, two bg on the anti-diagonal), choose ONE empty corner to fill so
+    the touch becomes face-connected. Prefer the INTERIOR corner (silhouette `s` == True — the
+    side inside the shape, no outward bulge); when neither empty corner is interior, take a
+    deterministic one (the only available, exterior, side). `b`, `s`: (H,W) bool. Returns the
+    (H,W) bool fill mask (caller ORs it into the outline). No RNG (H8)."""
+    tl, tr = b[:-1, :-1], b[:-1, 1:]
+    bl, br = b[1:, :-1], b[1:, 1:]
+    pat_a = tl & br & ~tr & ~bl      # fg on the ╲ diagonal; empty corners TR=(r,c+1), BL=(r+1,c)
+    pat_b = tr & bl & ~tl & ~br      # fg on the ╱ diagonal; empty corners TL=(r,c),   BR=(r+1,c+1)
+    s_tl, s_tr = s[:-1, :-1], s[:-1, 1:]
+    s_bl, s_br = s[1:, :-1], s[1:, 1:]
+    fill = np.zeros_like(b)
+    # pat_a → fill TR if interior (or both-exterior fallback), else BL (the interior one)
+    fill[:-1, 1:] |= pat_a & (s_tr | ~s_bl)
+    fill[1:, :-1] |= pat_a & ~s_tr & s_bl
+    # pat_b → fill TL if interior (or both-exterior fallback), else BR
+    fill[:-1, :-1] |= pat_b & (s_tl | ~s_br)
+    fill[1:, 1:] |= pat_b & ~s_tl & s_br
+    return fill
+
+
+def connect_disjoint(outline: np.ndarray, silhouette: np.ndarray, target: int,
+                     max_passes: int = PERIM_MAX_PASSES) -> np.ndarray:
+    """Make the perimeter FACE-connected (4-connectivity): fill ONE pixel per diagonal-only
+    corner touch, interior side preferred. Iterates to a fixpoint (a fill can create a new
+    neighbouring touch) capped at max_passes. Additive only — never removes a pixel, so it
+    can never open a seam; a no-diagonal outline is a byte-identical no-op (zero regression).
+    outline / silhouette: (target,target) uint8 {0,255}. Returns (target,target) uint8.
+    Deterministic (H8)."""
+    out = outline > 0
+    sil = silhouette > 0
+    for _ in range(max_passes):
+        fill = _diag_fill(out, sil)
+        if not fill.any():
+            break
+        out = out | fill
+    return (out * 255).astype(np.uint8)
+
+
+# ── un-blot small features: counters that merge into the outline at tiny T ───────────
+# At feed res a small interior counter (discord's eyes @16) can sit so close to another
+# boundary that silhouette_outline merges its rim into the outline mass — the feature
+# "blots" and stops reading as a distinct element (at 24 the eyes outline as separate
+# rings; at 16 the face is too small for erode to open any gap). This pass restores a
+# >= UNBLOT_GAP-px wall to the nearest other boundary by MOVING the hole 1px (toward open
+# space) or, failing that, DOWNSIZING it — entirely in the MASK domain (layer-on-top: a
+# solo part re-render is infeasible, the part's solo footprint != its joint footprint, per
+# the project_cleanup_layer_on_top_scope memory). The refine-tier analog of the render-tier
+# separation passes (render._outline_gaps / render_debug._separate_divots /
+# cubify._carve_necks), in a different domain (interior holes of the rendered silhouette).
+# Deterministic (H8), topology-guarded, byte-identical no-op when nothing blots.
+
+UNBLOT_GAP = 3           # min wall thickness (fg px) from a counter to the nearest other
+#                          boundary for it to read as un-blotted. A 1-px gap in the OUTLINE
+#                          needs a 3-px wall (W≥3 leaves a non-outline fg pixel between the two
+#                          rims; W=2 merges them): discord's eyes are wall-3/distinct @24,
+#                          wall-2/blotted @16 — the threshold that splits those two (knob).
+UNBLOT_MOVES = ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1))
+_SE3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
+
+def _min_feat_at(target: int) -> int:
+    """Smallest counter worth keeping at target res — mirrors compress.common._min_feature_px
+    (max(2, ceil(s / MIN_FEATURE_DIVISOR=48))) evaluated at the target grid."""
+    return max(2, math.ceil(target / 48))
+
+
+def _significant_holes(mask: np.ndarray, min_feat: int) -> list[np.ndarray]:
+    """Each interior hole (enclosed-background component) of `mask` whose bbox spans >=
+    min_feat in BOTH dims, as its own uint8 {0,255} region. Border flood-fill of the inverted
+    mask isolates enclosed bg (mirrors render_debug._sig_topology's technique — reimplemented
+    here, not imported, to avoid the render_debug → refine.common import cycle). H8."""
+    m = (mask > 0).astype(np.uint8)
+    pad = cv2.copyMakeBorder(m * 255, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    inv = cv2.bitwise_not(pad)
+    ffm = np.zeros((pad.shape[0] + 2, pad.shape[1] + 2), np.uint8)
+    cv2.floodFill(inv, ffm, (0, 0), 0)                  # border-connected bg → 0; enclosed bg remains
+    n, lbl, st, _c = cv2.connectedComponentsWithStats(inv[1:-1, 1:-1], connectivity=8)
+    return [((lbl == i).astype(np.uint8) * 255) for i in range(1, n)
+            if min(int(st[i, cv2.CC_STAT_WIDTH]), int(st[i, cv2.CC_STAT_HEIGHT])) >= min_feat]
+
+
+def _outer_bg(mask: np.ndarray) -> np.ndarray:
+    """Bool mask of the OUTER (border-connected) background — everything outside the silhouette,
+    excluding interior counters. Border flood-fill (the complement of _significant_holes' bg)."""
+    m = (mask > 0).astype(np.uint8)
+    pad = cv2.copyMakeBorder(m, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    ff = np.zeros((pad.shape[0] + 2, pad.shape[1] + 2), np.uint8)
+    flooded = pad.copy()
+    cv2.floodFill(flooded, ff, (0, 0), 2)               # border-connected bg → 2
+    return flooded[1:-1, 1:-1] == 2
+
+
+def _wall(fg: np.ndarray, hole: np.ndarray, outer_bg: np.ndarray) -> int:
+    """Wall thickness = number of foreground px between `hole` and the nearest OUTER-silhouette
+    boundary (`outer_bg`). Other interior holes are NOT boundaries here — two counters sitting
+    close (discord's eyes) is not a blot; only a counter merging with the silhouette EDGE is.
+    Grow the hole 1px/ring through the FOREGROUND ONLY (routing around other holes); the first
+    ring touching the outer background gives the thickness. Cheap on feed-res masks. H8."""
+    fgb = fg > 0
+    grown = hole > 0
+    for d in range(1, int(max(fg.shape)) + 2):
+        rim = (cv2.dilate(grown.astype(np.uint8), _SE3) > 0) & ~grown
+        if bool(np.any(rim & outer_bg)):
+            return d - 1
+        nxt = rim & fgb
+        if not bool(np.any(nxt)):                        # sealed in by other holes; never reached edge
+            return int(max(fg.shape))
+        grown = grown | nxt
+    return int(max(fg.shape))
+
+
+def _shift_region(mask: np.ndarray, dy: int, dx: int) -> np.ndarray:
+    """Integer (dy,dx) shift of a region, ZERO-filled at the vacated border (NOT np.roll, which
+    wraps). Pure-numpy slicing — deterministic, no interpolation (H8)."""
+    out = np.zeros_like(mask)
+    h, w = mask.shape
+    out[max(0, dy):h + min(0, dy), max(0, dx):w + min(0, dx)] = \
+        mask[max(0, -dy):h - max(0, dy), max(0, -dx):w - max(0, dx)]
+    return out
+
+
+def _recarve(sil: np.ndarray, old_hole: np.ndarray, new_hole: np.ndarray) -> np.ndarray:
+    """Replace `old_hole` with `new_hole` in `sil`: fill the old hole (→ fg), carve the new
+    (→ bg). uint8 {0,255}."""
+    out = sil.copy()
+    out[old_hole > 0] = 255
+    out[new_hole > 0] = 0
+    return out
+
+
+def unblot_features(silhouette: np.ndarray, target: int) -> np.ndarray:
+    """Move or downsize blotting counters so each keeps a >= UNBLOT_GAP-px wall to the nearest
+    other boundary. For each significant hole that blots (wall < UNBLOT_GAP): try the 8 single-
+    px MOVES, keep those that reach the wall AND preserve topology, pick the one with the
+    THICKEST resulting wall (tie-break toward the silhouette centroid — mirror-invariant, so a
+    symmetric pair like discord's eyes stays symmetric); if no move works, DOWNSIZE the hole
+    1px (erode, floored at min_feat). Honest partial (leave it) if neither helps. Mask-domain,
+    topology-guarded, deterministic; a no-blot silhouette is returned byte-identical."""
+    sil = silhouette.copy()
+    if not sil.any():
+        return sil
+    min_feat = _min_feat_at(target)
+    base = _topology(sil)
+    outer = _outer_bg(sil)                              # outer boundary is invariant under interior moves
+    ys, xs = np.nonzero(sil)
+    cy, cx = float(ys.mean()), float(xs.mean())
+    for hole in _significant_holes(sil, min_feat):
+        if _wall(sil, hole, outer) >= UNBLOT_GAP:
+            continue                                    # not blotting
+        hy, hx = np.nonzero(hole)
+        hcy, hcx = float(hy.mean()), float(hx.mean())
+        best, best_key = None, None
+        for dy, dx in UNBLOT_MOVES:
+            nh = _shift_region(hole, dy, dx)
+            if not nh.any():
+                continue
+            trial = _recarve(sil, hole, nh)
+            if _topology(trial) != base:                # breached / merged / lost a hole
+                continue
+            w = _wall(trial, nh, outer)
+            if w < UNBLOT_GAP:
+                continue
+            toward = dy * (cy - hcy) + dx * (cx - hcx)  # mirror-invariant tie-break
+            key = (w, toward)
+            if best_key is None or key > best_key:
+                best, best_key = trial, key
+        if best is None:                                # downsize fallback
+            nh = cv2.erode(hole, _SE3, borderType=cv2.BORDER_CONSTANT, borderValue=0)
+            if nh.any():
+                ny, nx = np.nonzero(nh)
+                if (int(ny.max() - ny.min()) + 1 >= min_feat
+                        and int(nx.max() - nx.min()) + 1 >= min_feat):
+                    trial = _recarve(sil, hole, nh)
+                    if _topology(trial) == base and _wall(trial, nh, outer) >= UNBLOT_GAP:
+                        best = trial
+        if best is not None:
+            sil = best
+    return sil
+
+
+WIDEN_TGT_THRESH = 110   # @24 footprint coverage (downscaled grayscale 0-255) above which the
+#                          @24 sibling "wants" foreground at a pixel — the continuous zone target.
+WIDEN_MAX_PASS = 6
+
+
+def _flanked(mask: np.ndarray) -> np.ndarray:
+    """Bool: background pixels with foreground on BOTH horizontal OR both vertical 4-neighbours —
+    an inner gap/notch being bridged (a concavity, e.g. gmail's M top-centre seam), NOT an outward
+    protrusion tip. Vectorized, deterministic (H8)."""
+    f = mask > 0
+    h = np.zeros_like(f)
+    v = np.zeros_like(f)
+    h[:, 1:-1] = f[:, :-2] & f[:, 2:]
+    v[1:-1, :] = f[:-2, :] & f[2:, :]
+    return (h | v) & (mask == 0)
+
+
+RADIAL_MIN_PEAKS = 6     # >= this many prominent angular-mass peaks (blades) = a radial/sunburst
+#                          mark (claude/firefox), EXCLUDED from the continuity widen per the
+#                          project's radial-family exclusion. Seeds: claude 11; gmail/figma 2,
+#                          discord 1, vscode 4 — a wide margin.
+
+
+def _is_radial(sil: np.ndarray) -> bool:
+    """True for sunburst/radial-blade marks: the angular mass profile (foreground pixels binned by
+    angle about the centroid) has >= RADIAL_MIN_PEAKS prominent peaks = many blades. The project's
+    own sunburst signal (peak-COUNT, not rfft — a spike train smears harmonics). Deterministic (H8):
+    a pure-numpy angular histogram, NOT cv2.warpPolar — that op races near the peak-count threshold
+    under a warm multithreaded pool and flaked this gate (and every caller: widen, deburr)
+    regardless of thread pinning; the histogram is thread-independent by construction."""
+    s = cv2.resize(sil, (96, 96), interpolation=cv2.INTER_NEAREST)     # INTER_NEAREST: no interp, deterministic
+    ys, xs = np.nonzero(s)
+    if xs.size == 0:
+        return False
+    cx, cy = float(xs.mean()), float(ys.mean())
+    ang = np.degrees(np.arctan2(ys.astype(np.float64) - cy, xs.astype(np.float64) - cx)) % 360.0
+    prof = np.bincount(np.minimum(ang.astype(np.int64), 359), minlength=360).astype(np.float64)
+    if prof.max() <= 0:
+        return False
+    k = np.ones(9) / 9.0                                  # circular box-smooth the per-degree histogram
+    prof = np.convolve(np.concatenate([prof, prof, prof]), k, "same")[360:720]   # (~warpPolar's radial avg)
+    prof = np.concatenate([prof, prof[:30]])              # wrap so peaks at 0deg aren't missed
+    peaks, _ = find_peaks(prof, prominence=0.25 * float(prof.max()), distance=12)
+    return int(np.count_nonzero(peaks < 360)) >= RADIAL_MIN_PEAKS
+
+
+def widen_underrepresented(sil: np.ndarray, target: int,
+                           structure_ref: np.ndarray | None = None) -> np.ndarray:
+    """Cross-resolution inner-feature CONTINUITY widen. When the @24 sibling (`structure_ref`)
+    renders an inner feature as a continuous filled zone but @16 pinches it (gmail's M-centre: a
+    1px tip + an unclosed top-centre seam), fill @16 toward @24's footprint so it reads continuous.
+
+    Mechanism: downscale @24 to the target grid as the footprint @24 "wants" (`WIDEN_TGT_THRESH`);
+    fill only deficit pixels that sit at a PINCH (thin fg that vanishes under a 3x3 erosion) or at
+    a FLANKED inner gap (_flanked) — never an outward protrusion tip; each fill applied as a MIRROR
+    PAIR about the glyph's vertical axis (symmetric inputs stay symmetric → clean zone, not a blob)
+    and accepted only if `_topology` (components, holes) is unchanged (so separate counters — e.g.
+    discord's eyes — can never merge). No-op when structure_ref is None (the @24 render is
+    authoritative and never widens). Deterministic (H8: no RNG, INTER_AREA, row-major).
+
+    NOTE: this is a GENERAL continuity rule; geometrically it ALSO fires on any fixture whose inner
+    features are thinner than its @24 (discord's body, etc.) — those are not distinguishable from
+    gmail's by any geometric signal. The harness/caller scopes WHICH fixtures it runs on."""
+    if structure_ref is None or not sil.any():               # @24 is authoritative — never widen it
+        return sil
+    if _is_radial(structure_ref):                            # radial-blade family (claude/firefox)
+        return sil                                           # excluded per the project convention
+    tgt = cv2.resize(structure_ref, (target, target), interpolation=cv2.INTER_AREA) > WIDEN_TGT_THRESH
+    xs = np.nonzero(sil)[1]
+    axis = (int(xs.min()) + int(xs.max())) / 2.0          # vertical mirror axis (bbox centre)
+    eroded = cv2.erode(sil, _SE3, borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    core = cv2.dilate(eroded, _SE3, borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    pinch = cv2.dilate(((sil > 0) & (core == 0)).astype(np.uint8) * 255, _SE3,
+                       borderType=cv2.BORDER_CONSTANT, borderValue=0) > 0
+    base = _topology(sil)
+    cur = sil.copy()
+    for _ in range(WIDEN_MAX_PASS):
+        allow = tgt & (pinch | _flanked(cur))             # @24 wants it, at a pinch or inner gap
+        nb = cv2.dilate(cur, _SE3, borderType=cv2.BORDER_CONSTANT, borderValue=0)
+        cand = (cur == 0) & allow & (nb > 0)
+        if not cand.any():
+            break
+        changed = False
+        for y, x in sorted(map(tuple, np.argwhere(cand))):
+            if cur[y, x]:
+                continue
+            trial = cur.copy()
+            trial[y, x] = 255
+            tx = int(round(2.0 * axis - x))               # mirror twin (keep symmetry)
+            if 0 <= tx < target:
+                trial[y, tx] = 255
+            if _topology(trial) == base:
+                cur, changed = trial, True
+        if not changed:
+            break
+    return cur
+
+
+def deburr_nibs(silhouette: np.ndarray, target: int,
+                reference: np.ndarray | None = None,
+                max_nib: int = 1) -> np.ndarray:
+    """Remove barely-attached single-pixel "bumps" (cubify raster jaggies) from a composited
+    silhouette. A bump is a FG pixel with EXACTLY ONE 4-connected (shared-edge) neighbour, where
+    that neighbour is a SOLID body pixel (>= 3 shared edges) — a lone pixel protruding from a wide
+    body. This catches jaggy edge bumps (figma's top row, gmail's arm edges, vscode's ears) while a
+    thin-feature TIP is KEPT, because a tip's single neighbour is itself thin (< 3 shared edges — a
+    chevron apex, a 1px antenna). Radial-blade marks (claude/firefox) are exempt via _is_radial on
+    the reference. Topology-guarded (no component split, no lost counter), bounded to `max_nib`
+    passes.
+
+    ACCEPTED TRADEOFF (user ruling — "aggressive de-jag, all bumps"): the reference and symmetry
+    gates are dropped, so a genuine sharp FILLED point (a triangle / wedge apex) — which also
+    protrudes from a solid body — WILL be shaved. No geometric signal separates a rogue bump from
+    an intended sharp point; over-fires are surfaced by the full-fixture audit, not prevented here.
+    No-op (byte-identical) when reference is None, the mark is radial, or nothing qualifies.
+    Deterministic (H8: no RNG, row-major order, thread-pinned _is_radial, fixed cap)."""
+    if reference is None or not silhouette.any():          # no oracle -> never guess
+        return silhouette
+    if _is_radial(reference):                              # radial-blade family (claude/firefox) — clean ref
+        return silhouette
+    base = _topology(silhouette)                           # fixed original (components, holes)
+    cur = silhouette.copy()
+    _NB4 = ((-1, 0), (1, 0), (0, -1), (0, 1))
+    for _ in range(max_nib):
+        n4 = _nb4count(cur)
+        thin = (cur > 0) & (n4 == 1)                       # a bump: exactly one shared-edge neighbour
+        if not thin.any():
+            break
+        changed = False
+        for y, x in sorted(map(tuple, np.argwhere(thin))):
+            if cur[y, x] == 0:                             # already peeled this pass
+                continue
+            q = next(((y + dy, x + dx) for dy, dx in _NB4              # its single 4-neighbour
+                      if 0 <= y + dy < target and 0 <= x + dx < target and cur[y + dy, x + dx]), None)
+            if q is None or n4[q] < 3:                     # neighbour is a thin stroke, not a solid body ->
+                continue                                   # keep it (protects genuine thin-feature tips)
+            trial = cur.copy()
+            trial[y, x] = 0
+            nt = _topology(trial)
+            if nt[0] <= base[0] and nt[1] >= base[1]:      # no fragmentation, no lost counter
+                cur, changed = trial, True
+        if not changed:
+            break
+    return cur
+
+
+STROKE_DIAG_FRAC = 0.6   # a <=2px stroke whose 1px centreline is >= this fraction diagonal would
+#                          staircase (8-connected but 4-BROKEN) if thinned -> WIDEN to 3px; a
+#                          predominantly axis-aligned centreline THINS to 1px (vscode's diagonal
+#                          tails widen; instagram's axis-aligned band thins). The user's rule:
+#                          thin unless thinning "breaks the shape" = a 4-connectivity break.
+STROKE_MIN_LEN = 2       # only normalize elongated strokes (a <2px-long speck is not a "line")
+
+
+def normalize_stroke_width(silhouette: np.ndarray, target: int) -> np.ndarray:
+    """Normalize 2px-thick strokes to an ODD width: thin to 1px by default, widen to 3px when
+    thinning would break the shape. A stroke is <=2px where a 3x3 opening removes it (a >=3px core
+    survives). Its half-width reads ~1 (medial_axis dist == ceil(w/2), so 1px and 2px both read 1 —
+    thinning a 1px stroke is a no-op, harmless). The thin-vs-widen call is the stroke centreline's
+    DIAGONALITY: a predominantly-diagonal 1px centreline 4-fragments (each px its own 4-component,
+    _n4/len ~ 1.0) so thinning staircases it (the user's "break"); a predominantly axis-aligned
+    centreline stays face-connected (_n4/len ~ 1/len). Above STROKE_DIAG_FRAC the stroke is WIDENED
+    (radius-1 re-stroke = 3px); below it, THINNED to its 1px skeleton (offset-swept, topology-
+    guarded — if thinning disconnects at every offset it is widened instead). Every change is
+    topology-guarded. Deterministic (H8: rng=0, row-major, fixed). Byte-identical when no <=2px
+    stroke is present. Radial-blade sunbursts (claude) are exempt — their thin blades are intended
+    features, and normalizing them unevenly breaks the radial symmetry."""
+    if not silhouette.any() or _is_radial(silhouette):
+        return silhouette
+    opened = cv2.morphologyEx(silhouette, cv2.MORPH_OPEN, _SE3,
+                              borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    thin_parts = ((silhouette > 0) & (opened == 0)).astype(np.uint8)   # the <=2px strokes/bands
+    if not thin_parts.any():
+        return silhouette
+    skel_raw, dist = medial_axis(silhouette > 0, return_distance=True, rng=0)
+    skel = _prune_spurs(skel_raw.astype(np.uint8) * 255) > 0
+    base = _topology(silhouette)
+    n, lbl, _st, _c = cv2.connectedComponentsWithStats(thin_parts, connectivity=8)
+    cur = silhouette.copy()
+    for i in range(1, n):
+        comp = (lbl == i)
+        cskel = skel & comp
+        length = int(cskel.sum())
+        if length < STROKE_MIN_LEN:                        # not an elongated line -> leave it
+            continue
+        skmask = cskel.astype(np.uint8) * 255
+        frag = (cv2.connectedComponents(skmask, connectivity=4)[0] - 1) / length
+        if frag <= STROKE_DIAG_FRAC:                       # axis-aligned centreline -> THIN to 1px
+            keep_skel = cur.copy(); keep_skel[comp & ~skel] = 0       # keep the medial-axis offset
+            keep_other = cur.copy(); keep_other[comp & skel] = 0      # or the other offset
+            if _topology(keep_skel) == base:
+                cur = keep_skel
+            elif _topology(keep_other) == base:
+                cur = keep_other
+            else:                                          # thinning disconnects at every offset -> widen
+                trial = cur | _restroke(skmask, np.ones_like(dist))
+                if _topology(trial) == base:
+                    cur = trial
+        else:                                              # diagonal centreline -> WIDEN to 3px
+            trial = cur | _restroke(skmask, np.ones_like(dist))
+            if _topology(trial) == base:
+                cur = trial
+    return cur
+
+
+SYM_AXIS_IOU = 0.70      # accept a label mirror axis when min(outer-flip-IoU, hole-flip-IoU) >= this
+#                          — hole-aware: a small feature (youtube's play triangle) can be body-
+#                          symmetric yet hole-ASYMMETRIC, which correctly rejects the false axis.
+SYM_ASYM_MAX = 0.032     # AND reject the axis if a single one-sided region larger than this fraction
+#                          of the canonical fg has no mirror partner — a BOUNDARY feature the IoU
+#                          gate misses (apple's bite, edge's swirl; folding would destroy it).
+SYM_ROT_MARGIN = 0.10    # AND reject the axis if rotation-IoU exceeds V/H-flip-IoU by more than this
+#                          — a CHIRAL mark (slack's pinwheel gap +0.218) or one whose true mirror axis
+#                          is off the V/H grid (react's atom, off-axis at ~60°, gap +0.196) reads far
+#                          more rotational than V/H-mirror; folding either about V/H merges its arms.
+#                          True V/H folders sit at gap <= -0.011 (chrome); the empty band (-0.011, 0.196)
+#                          is wide, so 0.10 has ~0.1 cushion on both sides. Measured over the n=30 set.
+#                          Conservative (user ruling: err toward NOT folding); genuine symmetric
+#                          marks' residual asymmetry is smaller/scattered (instagram 0.028, yt-music
+#                          0.023) than a real asymmetric feature (apple 0.05, edge 0.04-0.10).
+
+
+def _label_axes(constructions: list[tuple[list[Part], tuple, str]],
+                canvas_hw: tuple[int, int]) -> list[bool]:
+    """The mirror axes (True=vertical/reflect-x, False=horizontal/reflect-y) the LABEL is symmetric
+    about — hole-aware so a body-symmetric-but-hole-asymmetric axis (youtube: V) is rejected while a
+    genuine one (youtube/yt-music: H; instagram: both) is kept. Canonical geometry, not the render."""
+    h, w = canvas_hw
+    canon = np.zeros((h, w), np.uint8)
+    for parts, _c, _l in constructions:
+        canon |= _compound_mask(parts, h, w)
+    holes = ((canon == 0) & ~(_outer_bg(canon) > 0)).astype(np.uint8) * 255
+    rot_iou = _self_rot_iou(canon, (90.0, 180.0, 270.0))   # canonical's best rotation-IoU — the
+    #                          CHIRALITY reference the per-axis guard below compares each flip-IoU to
+    axes: list[bool] = []
+    for vert in (True, False):
+        fo = _best_flip_axis(canon, vert)
+        if fo is None:
+            continue
+        hi = _iou_bool(holes, _flip_mask(holes, fo[0], vert)) if holes.any() else 1.0
+        if min(fo[1], hi) < SYM_AXIS_IOU:
+            continue
+        if rot_iou - fo[1] > SYM_ROT_MARGIN:      # far more rotational than V/H-mirror -> chiral (slack)
+            continue                              # or off-grid mirror axis (react) -> folding corrupts it
+        asym = ((canon > 0) & ~(_flip_mask(canon, fo[0], vert) > 0)).astype(np.uint8)
+        _n, _l, st, _c = cv2.connectedComponentsWithStats(asym, connectivity=8)
+        largest = max((int(st[i, cv2.CC_STAT_AREA]) for i in range(1, _n)), default=0)
+        if largest > SYM_ASYM_MAX * max(1, int((canon > 0).sum())):   # big one-sided feature (apple's
+            continue                                                  # bite / edge's swirl) -> not symmetric
+        axes.append(vert)
+    return axes
+
+
+def symmetrize_render(silhouette: np.ndarray,
+                      constructions: list[tuple[list[Part], tuple, str]],
+                      canvas_hw: tuple[int, int], target: int) -> np.ndarray:
+    """Force the rendered silhouette to the LABEL's mirror symmetry at the pixel level. Detects the
+    label's true mirror axes (V and/or H) hole-awarely (_label_axes). A DUAL-axis mark (both V and
+    H, e.g. instagram) is symmetrized by a 4-orbit MAJORITY VOTE (a pixel is kept iff >= 2 of its
+    {self, V-mirror, H-mirror, VH-mirror} are foreground) — exactly V+H symmetric, minority accents
+    drop, and unlike a half-mirror it neither misaligns the two rings nor shatters a thinned 1px
+    band at the mirror seam. A SINGLE-axis mark (e.g. yt-music's play triangle) DROPS its small
+    asymmetric accents (components with no mirror partner, <= min-feature^2) then half-mirrors the
+    authoritative (cleaner) half onto the other (_half_mirror — corrects a lopsided render), kept
+    only if it does not fragment the silhouette; spurious small holes it opens are filled (kept
+    holes = the label's real counters via _significant_holes). No-op when the label has no mirror
+    axis. Deterministic (H8)."""
+    if not silhouette.any() or not constructions:
+        return silhouette
+    axes = _label_axes(constructions, canvas_hw)
+    if not axes:
+        return silhouette
+    cur = silhouette.copy()
+    if len(axes) >= 2:                     # DUAL axis (e.g. instagram): 4-orbit MAJORITY VOTE — a
+        av = _best_flip_axis(cur, True)    # pixel is kept if >= 2 of {self, V-mirror, H-mirror,
+        ah = _best_flip_axis(cur, False)   # VH-mirror} are fg. Exactly V+H symmetric, minority
+        if av is None or ah is None:       # accents drop, and unlike half-mirror it neither
+            return silhouette              # misaligns the two rings nor shatters a 1px band at the
+        fg = (cur > 0).astype(np.int16)    # seam.
+        fv = (_flip_mask(cur, av[0], True) > 0).astype(np.int16)
+        fh = (_flip_mask(cur, ah[0], False) > 0).astype(np.int16)
+        fvh = (_flip_mask(_flip_mask(cur, av[0], True), ah[0], False) > 0).astype(np.int16)
+        voted = ((fg + fv + fh + fvh) >= 2).astype(np.uint8) * 255
+        return voted if _topology(voted)[1] >= _topology(silhouette)[1] else silhouette   # keep counters
+    min_feat = _min_feat_at(target)
+    acc_max = min_feat * min_feat
+    for vert in axes:
+        fa = _best_flip_axis(cur, vert)
+        if fa is None:
+            continue
+        a2, _iou = fa
+        asym = (cur > 0) & ~(_flip_mask(cur, a2, vert) > 0)          # material with no mirror partner
+        n, lbl, stats, _c = cv2.connectedComponentsWithStats(asym.astype(np.uint8), connectivity=8)
+        trial = cur.copy()
+        for i in range(1, n):
+            if int(stats[i, cv2.CC_STAT_AREA]) <= acc_max:            # small asymmetric accent -> drop
+                trial[lbl == i] = 0
+        sym = _half_mirror(trial, a2, vert)
+        st_sym, st_cur = _topology(sym), _topology(cur)
+        if st_sym[0] <= st_cur[0] and st_sym[1] >= st_cur[1]:        # no fragment AND no lost counter
+            cur = sym
+    outer = _outer_bg(cur)                                            # fill spurious (non-counter) holes
+    significant = np.zeros(cur.shape, dtype=bool)
+    for hole in _significant_holes(cur, min_feat):
+        significant |= (hole > 0)
+    spurious = (cur == 0) & (outer == 0) & ~significant
+    if spurious.any():
+        cur = cur.copy(); cur[spurious] = 255
+    return cur
+
+
+def refine_perimeter(constructions: list[tuple[list[Part], tuple, str]],
+                     rendered_masks: list[np.ndarray],
+                     canvas_hw: tuple[int, int], target: int,
+                     structure_ref: np.ndarray | None = None) -> np.ndarray:
+    """Stage-4 v1 product: the FACE-CONNECTED 1-px boundary perimeter of the rendered
+    silhouette. Unions the per-construction renders → un-blots small counters → deburrs
+    single-pixel edge nibs that fall OUTSIDE the ideal reference (cubify union-seam raster
+    artifacts, see deburr_nibs) → silhouette → inner ring → diagonal disjoint repair. Signature
+    matches the (cons, masks, (S,S), target) seam (assemble_render's output); `canvas_hw` = (S,S)
+    is the parts' coord frame, used to raster the per-construction reference. `structure_ref` (the
+    @24 sibling silhouette) is accepted for the cross-resolution seam, but the widen pass it would
+    feed is DORMANT here pending a per-fixture scope decision (see widen_underrepresented).
+    Returns (target,target) uint8 {0,255}. Deterministic (H8)."""
+    if not rendered_masks:
+        return np.zeros((target, target), np.uint8)
+    sil = _composite(rendered_masks, (target, target))
+    if not sil.any():
+        return sil
+    sil = unblot_features(sil, target)
+    reference = _composite(
+        [reference_mask(parts, canvas_hw, target) for parts, _c, _l in constructions],
+        (target, target))
+    sil = deburr_nibs(sil, target, reference)   # drop cubify union-seam edge nibs (outside-ref)
+    sil = normalize_stroke_width(sil, target)   # 2px lines -> 1px (thin) or 3px (widen)
+    sil = symmetrize_render(sil, constructions, canvas_hw, target)   # fold to the label's mirror axes
+    #   (reflects features, so runs LAST); the chirality guard in _label_axes now excludes the
+    #   over-folding class — chiral pinwheels (slack) and off-V/H-axis mirrors (react) no-op.
+    ring = silhouette_outline(sil)
+    return connect_disjoint(ring, sil, target)

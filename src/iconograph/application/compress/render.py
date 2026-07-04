@@ -2361,7 +2361,12 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
     # regression). Lazy import breaks the render<->cubify cycle.
     if target <= CUBIFY_MAX_T:
         from .cubify import cubify
-        cmask = cubify(parts, canvas_hw, target)
+        # Cross-resolution structure constraint: a smaller feed size uses the largest feed
+        # size (@24) as its structural reference (the spine connected throughout). @24 itself
+        # has no larger sibling → renders normally (structure_ref=None, byte-identical).
+        structure_ref = (cubify(parts, canvas_hw, CUBIFY_MAX_T)
+                         if target < CUBIFY_MAX_T else None)
+        cmask = cubify(parts, canvas_hw, target, structure_ref)
         return RenderResult(
             mask=cmask, ref=ref, naive=naive, records=[],
             jag=jag_score(cmask), jag_naive=naive_jag,

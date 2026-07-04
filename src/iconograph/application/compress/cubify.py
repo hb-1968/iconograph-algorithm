@@ -22,6 +22,7 @@ from render.render_debug for target <= CUBIFY_MAX_T; geometry render kept for T 
 
 import cv2
 import numpy as np
+from skimage.morphology import medial_axis
 
 from iconograph.application.compress.common import (
     Circle,
@@ -33,6 +34,7 @@ from iconograph.application.compress.common import (
     Triangle,
     _compound_mask,
     _iou_bool,
+    _nbcount,
     _raster_part,
 )
 from iconograph.application.compress.render import (
@@ -47,6 +49,7 @@ from iconograph.application.compress.render import (
     reference_mask,
 )
 from iconograph.application.compress.straighten import (
+    scale_about_center,
     snap_polygon_run2,
     snap_triangle_run2,
 )
@@ -61,10 +64,14 @@ W_ACC = 20.0         # accuracy weight: 1 − area IoU vs the reference (high en
 W_SOFT = 0.02        # soft-coverage L1 tie term (deterministic tie-break toward truth)
 EPS = 1e-9
 W_AXIS = 1.5         # axis-blocky weight per ISOLATED diagonal boundary step (a staircase
-#                      tooth approximating a CURVE). Ramped by (T-16)/8 so T=16 is a no-op
-#                      (already the 'perfect' cube) and T=24 is pushed to the SAME blocky
-#                      goal — jag is DP-vertex-based and a smooth staircase reads as low jag,
-#                      so without this the 24px render drifts curvier than 16.
+#                      tooth approximating a CURVE) at T=24. jag is DP-vertex-based and a smooth
+#                      staircase reads as low jag, so without this the render drifts curvy.
+W_AXIS_T16 = 0.5     # the SAME weight at T=16, ramping linearly to W_AXIS at T=24. NOT zero
+#                      (the old ramp's "T=16 is already a perfect cube" assumption was wrong —
+#                      gmail's compound M rounded its corners/feet at 16 without any pressure)
+#                      and NOT the full 1.5 (that over-carves discord's ~3px eye holes into a
+#                      notch at 16); 0.5 fully de-curves gmail's M while keeping discord clean
+#                      (W_AXIS sweep on gmail+discord@16).
 
 TRI_EPS_FRAC = 0.04  # approxPolyDP epsilon (× hull perimeter): coarse enough to collapse
 #                      a triangle/flat-top silhouette to 3–4 vertices (D1 uses 0.01 for fine)
@@ -197,15 +204,6 @@ def _triangle_label(parts: list[Part], canvas_hw: tuple[int, int],
 # ── path B: silhouette pixel-cubify (compound constructions) ─────────────
 
 
-def _nbcount(mask: np.ndarray) -> np.ndarray:
-    """Per-pixel count (int16, 0..8) of FOREGROUND 8-neighbours, center excluded.
-    BORDER_CONSTANT pads with 0 (off-canvas = background); normalise to {0,1} first."""
-    b = (mask > 0).astype(np.uint8)
-    k = np.ones((3, 3), np.uint8)
-    k[1, 1] = 0
-    return cv2.filter2D(b, cv2.CV_16S, k, borderType=cv2.BORDER_CONSTANT)
-
-
 def _candidates(mask: np.ndarray, nb: np.ndarray,
                 ref: np.ndarray) -> list[tuple[int, int, int]]:
     """1px-brush moves (y, x, new_value), order (y, x, clear<fill). A fg pixel CLEARS if a
@@ -228,7 +226,15 @@ def _topo_ok(trial: tuple[int, int], cur: tuple[int, int],
              ref: tuple[int, int], canon: tuple[int, int]) -> bool:
     """A flip's topology is acceptable iff it does not move the COMPONENT count further
     from the nearer of ref/canon (admits reconnection, blocks fragmentation) AND does not
-    drop the HOLE count below min(current, canon) (a canonical hole is never destroyed)."""
+    drop the HOLE count below min(current, canon) (a canonical hole is never destroyed).
+
+    NOTE: no UPPER bound on holes. A hole-cap (holes <= max(ref, canon)) was tried to stop
+    the W_AXIS_T16 blockification from splitting nested_counter's counter into a spurious 3rd
+    hole at T=16 — but cubify LEGITIMATELY recovers counters the downscaled reference lost
+    (mastodon@16's 'm' forms 2 counters where ref/canon have 1), and the two are
+    indistinguishable by hole-count-vs-ref. The cap dropped mastodon's real counter, so it
+    was reverted: a synthetic shape gaining one hole is preferable to a real fixture losing a
+    counter."""
     ct, ht = trial
     cm, hm = cur
     comp_t = min(abs(ct - ref[0]), abs(ct - canon[0]))
@@ -265,10 +271,13 @@ def _staircase_teeth(mask: np.ndarray) -> int:
 
 def _cubic(mask: np.ndarray, ref: np.ndarray, cov: np.ndarray) -> float:
     """PHASE-B objective (lower = better): cubification + accuracy tradeoff + soft tie +
-    axis-blocky (T>16). The axis term ramps from 0 at T=16 so the 'perfect' cube is
-    byte-unchanged and the larger grids pursue the SAME blocky geometry (user ruling)."""
+    axis-blocky. The axis term is ACTIVE at every feed size T<=24 (ramps W_AXIS_T16 -> W_AXIS
+    over T=16..24): T=16 is NOT 'already a perfect cube' — gmail's compound M rounds its
+    corners/feet without this pressure (jag_score is DP-vertex-based, so a smooth boundary
+    reads as LOW jag and the greedy sheds vertices into curves). The T=16 weight is gentler
+    than T=24's so it doesn't over-carve discord's tiny eye holes. Same blocky goal at both."""
     T = mask.shape[0]
-    w_axis = W_AXIS * max(0.0, (T - 16) / 8.0)
+    w_axis = W_AXIS_T16 + (W_AXIS - W_AXIS_T16) * max(0.0, (T - 16) / 8.0)
     jag = jag_score(mask)
     soft = float(np.abs((mask > 0).astype(np.float32) - cov).sum())
     return (jag + W_ACC * (1.0 - _iou_bool(mask, ref)) + W_SOFT * soft
@@ -294,6 +303,16 @@ def _twin(y: int, x: int, axis: tuple[bool, int]) -> tuple[int, int]:
     return (y, a2 - x) if vertical else (a2 - y, x)
 
 
+def _glob_ok(trial: np.ndarray, pockets: list[np.ndarray]) -> bool:
+    """True if `trial` keeps >= POCKET_RETAIN of EVERY anti-glob pocket open (no glob). The one
+    anti-glob test shared by _greedy / _close_to_canon / _reconcile_structure (H5)."""
+    for pk in pockets:
+        pn = int(np.count_nonzero(pk))
+        if pn and int(np.count_nonzero((pk > 0) & (trial == 0))) < POCKET_RETAIN * pn:
+            return False
+    return True
+
+
 def _greedy(mask, score_fn, ref, cov, pockets, topo_ref, topo_canon, axis):
     """Deterministic best-improvement hill-climb to a fixpoint under score_fn (lower =
     better). Each accepted flip clears the anti-glob + topology guards; with `axis` set,
@@ -312,13 +331,7 @@ def _greedy(mask, score_fn, ref, cov, pockets, topo_ref, topo_canon, axis):
                 if not (0 <= ty < T and 0 <= tx < T):
                     continue
                 trial[ty, tx] = val
-            globbed = False
-            for pk in pockets:
-                pn = int(np.count_nonzero(pk))
-                if pn and int(np.count_nonzero((pk > 0) & (trial == 0))) < POCKET_RETAIN * pn:
-                    globbed = True
-                    break
-            if globbed:
+            if not _glob_ok(trial, pockets):
                 continue
             if not _topo_ok(_topology(trial), cur_topo, topo_ref, topo_canon):
                 continue
@@ -351,13 +364,7 @@ def _close_to_canon(mask: np.ndarray, topo_canon: tuple[int, int],
         for y, x in sorted((int(a), int(b)) for a, b in zip(ys, xs)):
             trial = mask.copy()
             trial[y, x] = 255
-            globbed = False
-            for pk in pockets:
-                pn = int(np.count_nonzero(pk))
-                if pn and int(np.count_nonzero((pk > 0) & (trial == 0))) < POCKET_RETAIN * pn:
-                    globbed = True
-                    break
-            if globbed:
+            if not _glob_ok(trial, pockets):
                 continue
             d2 = td(_topology(trial))
             if d2 < best_d:
@@ -470,12 +477,192 @@ def _carve_necks(mask: np.ndarray, vertical: bool,
     return mask
 
 
+# ── widen narrow OPEN negative-space gaps (gmail M-valley) ────────────────────────────
+# A narrow OPEN concavity (gmail's M central V — negative space that opens to the background)
+# renders ~1px at feed res and blots: the gap nearly closes, the outline rims merge, and
+# refine's disjoint repair eats what's left. No existing pass WIDENS (pockets/_outline_gaps/
+# _carve_necks only PRESERVE a ≤1px gap). Here we GROW the carving subtract part(s) so the gap
+# reaches >=2px in the reference, BEFORE the greedy — the cube greedy then renders the wider gap
+# (it matches the widened ref + its pocket guard). SCOPED to OPEN gaps + a ≤1px PINCH carve,
+# committed only on a strict net-pinch DECREASE (no new slivers) under topology + fidelity
+# guards. ENCLOSED counters are deliberately excluded: the widen over-enlarges discord's eyes
+# (jag LOSS @24) and can't clear vscode's triangle-tip notch — enclosed-counter widening needs a
+# different lever (open item). A no-open-narrow-gap construction is returned byte-identical.
+
+WIDEN_F_STEP = 0.1       # subtract upscale step in the stepped widening search
+WIDEN_F_MAX = 2.0        # cap — beyond this a subtract is over-carving, not widening a gap
+WIDEN_FID_FLOOR = 0.85   # min area-IoU of the widened silhouette vs the original (bounds the trade)
+
+
+def _zshift(a: np.ndarray, d: int, ax: int) -> np.ndarray:
+    """Shift `a` by d px along axis ax, ZERO-filling the vacated border (NOT np.roll, which
+    wraps — a border-opening gap would wrap into a false pinch)."""
+    out = np.zeros_like(a)
+    if d > 0:
+        dst = (slice(d, None), slice(None)) if ax == 0 else (slice(None), slice(d, None))
+        src = (slice(None, -d), slice(None)) if ax == 0 else (slice(None), slice(None, -d))
+    else:
+        d = -d
+        dst = (slice(None, -d), slice(None)) if ax == 0 else (slice(None), slice(None, -d))
+        src = (slice(d, None), slice(None)) if ax == 0 else (slice(None), slice(d, None))
+    out[dst] = a[src]
+    return out
+
+
+def _pinch(mask: np.ndarray) -> np.ndarray:
+    """Bool mask of background pixels squeezed to <=1px between two foreground walls (axis-
+    aligned, d=1) — the witness for a ≤1px gap. d=1 EMPTY in a region ⇒ that gap is >=2px."""
+    fg = mask > 0
+    bg = ~fg
+    return ((bg & _zshift(fg, 1, 1) & _zshift(fg, -1, 1))
+            | (bg & _zshift(fg, 1, 0) & _zshift(fg, -1, 0)))
+
+
+def _is_open(mask: np.ndarray, region: np.ndarray) -> bool:
+    """True if `region` (background pixels of `mask`) touches the OUTER (border-connected)
+    background — an OPEN concavity (gmail's M-valley), not an enclosed counter (discord's eyes,
+    vscode's notch). Border flood-fill. Scopes the widen to OPEN gaps: enclosed counters are
+    features the widen must not enlarge (it over-fires on discord's eyes otherwise), and an
+    enclosed notch like vscode's needs a different lever (subtract-scaling can't clear its tip)."""
+    m = (mask > 0).astype(np.uint8)
+    pad = cv2.copyMakeBorder(m, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    ff = np.zeros((pad.shape[0] + 2, pad.shape[1] + 2), np.uint8)
+    flooded = pad.copy()
+    cv2.floodFill(flooded, ff, (0, 0), 2)
+    outer = flooded[1:-1, 1:-1] == 2
+    return bool(np.any(region & outer))
+
+
+def _widen_gaps(parts: list[Part], canvas_hw: tuple[int, int], target: int) -> list[Part]:
+    """Grow subtract parts that carve a too-narrow OPEN valley (gmail's M central V) so the gap
+    is >=2px at feed res. Per subtract: isolate its carve at target (ref WITH vs WITHOUT it),
+    qualify it as carving a ≤1px OPEN gap (a pinch inside the carve, border-connected), then
+    scale it up about its centre (stepped, capped at WIDEN_F_MAX) until the gap clears —
+    committing ONLY if the target gap reaches >=2px AND TOTAL pinch strictly DECREASES (so
+    isotropic growth that carves NEW narrow slivers elsewhere — gmail@24 — is rejected) AND
+    topology is unchanged AND area-IoU stays >= WIDEN_FID_FLOOR. ENCLOSED counters are skipped
+    (the widen over-enlarges discord's eyes / can't clear vscode's triangle-tip notch — those
+    need a different lever). Subtracts processed in order on the running silhouette. Returns a
+    new parts list (unchanged when nothing qualifies). Deterministic (H8)."""
+    subs = [i for i, p in enumerate(parts) if p.op == "subtract"]
+    if not subs:
+        return parts
+    orig = reference_mask(parts, canvas_hw, target)
+    base_topo = _topology(orig)
+    out = list(parts)
+    for i in subs:
+        s = out[i]
+        cur = reference_mask(out, canvas_hw, target)
+        no_s = reference_mask([p for j, p in enumerate(out) if j != i], canvas_hw, target)
+        carve = (no_s > 0) & ~(cur > 0)                       # what this subtract removes at target
+        if not carve.any() or not bool((_pinch(cur) & carve).any()):
+            continue                                          # no ≤1px gap carved here → nothing to widen
+        if not _is_open(cur, carve):                          # enclosed counter (eyes/notch) → skip
+            continue
+        cur_pinch = int(_pinch(cur).sum())
+        f = 1.0 + WIDEN_F_STEP
+        committed = None
+        while f <= WIDEN_F_MAX + 1e-9:
+            cand = list(out)
+            cand[i] = Part(primitive=scale_about_center(s.primitive, f), op=s.op, group=s.group)
+            m = reference_mask(cand, canvas_hw, target)
+            if _topology(m) != base_topo or _iou_bool(m, orig) < WIDEN_FID_FLOOR:
+                break                                        # over-carve (fragment / too much area)
+            if not bool((_pinch(m) & carve).any()):          # target gap now >=2px
+                if int(_pinch(m).sum()) < cur_pinch:         # AND no NEW narrow gaps → net win
+                    committed = cand
+                break                                        # target cleared: commit or reject, then stop
+            f += WIDEN_F_STEP
+        if committed is not None:
+            out = committed
+    return out
+
+
 # ── dispatch ─────────────────────────────────────────────────────────────
 
 
-def cubify(parts: list[Part], canvas_hw: tuple[int, int], target: int) -> np.ndarray:
+# ── cross-resolution structure constraint (@24 → @16) ─────────────────────
+# Each feed size cubifies INDEPENDENTLY, so @16 can scatter a structure that @24 renders
+# coherently (figma's spine: @24 a solid connected bar; @16 thin-bridged scattered blocks —
+# 1-connected but visually incoherent). The larger sibling (@24) is the structural authority:
+# extract its connectivity BACKBONE (medial-axis skeleton + half-width), map it to the target
+# grid, and reconcile @16's native render onto it (FILL the missing backbone, guarded), so the
+# spine reads as a connected bar. Idempotent → no-op where @16 already covers the backbone, so
+# fixtures @24 already renders coherently at 16 are byte-identical. Deterministic (H8).
+
+BACKBONE_CAP = 0   # max disk radius (px) re-stroking the sibling backbone onto the target grid:
+#                    0 = the 1-px medial-axis CENTERLINE only. The centerline loops AROUND holes
+#                    (so the spine reconnects but @24's counters/gaps are preserved); a fatter cap
+#                    (>=1) merges disks ACROSS a narrow @24 gap and over-fills it (figma's bowl).
+
+
+def _structure_core(structure_ref: np.ndarray, target: int) -> np.ndarray:
+    """The larger-sibling (@24) render's connectivity BACKBONE mapped to the target grid: the
+    medial-axis skeleton (spine + branches) re-stroked as a thin solid stroke. structure_ref:
+    the sibling cubify mask (src×src). Returns (target,target) uint8 — the form @16 must stay
+    connected along. Deterministic (H8): medial_axis rng=0, exact ratio (24→16 = 2/3, no .5
+    ties), row-major. At BACKBONE_CAP=0 the re-stroke is the 1-px centerline (radius 0 = 1px);
+    a 2/3 DOWNSCALE cannot disconnect a connected centerline (no bridging needed), and the
+    centerline loops around holes so @24's counters are preserved (a fatter cap would merge
+    disks across a narrow counter and over-fill it)."""
+    src = int(structure_ref.shape[0])
+    skel, dist = medial_axis(structure_ref > 0, return_distance=True, rng=0)
+    ratio = target / src
+    core = np.zeros((target, target), np.uint8)
+    ys, xs = np.nonzero(skel)
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        ty = min(int(round(y * ratio)), target - 1)
+        tx = min(int(round(x * ratio)), target - 1)
+        r = min(BACKBONE_CAP, int(round(float(dist[y, x]) * ratio)))
+        cv2.circle(core, (tx, ty), max(0, r), 255, -1)
+    return core
+
+
+def _reconcile_structure(mask: np.ndarray, core: np.ndarray, pockets: list[np.ndarray],
+                         topo_ref: tuple[int, int], topo_canon: tuple[int, int],
+                         axis: tuple[bool, int] | None) -> np.ndarray:
+    """FILL @16 toward the sibling backbone `core`: greedily set each bg pixel that lies ON the
+    backbone AND is 8-adjacent to fg, accepting it only if it clears the anti-glob pocket guard
+    (_glob_ok) and _topo_ok (no fragmentation / no destroyed canonical hole). With `axis` set,
+    every fill is applied as a MIRROR PAIR (like _greedy) so a symmetric input stays symmetric.
+    Re-solidifies a scattered spine into a connected bar; iterates so a 2px gap bridges in two
+    passes. Idempotent → byte-identical no-op when mask already covers core. Modeled on
+    _close_to_canon; deterministic (H8): row-major order, no RNG."""
+    T = mask.shape[0]
+    cur_topo = _topology(mask)
+    for _ in range(MAX_SWEEPS):
+        nb = _nbcount(mask)
+        ys, xs = np.nonzero((mask == 0) & (core > 0) & (nb >= 1))
+        if len(ys) == 0:
+            break
+        changed = False
+        for y, x in sorted((int(a), int(b)) for a, b in zip(ys, xs)):
+            if mask[y, x]:                       # already filled earlier this sweep
+                continue
+            trial = mask.copy()
+            trial[y, x] = 255
+            if axis is not None:                 # mirror-pair the fill (preserve symmetry)
+                ty, tx = _twin(y, x, axis)
+                if not (0 <= ty < T and 0 <= tx < T):
+                    continue
+                trial[ty, tx] = 255
+            if not _glob_ok(trial, pockets):
+                continue
+            tt = _topology(trial)
+            if not _topo_ok(tt, cur_topo, topo_ref, topo_canon):
+                continue
+            mask, cur_topo, changed = trial, tt, True
+        if not changed:
+            break
+    return mask
+
+
+def cubify(parts: list[Part], canvas_hw: tuple[int, int], target: int,
+           structure_ref: np.ndarray | None = None) -> np.ndarray:
     """Render the construction at the feed resolution. Simple round labels render their
     cubic form (square / square ring); compound constructions are silhouette-cubified.
+    `structure_ref` (the larger feed-res sibling's cubify mask, e.g. @24 when rendering @16)
+    constrains the render to that backbone's connected form (supersedes the neck-divot pass).
     (target, target) uint8 {0,255}. Deterministic (H8)."""
     label = _label_render(parts, canvas_hw, target)
     if label is not None:
@@ -484,6 +671,7 @@ def cubify(parts: list[Part], canvas_hw: tuple[int, int], target: int) -> np.nda
     if tri is not None:
         return tri
 
+    parts = _widen_gaps(parts, canvas_hw, target)        # widen narrow OPEN gaps before rendering
     h, w = canvas_hw
     ref = reference_mask(parts, canvas_hw, target)
     naive = naive_mask(parts, canvas_hw, target)
@@ -508,9 +696,28 @@ def cubify(parts: list[Part], canvas_hw: tuple[int, int], target: int) -> np.nda
         mask = _close_to_canon(mask, topo_canon, pockets)
     mask = _greedy(mask, _cubic, ref, cov, pockets, topo_ref, topo_canon, axis)
 
-    # Outline-separate an overrepresented stack of round lobes (figma): punch a sub-pixel
-    # neck divot between consecutive lobes so they read as separate, proportional geometry.
-    if target <= DIVOT_MAX_T:
-        vertical, necks = _stacked_lobes(parts, canvas_hw)
-        mask = _carve_necks(mask, vertical, necks, canvas_hw, target)
+    # The stacked-lobe constructions (figma's pill+circles) are exactly where @16 fragments —
+    # the lumpy lobe column + the divot separation scatter the structure that @24 keeps coherent.
+    # Scope the cross-resolution work to that signal: with a sibling (@24) reference, reconcile @16
+    # to @24's connectivity backbone (this OWNS the separation, superseding the divot pass);
+    # without one, fall back to the sub-pixel neck divots. NON-lobe constructions (discord's
+    # head+eyes, gmail, vscode, claude) get NEITHER — the @24-skeleton fill misaligns with their
+    # already-coherent @16 form and would distort it (discord's eyes), so they stay byte-identical.
+    vertical, necks = (_stacked_lobes(parts, canvas_hw)
+                       if target <= DIVOT_MAX_T else (False, []))
+    if necks:
+        if structure_ref is not None:
+            core = _structure_core(structure_ref, target)
+            rec = _reconcile_structure(mask, core, pockets, topo_ref, topo_canon, axis)
+            div = _carve_necks(mask, vertical, necks, canvas_hw, target)
+            # Pick the lower-jag of the two separation strategies: the @24-backbone RECONCILE
+            # (re-solidifies a scattered structure — figma's spine, signal) vs the sub-pixel neck
+            # DIVOTS (the default). A genuine fragmentation reconciles to a far lower jag than its
+            # divots; a FALSE-POSITIVE lobe hit (apple-rainbow — already coherent at 16) reconciles
+            # WORSE than its divots, so it keeps the divots → byte-identical to the no-structure
+            # render. jag is a valid discriminator for the FILL direction (connecting lowers jag);
+            # the metric only penalizes the desired separation in the CARVE direction.
+            mask = rec if jag_score(rec) <= jag_score(div) else div
+        else:
+            mask = _carve_necks(mask, vertical, necks, canvas_hw, target)
     return mask

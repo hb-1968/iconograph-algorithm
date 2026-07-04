@@ -19,11 +19,10 @@ flowchart TB
       S1[1. categorize<br/>sub-case detection] --> S2[2. preprocess<br/>universalization]
       S2 --> S3[3. compress<br/>SHARED geometric decomposition<br/>L0 align → L1 classify → L2 segment]
       S3 --> S4[4. refine]
-      S4 --> S5[5. monogram]
-      S5 --> S6[6. fit<br/>aggressive per-target sizing]
+      S4 --> S5[5. monogram<br/>select letters → compose logo+letters on canvas]
     end
 
-    S6 --> OUT[outputs/<br/>+ manifest.json]
+    S5 --> OUT[outputs/<br/>+ manifest.json]
     OUT --> RV[review.html<br/>+ testbed strips]
 
     classDef shared fill:#e0f0ff,stroke:#06c
@@ -53,10 +52,15 @@ default leaves one core free)._
   slack cross-construction divots, figma neck divots. **Seed gate (5 × {16,24}) 10/10 green**;
   extended 10-fixture critique set **18/20** (adobe@16 + slack@16 honest partials); all
   byte-deterministic. Full design: R1 §"render rework".
-- **Stage 4 — refine:** a **mirror-symmetry cleanup pass** exists (harness-driven via
-  `render_debug --cleanup`, not yet pipeline-wired) — fixes gmail@16's render asymmetry,
-  leaves the other seeds byte-identical. Per-part consistency (size-equalization, de-cave) was
-  investigated and found infeasible as a post-pass (see issue 2).
+- **Stage 4 — refine:** the **perimeter-outline refine chain is BUILT and validated across the
+  full n=30 set** (harness `refine_debug`, not yet pipeline-wired — issue 3). Public entry
+  `refine_perimeter`: composite → `unblot_features` → `deburr_nibs` (aggressive de-jag) →
+  `normalize_stroke_width` (2px → 1/3px) → `symmetrize_render` (label mirror fold, chirality-guarded)
+  → `silhouette_outline` → `connect_disjoint`, emitting a face-connected 1-px boundary outline.
+  **Deterministic** (full-30 `--twice` = zero MISMATCH, all 4-connected); ruthless-grader PASS. The
+  scene-level / rotation / widen passes are built + harness-validated but DORMANT in the shipped chain
+  pending per-fixture scope. Per-part size-equalization / de-cave was investigated and found infeasible
+  as a post-pass → stage-5 geometry-refinement target (see issue 2).
 
 **Pressing issues** (roughly by priority)
 1. **R1 ships the SEEDS green at feed res; the geometry path (T > 24) and the non-seed feed-res
@@ -77,9 +81,9 @@ default leaves one core free)._
    stage-5 geometry-refinement matter (see R1 round 11). _Distinct from figma's feed-res neck
    fusion at 16/24, which is now **RESOLVED** at render via the cubify neck divots (R1 §"render
    rework", critique fix 4) — this issue 2 is the geometry-path T=32 size-consistency only._
-3. **The pipeline is not end-to-end.** `application/pipeline.py` is a stub; the stage-4 cleanup
-   runs only under the testbed. **Stages 5–6 are unimplemented.** `build` does not run end-to-
-   end yet — only the per-stage testbeds work.
+3. **The pipeline is not end-to-end.** `application/pipeline.py` is a stub; the stage-4 refine chain
+   (`refine_perimeter`) runs only under the `refine_debug` harness. **Stages 5–6 are unimplemented.**
+   `build` does not run end-to-end yet — only the per-stage testbeds work.
 4. **R2 / R3 render tiers deferred** (junction overrepresentation, residual layering) — the
    thin-stroke / tiny-grid identity losses (claude@16 spikes, vscode@16 X, mastodon residual)
    live there.
@@ -415,7 +419,7 @@ pool, which only improved.
 - **Perf:** the README's compute-`recon`-once TODO got more load-bearing — `_post_prune`'s budget pass
   is O(n²) compound evals and the depth-1 hole recursion fires the diff refiner (mastodon ≈ 2–3 min
   cold; memoized per process). An incremental compound mask + a downsampled prune scorer are the two
-  obvious wins before stage-6's 8-size loop.
+  obvious wins before scaling render onto the larger hicolor sizes.
 - **`diff_fit` C5 (evidence-gated):** encode subtract-Circles as non-elongatable `kind="circle"` if the
   refiner is ever observed mangling shave-off circles (not seen so far — contour-anchored traces mostly
   clear the fire gate).
@@ -429,12 +433,13 @@ pool, which only improved.
   methodology isn't a single-fixture win; likewise ≥1 more orbit/atom fixture for `_fit_rot_orbits`
   (both gated on the upstream routing fixes above — electron was meant to be the orbit second positive).
 - **Decompose polish, still open:** compute `recon` once per call (incremental compound mask — matters
-  for stage-6's 8 hicolor sizes); the optional annular → `compress/annular.py` split. **Reverted once,
+  for scaling onto the larger hicolor sizes); the optional annular → `compress/annular.py` split. **Reverted once,
   re-land separately if wanted:** deriving `AXIS_BBOX_FRAC` from the arc sagitta (measured mean-neutral;
   a deliberate area↔boundary/parsimony tradeoff, not a free cleanup).
-- **Deferred pipeline stages**: 4 refine · 5 monogram · **6 aggressive-fit — the rendering phase**
-  (per-target rasterization onto each hicolor grid + the two-tier render: idealized primitives + low-res
-  residual). Then the **file-icon pipeline** (deferred until the application path ships clean outputs).
+- **Next pipeline work**: stages 4 refine and 5 monogram (both phases) are built; **stage 6 is
+  removed** (its per-target placement is now stage 5 phases 2–3, emitting the 24/32 grids directly).
+  Remaining: scale the compose output to the larger hicolor grids (48/64/128/256), then the
+  **file-icon pipeline** (deferred until the application path ships clean outputs).
 
 #### L0 — align
 
@@ -1174,7 +1179,9 @@ render.py untouched. Per-part consistency (size-equalize, de-cave) was BUILT and
 seeds are single FUSED constructions, so a solo render ≠ a part's joint footprint and re-stamping
 fragments (figma@16/24) or squares the circles (figma@32, violating represented-geometry); a
 post-pass cannot isolate fused parts. Only whole-silhouette symmetry is cleanly reachable
-post-render.
+post-render. _(Superseded: `cleanup_scene`'s whole-silhouette half-mirror was later replaced by the
+pixel-level, chirality-guarded `symmetrize_render` in the shipped stage-4 chain — see "Stage 4 —
+refine". `cleanup_scene` remains in the tree but is dormant.)_
 
 **Round 11 — figma size-consistency attempt, FAILED + REVERTED (`!fc`).** User provided a 16×16
 figma ideal and asked for @32 size-consistency, sanctioning consistency-over-fidelity for a
@@ -1312,41 +1319,175 @@ cubified sizes is STRUCTURE (topology), not IoU.
 
 ### Stage 4 — refine
 
-**Status:** mirror-symmetry cleanup pass built (harness-driven, not pipeline-wired) — see R1
-round 10 above.
+**Status:** the **perimeter-outline refine chain is BUILT and validated across the full n=30 set**
+(driven by the `refine_debug` harness; **not yet pipeline-wired** — `application/pipeline.py` is a
+stub, pressing issue 3). Public entry point:
 
-`refine/common.py:cleanup_scene(constructions, rendered_masks, canvas_hw, target)` is a
-deterministic post-render pass that re-derives the mirror axis from the source parts and
-half-mirrors the produced silhouette when a logo is canonically symmetric but its render drifted
-(fixes gmail@16). It is gated to no-op when no axis fires or the render is already symmetric, so
-it is value-identical to the input on most fixtures. Driven by `render_debug --cleanup` (adds a
-cleanup strip column + a determinism print). **Deferred (pressing issue 2):** per-part
-size-equalization and de-cave — infeasible as a layer-on-top pass on fused constructions; figma's
-per-size consistency is a stage-5 geometry-refinement target. Remaining stage-4 scope: stray-pixel
-snapping, isolated-pixel artifact removal, minimum-feature-size enforcement per hicolor target,
-edge-aware corrections (mostly shared logic in `refine/common.py`; class-specific passes — e.g.
-radial-symmetry preservation for burst — only where shared logic visibly fails on a sub-case).
+```
+refine_perimeter(constructions, rendered_masks, canvas_hw, target) -> (target, target) uint8 {0,255}
+```
+
+It consumes the R1 cubify render (one silhouette mask per construction) and emits a **face-connected
+1-px boundary outline**. Deterministic (H8: full-30 `refine_debug --all --twice` on 15 cores = **zero
+MISMATCH / zero ERROR**, every fixture 4-connected). All logic is shared in `refine/common.py` (H4);
+class-specific passes exist only where shared logic visibly fails on a sub-case (none needed yet — the
+radial family is handled by an exemption gate, not a separate branch).
+
+#### The shipped chain (`refine_perimeter`), in order
+
+1. **composite** (`_composite`) — union the per-construction render masks into one silhouette.
+2. **`unblot_features`** — move or downsize *blotting counters* so every significant hole keeps a
+   `UNBLOT_GAP = 3`-px wall to the nearest other boundary. For each blotting hole: try the 8 single-px
+   moves, keep those that reach the wall AND preserve topology, pick the THICKEST resulting wall
+   (tie-break toward the silhouette centroid — mirror-invariant, so discord's two eyes stay symmetric);
+   if no move works, erode the hole 1 px (floored at min-feature). Honest partial (leave it) otherwise.
+   Topology-guarded; a no-blot silhouette returns byte-identical.
+3. **`deburr_nibs`** — **aggressive de-jag** (user ruling: "all bumps"). Removes a barely-attached bump
+   = a FG pixel with EXACTLY ONE 4-connected neighbour where that neighbour is a SOLID body (≥ 3 shared
+   edges) — a lone pixel protruding from a wide body (figma's top row, gmail's arm edges, vscode's ears).
+   A thin-feature TIP is KEPT because its single neighbour is itself thin (< 3 edges — a chevron apex, a
+   1-px antenna). **ACCEPTED TRADEOFF:** the reference/symmetry gates are dropped, so a genuine sharp
+   FILLED apex (triangle/wedge point) that also protrudes from a solid body WILL be shaved — no geometric
+   signal separates a rogue bump from an intended point, so over-fires are surfaced by the full-set audit,
+   not prevented here. Radial-blade marks (claude/firefox) are exempt via `_is_radial(reference)`.
+   Topology-guarded, bounded to `max_nib` passes; no-op when the reference oracle is absent.
+4. **`normalize_stroke_width`** — normalize 2-px strokes to ODD width. `≤ 2px` strokes are the residue of
+   a 3×3 `MORPH_OPEN`. The thin-vs-widen call is the centreline's **DIAGONALITY**,
+   `frag = _n4(skeleton) / length`: `> STROKE_DIAG_FRAC (0.6)` = predominantly diagonal → thinning would
+   STAIRCASE (8-connected but 4-BROKEN = the user's "break in the shape") → **WIDEN** to 3 px
+   (`_restroke`); else **THIN** to the 1-px medial-axis skeleton (offset-swept, topology-guarded, widened
+   back if it disconnects). vscode's diagonal tails widen; instagram's axis-aligned band thins. Radial
+   marks are `_is_radial`-exempt (uneven blade thinning breaks the sunburst).
+5. **`symmetrize_render`** — force the render to the LABEL's mirror symmetry at the pixel level (runs LAST
+   because it *reflects* features, after the precise per-feature edits). Axis detection is on the canonical
+   geometry (`_label_axes`, below). A **DUAL-axis** mark (instagram) uses a **4-orbit MAJORITY VOTE** (a
+   pixel is kept iff ≥ 2 of its {self, V, H, VH} mirrors are FG) — exactly V+H symmetric, drops minority
+   accents, and unlike a half-mirror it neither misaligns the two rings nor shatters a thinned 1-px band at
+   the seam. A **SINGLE-axis** mark (yt-music's play triangle) drops its small asymmetric accents, then
+   half-mirrors the cleaner half onto the other and fills spurious holes. Both branches topology-guarded
+   (no fragment, no lost counter).
+6. **`silhouette_outline`** — the 1-px INNER boundary ring: `M & ~erode(M)` (stays inside M's footprint,
+   unlike the 2-px outward-bulging `MORPH_GRADIENT`). Hole/counter rings come for free. `BORDER_CONSTANT 0`
+   is load-bearing — the default `BORDER_REFLECT_101` would keep canvas-edge pixels from eroding out, so
+   the silhouette's edge would be missing from the ring.
+7. **`connect_disjoint`** — make the perimeter FACE-connected (4-connectivity): fill ONE pixel per
+   diagonal-only corner touch, INTERIOR side preferred (`_diag_fill`), iterated to a fixpoint (a fill can
+   expose a new touch) capped at `PERIM_MAX_PASSES = 8`. **Additive-only** — it never removes a pixel, so
+   it can never open a seam; a no-diagonal outline is a byte-identical no-op (zero regression).
+
+Order was a user ruling: the precise per-feature modifications (deburr, stroke-normalize) run *before* the
+feature-reflecting symmetrize — but note thinning BEFORE symmetrize is exactly why instagram needs the
+orbit-vote (a 1-px band cannot be half-mirrored without shattering).
+
+#### The chirality guard (`_label_axes`)
+
+`_label_axes(constructions, canvas_hw) -> list[bool]` returns the mirror axes (True = vertical) the LABEL
+is symmetric about, computed on the canonical `_compound_mask` (not the render). An axis is accepted only
+when ALL THREE gates pass:
+
+- **IoU gate** — `min(outer-flip-IoU, hole-flip-IoU) ≥ SYM_AXIS_IOU (0.70)`. **Hole-aware**: youtube's
+  play-triangle HOLE breaks its V axis even though the body doesn't; IoU on the outline alone cannot
+  separate a false 0.95 from a true 0.81.
+- **Boundary-asym gate** — the largest single one-sided region must be `≤ SYM_ASYM_MAX (0.032)` of the fg.
+  A BOUNDARY feature the IoU gate misses (apple's bite, edge's swirl) is caught here; folding would destroy
+  it. (Measured gap: true instagram asym 0.028 vs apple 0.044 — narrow but real.)
+- **Chirality gate** — `rotation-IoU − axis-flip-IoU ≤ SYM_ROT_MARGIN (0.10)`. A mark that reads far more
+  ROTATIONAL than V/H-mirror is either genuinely CHIRAL (slack's 4-bar pinwheel — folding merges its 8
+  components → 2) or has its true mirror axis OFF the V/H grid (react's atom, axis ≈ 60°, V/H-flip only
+  0.799); folding either about V/H corrupts it. The margin is **data-driven**: over the n=30 set all true
+  V/H folders sit at gap `≤ −0.011` (chrome), the reject class at gap `≥ +0.196` (react +0.196, slack
+  +0.218) — a wide empty band, `0.10` mid-band with ~0.1 cushion each side. The SAME rule catches both
+  slack and react, so it is not a slack-only over-fit. The rotation-IoU is `_self_rot_iou(mask, angles)`,
+  the single shared source of truth for the rot-symmetry/chirality primitive (also used by
+  `_rotation_eligible`); it uses `warpAffine(INTER_NEAREST)` — integer selection, H8-safe (NOT the
+  thread-nondeterministic `warpPolar` / `INTER_LINEAR` class).
+
+Verdicts on the seed + coverage set: slack → `[]`, react → `[]` (chirality-rejected); instagram →
+`[V, H]`; gmail/android → `[V]`; vscode/youtube/youtube-music/whatsapp → `[H]`; chrome → `[V, H]`;
+apple/edge/firefox/claude → `[]` (IoU/asym-rejected). signal folds legitimately (V-symmetric bubble — the
+fold REDUCES fragmentation and is topology-guarded; its residual strays are an upstream render issue).
+
+#### Built but DORMANT in `refine_perimeter` (harness-validated, awaiting per-fixture scope)
+
+These passes are implemented, deterministic, and exercised by the harness, but are **not** in the shipped
+chain — each is gated out pending a scope decision, matching the cautious H3 posture:
+
+- **`widen_underrepresented`** — `@24`-guided inner-feature CONTINUITY fill (pinch + flanked, mirror-
+  twinned, topology-guarded). The larger feed sibling (`@24`) guides `@16`; `@24` itself gets no reference.
+  The harness runs it between `unblot` and `deburr`; `refine_perimeter` omits it. `WIDEN_TGT_THRESH = 110`.
+  Radial-excluded via angular peak-count; the user's rule is CONTINUITY, not width.
+- **`_rotation_search` / `_rotation_eligible`** — whole-glyph 45°-grid rotation, eligibility-gated to
+  rotational-symmetric or single-thin-stroke marks (the monogram/"M" case). Dormant on the oriented seeds —
+  it tilts figma/vscode even as jag drops (`JAG_MARGIN_FRAC = 0.05` displacement gate). A stage-5 signal.
+- **`_symmetry_scene` / `cleanup_scene`** — scene-level placement symmetry (half-mirror the composite about
+  the CANONICAL axis; `SCENE_SYM_MARGIN = 0.02`, `SCENE_FID_KEEP = 0.85`). Superseded by the pixel-level
+  `symmetrize_render`; residual asymmetry was rasterization-level, which the per-pixel fold addresses.
+- **`outline_scene` / `restroke_outline` / `refine_outline`** — a Phase-2 skeleton/medial-axis experiment
+  (fuse → topology-guarded `MORPH_CLOSE` → `medial_axis` → spur-prune → loop-break → L-corner straighten →
+  restroke from the width map). Kept for the re-stroke-from-skeleton direction; not in the shipped chain.
+
+#### Harness + coverage
+
+`python -m iconograph.refine_debug [fixtures…] [--all] [--twice] [--serial]` loads each fixture's cached L2
+constructions (`.cache/stages/<stem>/`), R1-renders per size (default `{16, 24}`), runs the chain, and
+writes a 4-column strip to `testbed/refine/<stem>.png`: **render | outline raw | connected | refined
+outline** (red = net additions, blue = net deletions). Parallel by default (`mp` fork Pool, per-worker
+`cv2.setNumThreads(1)` for H8, `ICONOGRAPH_JOBS` caps workers); `--twice` re-runs each fixture and asserts
+byte-identical output; `--serial` forces single-process; `--all` = the full n=30. Per H1, the strips are
+the truth — a cell can pass every count and still be visually wrong, so the strips are read, not just the
+stats.
+
+**Not done / stage-5 handoff:** wire `refine_perimeter` into `application/pipeline.py`; decide per-fixture
+scope for the dormant widen/rotation passes; signal's upstream render strays are a render/decompose matter,
+not a refine one.
 
 ### Stage 5 — monogram (selection + generation)
 
-**Status:** not yet implemented.
+**Status:** phase 1 shipped (letter selection); phases 2–3 not yet implemented.
 
-Pick the monogram glyph (extracted letter, embedded mark, or
-filename-derived fallback) and render it at canonical working resolution.
-Per-class: `inverted` uses a different luminance threshold for letter
-extraction; `monogram-only` logos forward their own glyph unchanged;
-`standard` logos go through connected-component / OCR letter extraction.
+The monogram is **name-derived** — its two most *defining* letters, taken from the
+application's name (`Discord→DC`, `Adobe Illustrator→AI`, `Android→AD`, `Medium→MD`).
+This supersedes the OCR-primary framing: the `standard`/`inverted` connected-component /
+OCR letter-extraction paths (`standard.py` / `inverted.py`) are **deferred**, not the
+main route. The stage runs in three phases:
 
-### Stage 6 — fit (aggressive per-target sizing)
+- **Phase 1 — letter selection (done).** `monogram/common.py::select_monogram_letters(name) -> str`
+  returns a 2-char uppercase monogram. Rule: letter 1 = first letter; letter 2 = the
+  onset of the next prosodic unit — the second **word** if the name is multi-word
+  (Adobe Illustrator→A**I**), else the onset consonant of a later **syllable** (dis-**C**ord,
+  an-**D**roid). Implemented as a tiered candidate rank (word-initial > syllable-onset >
+  consonant > vowel; min `(tier, position)` wins), with syllable boundaries from **pyphen**
+  (deterministic, H8; default `left/right=2,2`). camelCase splits only *within* a single
+  separator-token, so `YouTube`→YT but `YouTube Music`→YM. The name is sourced from an
+  explicit `stem → display name` map (`fixtures/names.json`); the selector itself is pure
+  (`name: str`), branch-agnostic, and never touches the filesystem. Harness:
+  `python -m iconograph.monogram_debug` (gates on Discord→DC / Adobe Illustrator→AI /
+  Android→AD / Medium→MD).
+- **Phase 2 — canvas + logo placement (done).** Place the stage-4 refined 1-px OUTLINE
+  logo at **native size** (never rescaled), tight-cropped, on an `N = T+8` canvas. Two
+  conversions: **16-logo → 24, 24-logo → 32** (N∈{24,32} are hicolor sizes → stage 5 emits
+  two hicolor grids directly).
+- **Phase 3 — letter generation + fit (done).** Render the two letters from a hand-authored
+  1-px-stroke pixel font (`monogram/glyphs.py`, `FONT_7X9`/`FONT_5X7`/`FONT_3X5` — NOT TTF)
+  and fit them **as large as possible**. User ruling: the logo is never rescaled; the
+  letters instead **intersect** it — a letter's bbox may overlap the logo's, weaving through
+  its negative space — the only hard constraint being that letter *pixels* never touch logo
+  pixels (strict **1-px 8-connected** gap, `application/common.py::masks_8adjacent`).
+  `monogram/compose.py::compose_icon` is a deterministic free-space maximal fit: the logo is
+  tight-flushed to each corner and each letter grown (base variant × integer upscale ≤3×) to
+  the largest glyph whose ink clears the logo halo; the corner + letters maximising total
+  footprint win (letter 1 leans top-left, letter 2 bottom-right → reading order). Letters may
+  scatter into opposite negative-space pockets — an accepted trade for size. Harness:
+  `python -m iconograph.monogram_compose_debug` (strips → `testbed/monogram/`; asserts
+  L↔logo + L↔L separation + `--twice` H8).
 
-**Status:** not yet implemented.
+### Stage 6 — removed (absorbed into stage 5)
 
-For each Fedora hicolor size (16, 22, 24, 32, 48, 64, 128, 256), search
-over `(scale, x-offset, y-offset)` to maximize the proportion of the N×N
-canvas occupied by ink, subject to: tight bounding-box preservation,
-minimum legible monogram glyph height per target, and a per-size padding
-floor. Per-target rasterization happens here. Writes the Fedora hicolor
-tree + updates `manifest.json`.
+Stage 6 (the "aggressive per-target fitting protocol") is **dropped**. Its job — placing
+the logo + monogram on the output canvas — is now stage 5 phases 2–3, which emit the 24
+and 32 hicolor grids directly (logo native size + an 8-px letter band). Larger hicolor
+sizes (48/64/128/256) are future scale-up work. The `application/fit/` stubs are dead
+(no importers) and retained only as empty placeholders.
 
 ## File-icon pipeline
 
@@ -1394,8 +1535,10 @@ src/iconograph/
     d1_debug.py            D1 typed-contour debug strips
     l3_debug.py            legacy L3-beam debug harness (baseline only)
     diff_debug.py          diff_fit refiner harness (--twice = H8 determinism check)
+    monogram_debug.py      Stage 5 phase 1 — name → two letters (text harness)
+    monogram_compose_debug.py  Stage 5 phases 2-3 — compose logo+letters (strips + --twice)
     application/
-        pipeline.py        stage 1 → 6 orchestrator
+        pipeline.py        stage 1 → 5 orchestrator
         categorize.py      Stage 1
         preprocess/        Stage 2 — standard.py, inverted.py, color_essential.py, common.py
         compress/          Stage 3 — align.py (L0), segment_prim_classify.py (L1),
@@ -1405,8 +1548,10 @@ src/iconograph/
                                      lazy import), common.py (primitives incl. Wedge, negative CSG
                                      groups, _post_prune, _fit_arc_circle; shared fitters, H5)
         refine/            Stage 4 — common.py, burst.py
-        monogram/          Stage 5 — standard.py, inverted.py, common.py
-        fit/               Stage 6 — search.py, compose.py, common.py
+        monogram/          Stage 5 — common.py (select_monogram_letters + split_monogram),
+                                     glyphs.py (pixel font), compose.py (compose_icon);
+                                     standard.py, inverted.py (deferred OCR stubs)
+        fit/               REMOVED (stage 6 absorbed into stage 5) — dead stubs only
     file/                  DEFERRED
 fixtures/                  ≥20 reference logos spanning sub-cases (per H9)
 inputs/logo-markings/      user-provided, gitignored

@@ -355,6 +355,23 @@ def _iou_bool(a: np.ndarray, b: np.ndarray) -> float:
     return inter / union if union else 0.0
 
 
+def _nbcount(mask: np.ndarray) -> np.ndarray:
+    """Per-pixel count (int16, 0..8) of FOREGROUND 8-neighbours, center excluded.
+    BORDER_CONSTANT pads with 0 (off-canvas = background); normalise to {0,1} first."""
+    b = (mask > 0).astype(np.uint8)
+    k = np.ones((3, 3), np.uint8)
+    k[1, 1] = 0
+    return cv2.filter2D(b, cv2.CV_16S, k, borderType=cv2.BORDER_CONSTANT)
+
+
+def _nb4count(mask: np.ndarray) -> np.ndarray:
+    """Per-pixel count (int16, 0..4) of FOREGROUND 4-neighbours (shared-edge only, center
+    excluded). BORDER_CONSTANT pads with 0 (off-canvas = background); normalise to {0,1} first."""
+    b = (mask > 0).astype(np.uint8)
+    k = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], np.uint8)
+    return cv2.filter2D(b, cv2.CV_16S, k, borderType=cv2.BORDER_CONSTANT)
+
+
 def _centroid(mask: np.ndarray) -> tuple[float, float] | None:
     """(cx, cy) of a uint8 mask via image moments, or None if empty."""
     m = cv2.moments(mask, binaryImage=True)
