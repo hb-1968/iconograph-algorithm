@@ -115,7 +115,7 @@ GOTCHAS
 '''
 import numpy as np
 from iconograph.application.categorize import Categorization
-from . import standard, inverted, color_essential
+from . import standard, inverted, color_essential, color_carried
 from .common import frame_with_margin
 
 
@@ -127,6 +127,8 @@ def preprocess(cat: Categorization, rgba: np.ndarray) -> np.ndarray:
         return color_essential.compose_features(features)
     if cat.routing == "inverted":
         bw = inverted.universalize(cat, rgba)
+    elif cat.color_carried:
+        bw = color_carried.universalize(cat, rgba)
     else:
         bw = standard.universalize(cat, rgba)
     return frame_with_margin(bw)

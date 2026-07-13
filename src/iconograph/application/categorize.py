@@ -21,6 +21,9 @@ from skimage.color import rgb2lab
 from sklearn.cluster import KMeans
 from sklearn.exceptions import ConvergenceWarning
 
+from iconograph.application.common import (
+    COLLAPSE_IOU, MARK_FRAC_FLOOR, fit_simple_primitive, interior_mark_mask)
+
 
 @contextmanager
 def _silence_kmeans_convergence():
@@ -74,6 +77,21 @@ class Categorization:
     precedence: Precedence | None
     envelope_mask: np.ndarray | None = field(default=None, repr=False, compare=False)
     inner_mask: np.ndarray | None = field(default=None, repr=False, compare=False)
+    color_carried: bool = False   # solid badge whose identity is interior colour marks
+                                  # (routes stage 2 to the color_carried cutout branch)
+
+
+def _color_carried(lab: np.ndarray, opaque: np.ndarray) -> bool:
+    """Colour-carried: discarding colour collapses the silhouette to ONE simple
+    primitive AND the interior holds enclosed colour-contrast marks (EasyEffects' EQ
+    knobs on a disc, Ptyxis' prompt on a square) — so the identity lives in colour,
+    not outline (user ruling). Only meaningful when NOT already color_essential /
+    is_compound; the caller gates that. Routes stage 2 to the color_carried cutout."""
+    _, iou = fit_simple_primitive(opaque.astype(np.uint8))
+    if iou < COLLAPSE_IOU:
+        return False
+    marks = interior_mark_mask(lab, opaque)
+    return int(marks.sum()) >= MARK_FRAC_FLOOR * int(opaque.sum())
 
 
 def categorize(image_path: Path) -> Categorization:
@@ -91,7 +109,10 @@ def categorize(image_path: Path) -> Categorization:
     if color_essential:
         return Categorization("burst", True, is_compound, None, env_mask, inner_mask)
     if not is_compound:
-        return Categorization("standard", False, False, None)
+        # A solid single-primitive silhouette whose interior colour-contrast marks
+        # would be lost to the alpha-only standard branch → route the cutout instead.
+        return Categorization("standard", False, False, None,
+                              color_carried=_color_carried(lab, opaque))
     prec = _precedence(env_mask, inner_mask)
     initial_routing: Routing = "inverted" if prec == "inner" else "standard"
     # Final routing precedence — applied conceptually AFTER Stage 2 strips

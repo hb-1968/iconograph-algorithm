@@ -50,10 +50,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_build = sub.add_parser(
         "build",
-        help="batch over inputs/logo-markings/, skip unchanged",
+        help="process every installed app's icon into the Iconograph theme "
+             "(~/.local/share/icons/Iconograph; incremental — run after "
+             "installing a new app)",
     )
-    p_build.add_argument("--force", action="store_true", help="reprocess everything")
-    p_build.add_argument("--only", metavar="GLOB", help="reprocess matching inputs")
+    p_build.add_argument("--update", action="store_true",
+                         help="full rebuild of the ENTIRE set (after pipeline "
+                              "code improvements); default runs are incremental")
+    p_build.add_argument("--force", action="store_true",
+                         help="alias of --update")
+    p_build.add_argument("--cores", type=int, metavar="N",
+                         help="worker-pool size (default: half the host cores)")
+    p_build.add_argument("--only", metavar="GLOB",
+                         help="restrict to matching icon names, e.g. 'org.gnome.*'")
 
     sub.add_parser("review", help="regenerate review.html")
 
@@ -91,6 +100,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command == "build":
+        from iconograph.iconpack import run_build
+        return run_build(cores=args.cores, update=args.update or args.force,
+                         only=args.only)
     if args.command == "bench":
         from iconograph.testbed import run_bench
         return run_bench(stage=args.stage, serial=args.serial, label=args.label)

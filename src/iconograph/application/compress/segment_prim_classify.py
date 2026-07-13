@@ -17,6 +17,7 @@ shapes share a single foreground pixel they are one CC and they become
 one L1 miss for L2. No watershed, no morphological neck-splitting. The
 Adobe Illustrator "Ai" fixture is the canonical case: Circle (i-dot),
 Rectangle (i-body), L1Miss (A).
+
 """
 
 from __future__ import annotations
@@ -50,6 +51,15 @@ MIN_AREA_FRAC = 5e-4
 # corner droplets (sym ≈ 0.88) — must reject. Threshold 0.96 sits above
 # Signal's 0.955 and well below Ai's clean i-dot 0.99.
 SYMMETRY_MIN_IOU = 0.96
+# Triangle concavity gate (the vue class): a min-enclosing triangle papers
+# over any concavity, and IoU under-weights a NARROW deep notch — vue's bold
+# V fits at IoU 0.9436 ≥ IOU_ACCEPT while its nested-V identity dies at this
+# stage. Census (the ONLY two L1-Classified Triangles in the fixture cache):
+# vue defect 0.2015 / notch 0.0552; youtube-music#1 0.0025 / 0.0000. BOTH
+# thresholds must hold to reject — a deep hairline crack alone is boundary
+# noise, and a wide shallow leg-gap (adobe's A hull) alone is not identity.
+TRI_MAX_DEFECT_FRAC = 0.04   # max convexityDefects depth / max(h, w)
+TRI_MAX_NOTCH_FRAC = 0.02    # largest hull∖CC component area / CC area
 
 _GREEN = (0x2E, 0x7D, 0x32)
 _RED = (0xC6, 0x28, 0x28)
@@ -91,6 +101,36 @@ def _axis_symmetry(roi: np.ndarray) -> float:
     hf = np.flip(rb, axis=1)
     vf = np.flip(rb, axis=0)
     return min(_iou_bool(rb, hf), _iou_bool(rb, vf))
+
+
+def _tri_concavity(roi: np.ndarray, contour: np.ndarray) -> tuple[float, float]:
+    """(max convexity-defect depth / max(h, w), largest hull∖roi component
+    area / roi area) — how DEEP and how LARGE the biggest bite the
+    min-enclosing triangle would paper over is. `contour` must be the SAME
+    int32 CHAIN_APPROX_NONE contour the fits use (mixing a resampled contour
+    desynchronizes convexityDefects' indices). (0.0, 0.0) on any degenerate
+    case (short contour, collapsed hull, already-convex CC)."""
+    if contour.shape[0] < 4:
+        return 0.0, 0.0
+    hull_idx = cv2.convexHull(contour, returnPoints=False)
+    if hull_idx is None or len(hull_idx) < 3:
+        return 0.0, 0.0
+    try:
+        defects = cv2.convexityDefects(contour, hull_idx)
+    except cv2.error:
+        return 0.0, 0.0
+    if defects is None:
+        return 0.0, 0.0
+    # the 4th defects column is ×256 fixed-point pixels
+    dep = float(defects[:, 0, 3].max()) / 256.0 / float(max(roi.shape))
+    hull_mask = np.zeros_like(roi)
+    cv2.fillPoly(hull_mask, [contour[hull_idx.flatten()]], 255)
+    notch = ((hull_mask > 0) & (roi == 0)).astype(np.uint8)
+    n, _lbl, stats, _c = cv2.connectedComponentsWithStats(notch, connectivity=8)
+    if n <= 1:
+        return dep, 0.0
+    nfr = float(stats[1:, cv2.CC_STAT_AREA].max()) / float(np.count_nonzero(roi))
+    return dep, nfr
 
 
 def segment_prim_classify(img: np.ndarray) -> SegmentClassification:
@@ -149,17 +189,23 @@ def segment_prim_classify(img: np.ndarray) -> SegmentClassification:
         # Axis-symmetry gate: Circle and Ellipse demand reflection-symmetry
         # about both bbox centerlines. Rectangles are symmetric by
         # construction (the fit IS the bbox), so any shape that hits the
-        # rect IoU floor is already symmetric enough. Triangles are
-        # intentionally not gated — min-enclosing triangles are rarely
-        # axis-symmetric.
+        # rect IoU floor is already symmetric enough. Triangles get the
+        # CONCAVITY gate below instead — min-enclosing triangles are rarely
+        # axis-symmetric, but a deep+large bite means compound glyph (vue).
         sym_ok = _axis_symmetry(roi) >= SYMMETRY_MIN_IOU
         iou_circle = iou_analytical(roi, fit_c, area_c) if sym_ok else 0.0
         iou_ellipse = iou_analytical(roi, fit_e, area_e) if sym_ok else 0.0
+        # Triangle concavity gate: rejecting the candidate makes the CC an
+        # L1Miss — L2 re-fits hint="triangle" and decompose carves the notch
+        # as subtracts (vue: 4 parts, a0.981/b0.885, the V ~85% carved).
+        dep, nfr = _tri_concavity(roi, contour)
+        tri_ok = not (dep >= TRI_MAX_DEFECT_FRAC and nfr >= TRI_MAX_NOTCH_FRAC)
+        iou_tri = iou_analytical(roi, fit_t, area_t) if tri_ok else 0.0
 
         candidates: list[tuple[str, float, Primitive]] = [
             ("circle", iou_circle, circle),
             ("rectangle", iou_analytical(roi, fit_r, area_r), rect),
-            ("triangle", iou_analytical(roi, fit_t, area_t), tri),
+            ("triangle", iou_tri, tri),
             ("ellipse", iou_ellipse, ell),
         ]
         best_name, best_iou, best_prim = max(candidates, key=lambda c: c[1])

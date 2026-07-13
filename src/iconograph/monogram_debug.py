@@ -25,7 +25,9 @@ from pathlib import Path
 from iconograph.application.monogram.common import select_monogram_letters
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-NAMES_JSON = REPO_ROOT / "fixtures" / "names.json"
+from iconograph.cache import FIXTURES_ROOT  # noqa: E402
+
+NAMES_JSON = FIXTURES_ROOT / "names.json"   # env-overridable (ICONOGRAPH_FIXTURES)
 
 # The 4 user examples (hard ground truth — acceptance gate) then the remaining seeds (observed).
 DEFAULT_FIXTURES = (

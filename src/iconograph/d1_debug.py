@@ -30,12 +30,12 @@ from iconograph.application.preprocess import preprocess  # noqa: E402
 from iconograph.application.compress import align, segment_prim_classify  # noqa: E402
 from iconograph.application.compress.L2_feature_segment import Feature, segment_features  # noqa: E402
 from iconograph.application.compress.contour_parse import draw_shape_overlay, parse_shape  # noqa: E402
-from iconograph.cache import cached  # noqa: E402
+from iconograph.cache import FIXTURES_ROOT, TESTBED_ROOT, cached  # noqa: E402
 from iconograph.debug_common import labeled as _label  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-FIXTURES = REPO_ROOT / "fixtures"
-DUMP_DIR = REPO_ROOT / "testbed" / "D1_contour"
+FIXTURES = FIXTURES_ROOT   # env-overridable basis (ICONOGRAPH_FIXTURES)
+DUMP_DIR = TESTBED_ROOT / "D1_contour"
 CACHE = REPO_ROOT / ".cache" / "stages"
 DEFAULT_FIXTURES = ("android-head_flat", "docker-mark-black", "obsidian", "gmail")
 

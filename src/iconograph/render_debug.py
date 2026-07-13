@@ -156,7 +156,6 @@ GOTCHAS
     no dedicated field; do not add one — the drop record IS the contract).
   - ASCII only in cv2 panel captions (Hershey renders non-ASCII as ??);
     the table goes to stdout, so Ĵ etc. are fine THERE.
-────────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
@@ -207,20 +206,24 @@ from iconograph.application.compress.decompose import decompose_shape  # noqa: E
 from iconograph.application.compress.label_clean import clean_labels  # noqa: E402
 from iconograph.application.compress.render import (  # noqa: E402
     CUBIFY_MAX_T,
+    _FX_BG,
+    _assemble_masks,
     _topology,
+    assemble_render,
+    build_constructions,
     floor_for,
     jag_norm,
     jag_score,
 )
 from iconograph.application.compress.render import render_debug as r1_render  # noqa: E402
 from iconograph.application.compress.straighten import DEG_TRUE, straighten_part  # noqa: E402
-from iconograph.cache import CACHE_ROOT  # noqa: E402
+from iconograph.cache import CACHE_ROOT, TESTBED_ROOT  # noqa: E402
 from iconograph.debug_common import hstack, labeled  # noqa: E402
 from iconograph.application.refine.common import (  # noqa: E402
     cleanup_scene, outline_scene, refine_outline)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DUMP_DIR = REPO_ROOT / "testbed" / "render"
+DUMP_DIR = TESTBED_ROOT / "render"
 # Render strips are filed by CONTEXT (H7 — testbed never accumulates a flat pile):
 SYNTH_DIR = DUMP_DIR / "synthetic"  # synthetic shape regression strips (geometry path,
 #                                     T ∈ {16,24,32,64}) — the default/synthetic mode
@@ -272,6 +275,12 @@ EXPECTED_REG = {
     "figma": "group", "row_stack": "group",
     "discord": "none", "gmail": "none", "vscode": "none",
 }
+# Identity-notch witness (closes the render==own-primitive-reference blindness
+# class: vue PASSED Ĵ 0.201/0.122 while its whole nested-V was missing — the
+# gate graded a triangle against a triangle). notch = hull(ren)∖ren px in the
+# TOP HALF of ren's bbox; listed fixtures FAIL below their floor (measured:
+# vue 4 @16 / 6 @24), everyone else report-only.
+EXPECTED_NOTCH: dict[str, dict[int, int]] = {"vue": {16: 3, 24: 5}}
 PANEL_T = 256              # upscale targets to ~this for visibility
 _INK = (40, 40, 40)
 _UNDER = (230, 25, 75)     # reference pixels the render missed — red
@@ -438,56 +447,15 @@ def _degree_panels(parts: list[Part], canvas_hw: tuple[int, int],
 
 
 def _fixture_constructions(stem: str):
-    """Cached L2 → per-segment constructions in FULL-canvas coords.
-    Classified → 1-part add; Feature → decompose_shape (computed once, reused
-    across every target size) offset by (bbox − pad). Returns
-    (S, aligned_rgb, [(parts, color_rgb, label), ...])."""
+    """Cached L2 -> constructions: the 3 raw pkl reads (debug-only pattern —
+    production gets these objects from its own cached() chain) + the shared
+    compress.render.build_constructions core. Returns (S, aligned, cons, src)."""
     cdir = CACHE_ROOT / stem
     fs = pickle.loads((cdir / "L2_feature_segment.pkl").read_bytes())
     aligned = pickle.loads((cdir / "align.pkl").read_bytes())
-    # stage-1 routing ('standard'|'inverted'|'burst') — the label-cleaner's sub-case
-    # signal (WS2). seg.shape_hint is the per-segment refinement, passed below.
     sub_case = pickle.loads((cdir / "categorize.pkl").read_bytes()).routing
-    S = int(fs.image_shape[0])
-    min_feat = _min_feature_px(S)
-    cons: list[tuple[list[Part], tuple[int, int, int], str]] = []
-    n_residual = 0
-    for si, seg in enumerate(fs.segments):
-        if isinstance(seg, Classified):
-            cons.append(([Part(seg.primitive, "add")], seg.color_rgb,
-                         f"#{si} L1 {type(seg.primitive).__name__}"))
-            continue
-        if not isinstance(seg, Feature):
-            continue
-        t0 = time.time()
-        d = decompose_shape(seg.mask, min_feat, seg.shape_hint,
-                            ring=seg.ring_geom, bbox_xy=(seg.bbox[0], seg.bbox[1]))
-        # WS2 label-cleaner: prune/merge/re-fit/normalize/re-select before render.
-        # Rebuild the SAME padded target the decomposer scored against
-        # (decompose.py builds target from seg.mask at d.pad / d.shape).
-        _th, _tw = seg.mask.shape[:2]
-        _src = np.zeros(d.shape, np.uint8)
-        _src[d.pad:d.pad + _th, d.pad:d.pad + _tw] = seg.mask
-        d = clean_labels(d, _src, sub_case, min_feat)
-        dt = time.time() - t0
-        if d.residual is not None:
-            n_residual += 1
-        if not d.parts:
-            print(f"  {stem}#{si}: decompose returned no parts — deferred "
-                  f"(R3 residual territory) [{dt:.1f}s]")
-            continue
-        ox, oy = seg.bbox[0] - d.pad, seg.bbox[1] - d.pad
-        parts = [_offset_part(p, ox, oy) for p in d.parts]
-        cons.append((parts, seg.color_rgb, f"#{si} D2 n={len(parts)}"))
-        print(f"  {stem}#{si} decomposed: {len(parts)} parts "
-              f"cov a{d.coverage:.2f}/b{d.boundary_cov:.2f} [{dt:.1f}s]")
-    if n_residual:
-        print(f"  {stem}: {n_residual} feature(s) carry a residual "
-              f"(R3 tier, not rendered)")
-    return S, aligned, cons
-
-
-_FX_BG = (238, 238, 238)   # light grey: white-on-white features stay visible
+    S, cons, src = build_constructions(fs, sub_case, tag=stem)
+    return S, aligned, cons, src
 
 
 def _src_panel(aligned: np.ndarray) -> np.ndarray:
@@ -511,6 +479,20 @@ def _color_panel(layers: list[tuple[np.ndarray, tuple[int, int, int]]],
     oy, ox = (PANEL_T - up.shape[0]) // 2, (PANEL_T - up.shape[1]) // 2
     canvas[oy:oy + up.shape[0], ox:ox + up.shape[1]] = up
     return np.pad(canvas, ((22, 0), (0, 0), (0, 0)), constant_values=255)
+
+
+def _notch_px(ren: np.ndarray) -> int:
+    """hull(ren)∖ren px in the TOP HALF of ren's bbox — the EXPECTED_NOTCH
+    witness (vue's carved V opens through the top edge)."""
+    nz = cv2.findNonZero((ren > 0).astype(np.uint8))
+    if nz is None:
+        return 0
+    hm = np.zeros(ren.shape, np.uint8)
+    cv2.fillPoly(hm, [cv2.convexHull(nz)], 255)
+    diff = (hm > 0) & (ren == 0)
+    ys = nz[:, 0, 1]
+    diff[(int(ys.min()) + int(ys.max())) // 2 + 1:, :] = False
+    return int(np.count_nonzero(diff))
 
 
 def _sig_topology(mask: np.ndarray, min_feat: int) -> tuple[int, int]:
@@ -537,7 +519,7 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
         print(f"{stem}: no cached L2 segmentation under .cache/stages/ — "
               f"run the testbed/build first")
         return []
-    S, aligned, cons = _fixture_constructions(stem)
+    S, aligned, cons, src = _fixture_constructions(stem)
     if not cons:
         print(f"{stem}: nothing to render")
         return []
@@ -556,10 +538,20 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
             again = [r1_render(parts, (S, S), t) for parts, _c, _l in cons]
             same = all(np.array_equal(a.mask, b.mask) for a, b in zip(rrs, again))
             print(f"  determinism({stem}@{t}): {'IDENTICAL' if same else 'MISMATCH'}")
-        # cross-construction separation: re-open 1px divots between source-separate
-        # constructions that fused at the feed res (slack's pinwheel). The composite mask
-        # + R1 panel use the divoted masks; per-construction r.* metrics stay from rrs.
-        dmasks = _separate_divots([r.mask for r in rrs], cons, S)
+        # cross-construction ASSEMBLY (the shared _assemble_masks chain: harmonize →
+        # radial → divots → nested-rings → subrep-accents → bridge). The composite mask
+        # + R1 panel use the assembled masks; per-construction r.* metrics stay from rrs.
+        amasks, _accent, protected, n_dec = _assemble_masks(
+            [r.mask for r in rrs], cons, S, t, src)
+        if protected:                                     # szspread gate column (R1)
+            hs = [int(np.count_nonzero(amasks[ci].any(axis=1))) for ci in sorted(protected)]
+            ws = [int(np.count_nonzero(amasks[ci].any(axis=0))) for ci in sorted(protected)]
+            szspread = (max(hs) - min(hs)) + (max(ws) - min(ws))
+        else:
+            szspread = 0
+        if protected or szspread:
+            print(f"  {stem:<14} T={t:<3} harmonized {len(protected)} stamps  "
+                  f"szspread={szspread}")
         ren = np.zeros((t, t), np.uint8)
         ref = np.zeros((t, t), np.uint8)
         nai = np.zeros((t, t), np.uint8)
@@ -567,7 +559,7 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
         axis_fired = False
         reg_det_stem = None
         for idx, ((parts, _c, label), r) in enumerate(zip(cons, rrs)):
-            ren |= dmasks[idx]
+            ren |= amasks[idx]
             ref |= r.ref
             nai |= r.naive
             viol += len(r.violations)
@@ -602,6 +594,9 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
             print(f"      {label:<22} T={t:<3} Ĵ {ratio_i:5.3f}"
                   f"{' LOSS' if ratio_i > 1.0 else '     '} fid {fid_i:.3f}"
                   f"  drops={len(r.drops)} viol={len(r.violations)}{extra}")
+        # radial decimation is an honest per-cell drop (signal@16's 16->8 comb):
+        # the topo/floor audits' drops>0 escape covers the member-count delta
+        drops += n_dec
         jn_r, jn_n = jag_norm(ren), jag_norm(nai)
         ratio = (jn_r / jn_n) if jn_n > 0 else 1.0
         band = _band_width(ref)
@@ -618,7 +613,7 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
             labeled(_color_panel([(r.naive, c) for r, (_p, c, _l) in zip(rrs, cons)], t),
                     f"naive  J{jag_score(nai):.0f}"),
             # ASCII captions only — cv2.putText's Hershey fonts render non-ASCII as ??
-            labeled(_color_panel([(dm, c) for dm, (_p, c, _l) in zip(dmasks, cons)], t),
+            labeled(_color_panel([(dm, c) for dm, (_p, c, _l) in zip(amasks, cons)], t),
                     f"R1  J{jag_score(ren):.0f}  fid{fid:.2f}  "
                     f"Jratio {ratio:5.3f}{' LOSS' if ratio > 1.0 else ''}"),
         ]
@@ -672,17 +667,26 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
                   f"got {reg_det_stem or 'none'}")
         # round 6 — gate column: a detached blob (gmail@24/32's sliver) is a
         # silhouette TOPOLOGY mismatch; drops escape like _feasible's
+        # A deliberately-PLACED nest accent is carved from the audited mask (same doctrine
+        # as count_tight_ref's protected clause): the reference cannot express it — its
+        # natural downsample position COLLIDES with the rings (the very defect the
+        # coordination pass fixes) and its ratified hollow form has a hole no solid
+        # canonical carries. The audit judges the rings; the accent is the strip's truth.
+        ren_audit = ren
+        if _accent is not None:
+            ren_audit = ren.copy()
+            ren_audit[_accent > 0] = 0
         if t <= CUBIFY_MAX_T:
             # cubify represents labels at the feed resolution — pass on EITHER the
             # SIGNIFICANT topology matching (filters sub-min-feature rasterization holes —
             # claude's 1px blade gaps) OR the plain topology matching ref/canon (the
             # label-driven square ring + triangle matches the canonical structure).
             mft = _min_feature_px(t)
-            topo_cell_ok = (_sig_topology(ren, mft) == _sig_topology(ref, mft)
-                            or _topology(ren) in (_topology(ref), topo_canon_comp)
+            topo_cell_ok = (_sig_topology(ren_audit, mft) == _sig_topology(ref, mft)
+                            or _topology(ren_audit) in (_topology(ref), topo_canon_comp)
                             or drops > 0)
         else:
-            topo_cell_ok = (_topology(ren) in (_topology(ref), topo_canon_comp)
+            topo_cell_ok = (_topology(ren_audit) in (_topology(ref), topo_canon_comp)
                             or drops > 0)
         # The cubify render (T <= CUBIFY_MAX_T) REPRESENTS labels, it does not pixel-fit
         # the round raster (user ruling) — a square ring barely overlaps a circle ring, so
@@ -691,12 +695,19 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
         # of IoU; the geometry path (T > 24) keeps the fidelity floor.
         floor_ok = (fid >= floor or drops > 0
                     or (t <= CUBIFY_MAX_T and topo_cell_ok))
+        exp_notch = EXPECTED_NOTCH.get(stem, {}).get(t)
+        notch_v = _notch_px(ren)
+        notch_ok = exp_notch is None or notch_v >= exp_notch
+        if not notch_ok:
+            print(f"  {stem:<14} T={t:<3} NOTCH-AUDIT expected >= {exp_notch} "
+                  f"got {notch_v}")
         stats.append({"name": stem, "t": t, "ratio": ratio, "fid": fid,
                       "floor_ok": floor_ok,
                       "jag_win": ratio <= 1.0, "viol": viol, "drops": drops,
                       "strays": strays, "topo_ok": topo_cell_ok,
                       "axis_fired": axis_fired,
-                      "reg_audit_ok": reg_audit_ok})
+                      "reg_audit_ok": reg_audit_ok,
+                      "notch": notch_v, "notch_ok": notch_ok})
     FX_DIR.mkdir(parents=True, exist_ok=True)
     Image.fromarray(np.vstack(rows), "RGB").save(
         FX_DIR / f"fx_{stem}.png", "PNG", optimize=True)
@@ -706,63 +717,6 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
 # ── final render product (assembled deliverable; stage-4 refine's input) ──
 
 
-SEP_MIN_CONS = 4   # divots fire only on OVERREPRESENTED multi-element marks (>= this many
-#                    constructions — slack's 8-pill pinwheel). A 2-3 piece glyph (adobe's
-#                    A + i-stem + i-dot) is NOT force-separated: the i-dot stays attached to
-#                    its stem (user: 'dot attached to stem'). A size guard can't do this —
-#                    at 16px slack's short pills are the SAME size as the i-dot — so the
-#                    discriminator is piece COUNT (the user's 'overrepresented' principle).
-
-
-def _separate_divots(masks: list[np.ndarray], cons, S: int) -> list[np.ndarray]:
-    """Re-open 1px divots between constructions that are SEPARATE in the source but whose
-    rendered masks fused at the feed resolution (slack's 8 pinwheel pills 'glob together
-    for no good reason'). Gated to OVERREPRESENTED marks (>= SEP_MIN_CONS constructions);
-    a 2-3 piece glyph is left as rendered. Source-separate iff CANONICAL footprints are
-    8-disconnected at canvas res (unambiguous, before the feed-res downsample globs the
-    gaps — slack's gaps are sub-pixel in the reference at 16, so a reference-based test
-    under-separates). Where such a pair's rendered masks touch, the contact pixels are
-    cleared from the later (area-sorted smaller, drawn on top) construction so each label
-    keeps a >=1px gap; pairs that genuinely abut in the source are left fused. (H8)."""
-    if len(masks) < SEP_MIN_CONS:
-        return masks
-    k = np.ones((3, 3), np.uint8)
-    canon = [_compound_mask(parts, S, S) for parts, _c, _l in cons]
-    out = [m.copy() for m in masks]
-    for i in range(len(masks)):
-        di = cv2.dilate(masks[i], k)
-        ci = cv2.dilate(canon[i], k)
-        for j in range(i + 1, len(masks)):
-            if np.any((ci > 0) & (canon[j] > 0)):
-                continue                              # abut in source — preserve the join
-            contact = (di > 0) & (masks[j] > 0)
-            if np.any(contact):
-                out[j] = out[j].copy()
-                out[j][contact] = 0
-    return out
-
-
-def assemble_render(cons, S: int, target: int):
-    """Add all the render pieces together for ONE target size.
-
-    cons: [(parts, color_rgb, label), ...] from _fixture_constructions (decomposed
-    + label-cleaned once, target-independent). Renders every construction
-    INDEPENDENTLY on the shared (S, S) grid (per-feature, no cross-feature CSG
-    group collisions — the strip path's contract) and composites the
-    per-construction R1 masks in segment order (area-sorted upstream → smaller
-    features draw on top) into one final color icon.
-
-    Returns (masks, icon): masks = per-construction (target, target) uint8 {0,255}
-    R1 masks; icon = (target, target, 3) uint8 composited render. The tuple
-    (cons, masks, (S, S), target) is exactly what stage-4
-    refine.common.refine_outline consumes — this function IS the seam refine
-    touches up next."""
-    rrs = [r1_render(parts, (S, S), target) for parts, _c, _l in cons]
-    masks = _separate_divots([r.mask for r in rrs], cons, S)
-    icon = np.full((target, target, 3), _FX_BG, np.uint8)
-    for m, (_p, c, _l) in zip(masks, cons):
-        icon[m > 0] = c
-    return masks, icon
 
 
 def _final_product(stem: str, sizes: tuple[int, ...], twice: bool):
@@ -774,15 +728,15 @@ def _final_product(stem: str, sizes: tuple[int, ...], twice: bool):
         print(f"{stem}: no cached L2 segmentation under .cache/stages/ — "
               f"run the testbed/build first")
         return None
-    S, aligned, cons = _fixture_constructions(stem)
+    S, aligned, cons, src = _fixture_constructions(stem)
     if not cons:
         print(f"{stem}: nothing to render")
         return None
     panels = [labeled(_src_panel(aligned), f"{stem} aligned")]
     for t in sizes:
-        masks, _icon = assemble_render(cons, S, t)
+        masks, _icon, _accent = assemble_render(cons, S, t, src)
         if twice:
-            again, _ = assemble_render(cons, S, t)
+            again, _i2, _a2 = assemble_render(cons, S, t, src)
             same = all(np.array_equal(a, b) for a, b in zip(masks, again))
             print(f"  determinism({stem}@{t}): "
                   f"{'IDENTICAL' if same else 'MISMATCH'}")
@@ -913,18 +867,20 @@ def _process(name: str, builder, sizes: tuple[int, ...], degrees: bool,
 
 def _gate_table(all_stats: list[dict]) -> None:
     """Round-6 shipping gate, per-cell truth: one row per (fixture, T).
-    Green iff no LOSS, viol 0, strays 0, floor-or-drop, reg-audit ok.
-    Sym has no per-fixture expectation — the figma mirror guard prints
-    separately. Visual strip sign-off stays a human step (H1)."""
+    Green iff no LOSS, viol 0, strays 0, floor-or-drop, reg-audit ok, and the
+    EXPECTED_NOTCH floor holds (identity-notch witness; report-only column for
+    unlisted fixtures). Sym has no per-fixture expectation — the figma mirror
+    guard prints separately. Visual strip sign-off stays a human step (H1)."""
     gsizes = sorted({s["t"] for s in all_stats})
     print(f"\ngate table (feed res — fixtures x {{{','.join(map(str, gsizes))}}}):")
     print(f"  {'fixture':<10} {'T':>3}  {'Jratio':>10}  {'viol':>4}  "
-          f"{'strays':>6}  {'topo':>4}  {'floor':>5}  {'reg':>3}  verdict")
+          f"{'strays':>6}  {'topo':>4}  {'floor':>5}  {'reg':>3}  {'notch':>5}  verdict")
     green = 0
     for s in all_stats:
         ok = (s["ratio"] <= 1.0 and s["viol"] == 0
               and s.get("strays", 0) == 0 and s.get("topo_ok", True)
-              and s["floor_ok"] and s.get("reg_audit_ok", True))
+              and s["floor_ok"] and s.get("reg_audit_ok", True)
+              and s.get("notch_ok", True))
         green += ok
         print(f"  {s['name']:<10} {s['t']:>3}  {s['ratio']:>5.3f}"
               f"{' LOSS' if s['ratio'] > 1.0 else '     '}  "
@@ -932,6 +888,7 @@ def _gate_table(all_stats: list[dict]) -> None:
               f"{'ok' if s.get('topo_ok', True) else 'BAD':>4}  "
               f"{'ok' if s['floor_ok'] else 'MISS':>5}  "
               f"{'ok' if s.get('reg_audit_ok', True) else 'BAD':>3}  "
+              f"{s.get('notch', 0):>5}  "
               f"{'PASS' if ok else 'FAIL'}")
     print(f"  gate: {green}/{len(all_stats)} cells green")
 
@@ -944,9 +901,14 @@ def _all_cached() -> list[str]:
 
 
 def _half_cores() -> int:
-    """Half the host cores — the bounded thread/CPU budget for the fixture pool (a 16-core
-    box → 8). GPU offload is unavailable on this box (RX 580 / no ROCm), so CPU-parallel
-    across fixtures is the perf lever; each worker stays single-threaded for H8."""
+    """Worker budget for the fixture pool: ICONOGRAPH_JOBS when set (the same
+    env contract testbed._pool and refine_debug.main honor — the 25%-CPU sample
+    batches run at JOBS=4), else half the host cores (a 16-core box → 8). GPU
+    offload is unavailable on this box (RX 580 / no ROCm), so CPU-parallel
+    across fixtures is the perf lever; each worker stays single-threaded (H8)."""
+    env = os.environ.get("ICONOGRAPH_JOBS")
+    if env:
+        return max(1, int(env))
     return max(1, (os.cpu_count() or 2) // 2)
 
 

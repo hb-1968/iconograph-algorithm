@@ -46,14 +46,14 @@ from iconograph.application.compress.common import (  # noqa: E402
 from iconograph.application.compress.decompose import decompose_shape  # noqa: E402
 from iconograph.application.compress.diff_fit import refine_candidates  # noqa: E402
 from iconograph.application.compress.L2_feature_segment import Feature  # noqa: E402
-from iconograph.cache import CACHE_ROOT  # noqa: E402
+from iconograph.cache import CACHE_ROOT, FIXTURES_ROOT, TESTBED_ROOT  # noqa: E402
 from iconograph.debug_common import hstack as _hstack  # noqa: E402
 from iconograph.debug_common import labeled as _labeled  # noqa: E402
 from iconograph.debug_common import shrink  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-FIXTURES = REPO_ROOT / "fixtures"
-DUMP_DIR = REPO_ROOT / "testbed" / "diff_fit"
+FIXTURES = FIXTURES_ROOT   # env-overridable basis (ICONOGRAPH_FIXTURES)
+DUMP_DIR = TESTBED_ROOT / "diff_fit"
 
 DEFAULT_FIXTURES = ("homebrew", "mastodon", "vscode")
 PANEL_H = 420

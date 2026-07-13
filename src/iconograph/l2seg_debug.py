@@ -37,11 +37,11 @@ from iconograph.application.compress.L2_feature_segment import (  # noqa: E402
     segment_features,
 )
 from iconograph.application.compress.segment_prim_classify import Classified, L1Miss  # noqa: E402
-from iconograph.cache import cached  # noqa: E402
+from iconograph.cache import FIXTURES_ROOT, TESTBED_ROOT, cached  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-FIXTURES = REPO_ROOT / "fixtures"
-DUMP_DIR = REPO_ROOT / "testbed" / "L2_feature_segment"
+FIXTURES = FIXTURES_ROOT   # env-overridable basis (ICONOGRAPH_FIXTURES)
+DUMP_DIR = TESTBED_ROOT / "L2_feature_segment"
 CACHE = REPO_ROOT / ".cache" / "stages"
 
 

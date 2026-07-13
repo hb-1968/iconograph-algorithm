@@ -355,6 +355,46 @@ def _iou_bool(a: np.ndarray, b: np.ndarray) -> float:
     return inter / union if union else 0.0
 
 
+def _outer_bg(mask: np.ndarray) -> np.ndarray:
+    """Bool mask of the OUTER (border-connected) background — everything outside the
+    silhouette, excluding interior counters. Pad-by-1 border flood-fill from (0,0) —
+    the repo's ONE enclosure idiom (a bbox-touch exclusion test has a real edge case:
+    a component touching the border on one side while enclosing bg elsewhere). THE
+    single source (H5): refine.common re-exports it, cubify._is_open and the render
+    witness/curtain machinery consume it directly. Deterministic (H8)."""
+    m = (mask > 0).astype(np.uint8)
+    pad = cv2.copyMakeBorder(m, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    ff = np.zeros((pad.shape[0] + 2, pad.shape[1] + 2), np.uint8)
+    flooded = pad.copy()
+    cv2.floodFill(flooded, ff, (0, 0), 2)
+    return flooded[1:-1, 1:-1] == 2
+
+
+def _orbit(y: int, x: int, axes: list[tuple[bool, int]],
+           shape: tuple[int, int]) -> list[tuple[int, int]] | None:
+    """The mirror orbit of (y, x) under the exact axes (closure under _mirror_point),
+    row-major sorted; None when any orbit point falls off-canvas — a both-or-neither
+    carve/flip must never touch a pixel whose mirror partner doesn't exist
+    (deliberately the OPPOSITE convention from _flip_mask's zero-fill, which serves
+    whole-mask symmetrization). Shared by refine's paired passes and cubify's R6
+    dual-axis moves (H5)."""
+    pts = {(y, x)}
+    for vert, a2 in axes:
+        pts |= {_mirror_point(yy, xx, vert, a2) for yy, xx in pts}
+    if any(not (0 <= yy < shape[0] and 0 <= xx < shape[1]) for yy, xx in pts):
+        return None
+    return sorted(pts)
+
+
+def _mirror_point(y: int, x: int, vertical: bool, a2: int) -> tuple[int, int]:
+    """Reflect (y, x) about a half-px-snapped integer mirror axis: x reflects when
+    vertical (true axis = a2/2), else y. THE single source of the reflect-about-axis
+    formula (cubify._twin delegates; refine's mirror-orbit machinery calls it) —
+    parity note: even a2 has a genuine fixed row/col (a2 - i == i), odd a2 pairs every
+    pixel with a distinct partner. Integer-exact, H8-safe."""
+    return (y, a2 - x) if vertical else (a2 - y, x)
+
+
 def _nbcount(mask: np.ndarray) -> np.ndarray:
     """Per-pixel count (int16, 0..8) of FOREGROUND 8-neighbours, center excluded.
     BORDER_CONSTANT pads with 0 (off-canvas = background); normalise to {0,1} first."""

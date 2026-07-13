@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pickle
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -23,6 +24,21 @@ from typing import Any, Callable, Iterable
 _PKG_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT = _PKG_ROOT.parents[1]
 CACHE_ROOT = _REPO_ROOT / ".cache" / "stages"
+# The fixtures BASIS directory — overridable so an uncurated sample set
+# (fixtures-sample/, the real-world app-icon basis) can drive the testbed +
+# harnesses without touching the curated H9 fixtures/. Default (env unset) is
+# byte-identical to the historical constant. The stage cache namespace stays
+# SHARED (CACHE_ROOT keys by stem) — sample stems are reverse-DNS and cannot
+# collide with curated stems; sample runs use explicit stem lists.
+FIXTURES_ROOT = Path(os.environ.get("ICONOGRAPH_FIXTURES",
+                                    str(_REPO_ROOT / "fixtures")))
+# Testbed OUTPUT root, basis-aware: the default basis writes testbed/ as always;
+# an overridden basis (ICONOGRAPH_FIXTURES=fixtures-sample) writes under
+# testbed/<basis-name>/ so sample strips are FILTERABLE from the curated set's
+# (user directive 2026-07-11) and basis runs never overwrite each other's grids.
+TESTBED_ROOT = (_REPO_ROOT / "testbed"
+                if FIXTURES_ROOT == _REPO_ROOT / "fixtures"
+                else _REPO_ROOT / "testbed" / FIXTURES_ROOT.name)
 _APPLICATION_ROOT = _PKG_ROOT / "application"
 
 _code_version_cache: str | None = None

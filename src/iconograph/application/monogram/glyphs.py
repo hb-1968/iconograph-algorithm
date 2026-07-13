@@ -3,42 +3,84 @@
 A vector stroke font: each letter is a list of strokes, each stroke `(points, closed)`
 with `points` in normalized [0,1]^2 (x left->right, y top->bottom). `render_letter`
 scales the points to an arbitrary (w, h) box and rasterizes each stroke as a crisp 1px
-`cv2.LINE_8` polyline. Non-uniform stretch is free (x and y scale independently), so the
-same "D" fills a tall-narrow box or a squat-wide one.
+`cv2.LINE_4` polyline (4-connected — no diagonal-only cuts). Non-uniform stretch is free
+(x and y scale independently), so the same "D" fills a tall-narrow box or a squat-wide one.
 
-These are MINIMAL GEOMETRIC forms (per the user's ideal): a closed loop where the letter
-has a bowl (D, O), an open polyline otherwise (C, M, V, ...). They read by silhouette, not
-by typographic fidelity, and each is a continuous 1px stroke (snake-connectable in the
-future phase 5). NOT a bitmap (the old FONT_5X7/etc. upscale made thick FILLED strokes)
-and NOT TTF (counters -> multi-loop, and mush at small sizes).
+These are MINIMAL GEOMETRIC FRAME forms (per the user: "give every letter F's frame
+feature"): each hugs the canvas border on 2-3 sides + any divider strokes, so when stretched
+to fill the canvas it bounds ONE large open interior bay that can HOST the native logo + the
+partner letter (1px-separated). C/D/G/L/F are natural frames; M/V/S were reshaped (shallow M
+notch, wide-top V, blocky 3-bar S) to open a usable body. They read by silhouette, not by
+typographic fidelity, and each is a continuous 1px stroke (snake-connectable in the future
+phase 5). NOT a bitmap (the old FONT_5X7/etc. upscale made thick FILLED strokes) and NOT TTF
+(counters -> multi-loop, and mush at small sizes).
 
-Author fixture letters first (D,C,G,M,V,S,L,F + '?'); the rest fall back to '?' until A-Z
-is filled in.
+Full **A-Z** authored (+ '?' fallback). `render_letter` ends with `common.face_connect` to
+guarantee connectivity-4 even for narrow M/W/Q, where `skeletonize` (fired by the thickness
+guard) and LINE_4 vertices otherwise leave diagonal-only steps that split the glyph.
 """
 from __future__ import annotations
 
 import cv2
 import numpy as np
 
-# char -> list of (points, closed). points: list[(x, y)] in [0,1]^2.
+from iconograph.application.common import face_connect
+
+# char -> list of (points, closed). points: list[(x, y)] in [0,1]^2. Letters are RECTILINEAR
+# frame forms: predominantly HORIZONTAL / VERTICAL strokes (a diagonal only where the letter's
+# identity requires it — N, V, W, X, Z, K, R's leg). Straight strokes render crisp (no
+# staircase) and leave clean RECTANGULAR interior bays for the logo to weave into, per the user
+# ("letters should be almost entirely straight line renders … opens up better weaving").
 STROKES: dict[str, list[tuple[list[tuple[float, float]], bool]]] = {
-    # bowl letters: closed loops, flat/round sides distinguish D vs O
-    "D": ([([(0.0, 0.0), (0.7, 0.0), (1.0, 0.28), (1.0, 0.72), (0.7, 1.0), (0.0, 1.0)], True)]),
-    "O": ([([(0.3, 0.0), (0.7, 0.0), (1.0, 0.3), (1.0, 0.7), (0.7, 1.0),
-             (0.3, 1.0), (0.0, 0.7), (0.0, 0.3)], True)]),
-    # open-bowl letters
+    # bowls → near-rectangles with MINIMAL 1-step corner bevels (D flat-left, O symmetric)
+    "D": ([([(0.0, 0.0), (0.85, 0.0), (1.0, 0.2), (1.0, 0.8), (0.85, 1.0), (0.0, 1.0)], True)]),
+    "O": ([([(0.25, 0.0), (0.75, 0.0), (1.0, 0.25), (1.0, 0.75), (0.75, 1.0),
+             (0.25, 1.0), (0.0, 0.75), (0.0, 0.25)], True)]),
     "C": ([([(1.0, 0.0), (0.0, 0.0), (0.0, 1.0), (1.0, 1.0)], False)]),
     "G": ([([(1.0, 0.0), (0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.5), (0.5, 0.5)], False)]),
-    # open polylines
-    "M": ([([(0.0, 1.0), (0.0, 0.0), (0.5, 0.55), (1.0, 0.0), (1.0, 1.0)], False)]),
-    "V": ([([(0.0, 0.0), (0.5, 1.0), (1.0, 0.0)], False)]),
-    "S": ([([(1.0, 0.1), (0.2, 0.0), (0.0, 0.25), (0.25, 0.5), (0.75, 0.5),
-             (1.0, 0.75), (0.8, 1.0), (0.0, 0.9)], False)]),
-    "L": ([([(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)], False)]),
-    # F as a FRAME: spine full height + top bar + a HIGH full-width 2nd bar, opening a
-    # big lower body for the logo + other letter to nest in (matches the user's ideal).
+    "Q": ([([(0.25, 0.0), (0.75, 0.0), (1.0, 0.25), (1.0, 0.75), (0.75, 1.0),
+             (0.25, 1.0), (0.0, 0.75), (0.0, 0.25)], True),
+           ([(0.6, 0.7), (1.0, 1.0)], False)]),                        # O + a tail
+    # square bowls: spine + top bar + right vertical + mid bar → a clean rectangular lower bay
+    "P": ([([(0.0, 1.0), (0.0, 0.0), (0.9, 0.0), (0.9, 0.45), (0.0, 0.45)], False)]),
+    "R": ([([(0.0, 1.0), (0.0, 0.0), (0.9, 0.0), (0.9, 0.45), (0.0, 0.45)], False),
+           ([(0.4, 0.45), (1.0, 1.0)], False)]),                       # leg (the one R diagonal)
+    "B": ([([(0.0, 1.0), (0.0, 0.0), (0.9, 0.0), (0.9, 1.0)], True),   # 日 — two stacked bays
+           ([(0.0, 0.5), (0.9, 0.5)], False)]),
+    "U": ([([(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)], False)]),  # square cup
+    # ── spine-and-bar SKELETON frames (all H/V; the strongest hosts, like F) ────────────
+    "E": ([([(1.0, 0.0), (0.0, 0.0), (0.0, 1.0), (1.0, 1.0)], False),   # C + a mid-bar
+           ([(0.0, 0.5), (0.8, 0.5)], False)]),
     "F": ([([(1.0, 0.0), (0.0, 0.0), (0.0, 1.0)], False),
            ([(0.0, 0.25), (1.0, 0.25)], False)]),
+    "H": ([([(0.0, 0.0), (0.0, 1.0)], False),                          # two spines + crossbar
+           ([(1.0, 0.0), (1.0, 1.0)], False),
+           ([(0.0, 0.5), (1.0, 0.5)], False)]),
+    "T": ([([(0.0, 0.0), (1.0, 0.0)], False),                          # top bar + centre spine
+           ([(0.5, 0.0), (0.5, 1.0)], False)]),
+    "I": ([([(0.15, 0.0), (0.85, 0.0)], False),                        # serifed spine (thin)
+           ([(0.5, 0.0), (0.5, 1.0)], False),
+           ([(0.15, 1.0), (0.85, 1.0)], False)]),
+    "L": ([([(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)], False)]),
+    "S": ([([(1.0, 0.0), (0.0, 0.0), (0.0, 0.25), (1.0, 0.25), (1.0, 1.0), (0.0, 1.0)], False)]),
+    # A / M / Y → RECTILINEAR (Π + crossbar / Π + centre stub / bracket + stem) — big rect bays
+    "A": ([([(0.0, 1.0), (0.0, 0.0), (1.0, 0.0), (1.0, 1.0)], False),
+           ([(0.0, 0.55), (1.0, 0.55)], False)]),
+    "M": ([([(0.0, 1.0), (0.0, 0.0), (1.0, 0.0), (1.0, 1.0)], False),
+           ([(0.5, 0.0), (0.5, 0.45)], False)]),
+    "Y": ([([(0.0, 0.0), (0.0, 0.4), (1.0, 0.4), (1.0, 0.0)], False),
+           ([(0.5, 0.4), (0.5, 1.0)], False)]),
+    # inherently-diagonal letters — kept minimal (mostly vertical, a short converging point)
+    "N": ([([(0.0, 1.0), (0.0, 0.0), (1.0, 1.0), (1.0, 0.0)], False)]),
+    "V": ([([(0.0, 0.0), (0.0, 0.6), (0.5, 1.0), (1.0, 0.6), (1.0, 0.0)], False)]),
+    "W": ([([(0.0, 0.0), (0.0, 0.55), (0.25, 1.0), (0.5, 0.5), (0.75, 1.0),
+             (1.0, 0.55), (1.0, 0.0)], False)]),
+    "K": ([([(0.0, 0.0), (0.0, 1.0)], False),                          # spine + two arms
+           ([(1.0, 0.0), (0.0, 0.5), (1.0, 1.0)], False)]),
+    "X": ([([(0.0, 0.0), (1.0, 1.0)], False),
+           ([(1.0, 0.0), (0.0, 1.0)], False)]),
+    "Z": ([([(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)], False)]),
+    "J": ([([(1.0, 0.0), (1.0, 0.9), (0.5, 1.0), (0.1, 0.9), (0.1, 0.75)], False)]),
     "?": ([([(0.1, 0.2), (0.5, 0.0), (0.9, 0.2), (0.5, 0.5), (0.5, 0.62)], False),
            ([(0.5, 0.82), (0.5, 0.9)], False)]),
 }
@@ -68,7 +110,11 @@ def render_letter(ch: str, w: int, h: int) -> np.ndarray:
     if np.any((nb >= 9) & m):
         from skimage.morphology import skeletonize
         m = skeletonize(m)
-    return m
+    # Guarantee FACE-connectivity (connectivity-4): skeletonize's 8-connected output and LINE_4
+    # segments meeting at a sharp vertex can leave diagonal-only steps that split a narrow
+    # M/W/Q under connectivity-4 (compose's `_singly_connected` gate + the phase-5 snake need
+    # 4-conn). A no-op on the already-4-connected raster → existing letters stay byte-identical.
+    return face_connect(m)
 
 
 def _ascii(mask: np.ndarray) -> str:

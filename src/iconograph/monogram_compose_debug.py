@@ -40,15 +40,18 @@ from PIL import Image  # noqa: E402
 
 from iconograph.application.common import masks_8adjacent  # noqa: E402
 from iconograph.application.monogram.compose import compose_icon  # noqa: E402
+from iconograph.application.monogram.connect import connect_snake, join_report  # noqa: E402
 from iconograph.application.monogram.common import select_monogram_letters  # noqa: E402
-from iconograph.application.refine.common import refine_perimeter  # noqa: E402
+from iconograph.application.pipeline import build_outlines  # noqa: E402
 from iconograph.debug_common import hstack, labeled  # noqa: E402
-from iconograph.render_debug import _fixture_constructions, assemble_render  # noqa: E402
+from iconograph.render_debug import _fixture_constructions  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-FIXTURES = REPO_ROOT / "fixtures"
+from iconograph.cache import FIXTURES_ROOT, TESTBED_ROOT  # noqa: E402
+
+FIXTURES = FIXTURES_ROOT   # env-overridable basis (ICONOGRAPH_FIXTURES)
 NAMES_JSON = FIXTURES / "names.json"
-DUMP_DIR = REPO_ROOT / "testbed" / "monogram"
+DUMP_DIR = TESTBED_ROOT / "monogram"
 OCACHE = REPO_ROOT / ".cache" / "monogram_outlines"
 
 DEFAULT_FIXTURES = ("discord", "gmail", "vscode", "claude", "figma")
@@ -62,16 +65,10 @@ def _load_names() -> dict[str, str]:
 
 def _compute_outlines(stem: str) -> dict[int, np.ndarray]:
     """{T: (T,T) uint8 {0,255} stage-4 refined 1-px outline} for T in {16,24}.
-    Slow — decompose + render + refine. @16 is seeded with the @24 silhouette."""
-    S, _aligned, cons = _fixture_constructions(stem)
-    masks24, _ = assemble_render(cons, S, 24)
-    sil24 = np.zeros((24, 24), np.uint8)
-    for m in masks24:
-        sil24 |= m
-    out24 = refine_perimeter(cons, masks24, (S, S), 24)
-    masks16, _ = assemble_render(cons, S, 16)
-    out16 = refine_perimeter(cons, masks16, (S, S), 16, structure_ref=sil24)
-    return {16: out16, 24: out24}
+    Slow — decompose + render + refine. Delegates to the PRODUCTION path
+    (application.pipeline.build_outlines — one implementation, harness consumes)."""
+    S, _aligned, cons, src = _fixture_constructions(stem)
+    return build_outlines(cons, S, src)
 
 
 def _outlines(stem: str, fresh: bool) -> dict[int, np.ndarray]:
@@ -129,9 +126,14 @@ def _process(stem: str, names: dict[str, str], fresh: bool, twice: bool) -> list
         sep_gl = not masks_8adjacent(res.letters, res.logo)   # letters <-> logo
         sep_ll = _letters_separated(res, N)                   # letter  <-> letter
         both = res.l1 is not None and res.l2 is not None
+        snake = connect_snake(res.union)                       # phase 5 op-1: connect the pieces
+        snake_conn = _singly_connected(snake)                  # ONE 4-connected stroke = success
+        nj, nc = join_report(res.union)                        # report-only: T-free-join rate
+        joins = f"{nc}/{nj}" if nj else "-"                    # (connectivity gate can't see this)
         det_ok = True
         if twice:
-            det_ok = bool(np.array_equal(res.canvas, compose_icon(outline, mono, N).canvas))
+            det_ok = bool(np.array_equal(res.canvas, compose_icon(outline, mono, N).canvas)
+                          and np.array_equal(snake, connect_snake(res.union)))
             print(f"  determinism({stem}@{N}): {'IDENTICAL' if det_ok else 'MISMATCH'}")
         onepx = _onepx(res.letters)                            # LETTERS <=1px (I render them;
         #                            the native logo's own 1px-ness is stage-4 refine's concern)
@@ -140,9 +142,10 @@ def _process(stem: str, names: dict[str, str], fresh: bool, twice: bool) -> list
         conn = ((res.l1 is None or _singly_connected(res.l1.mask))
                 and (res.l2 is None or _singly_connected(res.l2.mask)))
         sz = f"{res.l1.w}x{res.l1.h}/{res.l2.w}x{res.l2.h}" if both else "-"
-        stats.append((stem, T, N, mono, sep_gl, sep_ll, both, det_ok, onepx, conn, sz))
+        stats.append((stem, T, N, mono, res.layout, sep_gl, sep_ll, both, det_ok, onepx, conn, snake_conn, joins, sz))
         panels.append(labeled(_up(_vis(outline)), f"outline@{T}"))
         panels.append(labeled(_up(res.canvas), f"{mono} @{N}"))
+        panels.append(labeled(_up(_vis(snake)), f"snake @{N}"))
     DUMP_DIR.mkdir(parents=True, exist_ok=True)
     Image.fromarray(hstack(panels), "RGB").save(DUMP_DIR / f"{stem}.png", "PNG", optimize=True)
     return stats
@@ -151,10 +154,11 @@ def _process(stem: str, names: dict[str, str], fresh: bool, twice: bool) -> list
 def main(argv: list[str]) -> int:
     twice = "--twice" in argv
     fresh = "--fresh" in argv
-    argv = [a for a in argv if a not in ("--twice", "--fresh")]
+    allf = "--all" in argv                                  # every fixture in names.json
+    argv = [a for a in argv if a not in ("--twice", "--fresh", "--all")]
     cv2.setNumThreads(1)
     names = _load_names()
-    wanted = argv or list(DEFAULT_FIXTURES)
+    wanted = sorted(names) if allf else (argv or list(DEFAULT_FIXTURES))
     all_stats: list[tuple] = []
     for stem in wanted:
         try:
@@ -162,15 +166,15 @@ def main(argv: list[str]) -> int:
         except Exception as e:  # noqa: BLE001 — debug harness: report and continue
             print(f"{stem}: ERROR {type(e).__name__}: {e}")
 
-    print(f"\n{'fixture':<12} {'T→N':<7} {'mono':<5} {'sep':<4} {'both':<5} {'det':<4} "
-          f"{'1px':<4} {'conn':<5} box(w×h)")
+    print(f"\n{'fixture':<12} {'T→N':<7} {'mono':<5} {'layout':<9} {'sep':<4} {'both':<5} "
+          f"{'det':<4} {'1px':<4} {'conn':<5} {'snake':<6} {'joins':<6} box(w×h)")
     ok = True
-    for stem, T, N, mono, sep_gl, sep_ll, both, det_ok, onepx, conn, sz in all_stats:
+    for stem, T, N, mono, layout, sep_gl, sep_ll, both, det_ok, onepx, conn, snake_conn, joins, sz in all_stats:
         sep = "OK" if (sep_gl and sep_ll) else "BAD"
-        print(f"{stem:<12} {f'{T}→{N}':<7} {mono:<5} {sep:<4} {str(both):<5} "
+        print(f"{stem:<12} {f'{T}→{N}':<7} {mono:<5} {layout:<9} {sep:<4} {str(both):<5} "
               f"{'OK' if det_ok else 'BAD':<4} {'OK' if onepx else 'BAD':<4} "
-              f"{'OK' if conn else 'BAD':<5} {sz}")
-        ok = ok and sep_gl and sep_ll and both and det_ok and onepx and conn
+              f"{'OK' if conn else 'BAD':<5} {'OK' if snake_conn else 'BAD':<6} {joins:<6} {sz}")
+        ok = ok and sep_gl and sep_ll and both and det_ok and onepx and conn and snake_conn
     print(f"\n{'ALL CLAUSES OK — separation (L↔logo + L↔L) + both letters + determinism'
           if ok else '*** FAILURES PRESENT ***'}")
     return 0 if ok else 1

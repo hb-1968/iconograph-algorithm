@@ -51,13 +51,13 @@ from iconograph.application.compress.L3_fit import (  # noqa: E402
     draw_fit_overlay,
     fit_features,
 )
-from iconograph.cache import cached  # noqa: E402
+from iconograph.cache import FIXTURES_ROOT, TESTBED_ROOT, cached  # noqa: E402
 from iconograph.debug_common import hstack as _hstack  # noqa: E402
 from iconograph.debug_common import labeled as _labeled  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-FIXTURES = REPO_ROOT / "fixtures"
-DUMP_DIR = REPO_ROOT / "testbed" / "L3_fit"
+FIXTURES = FIXTURES_ROOT   # env-overridable basis (ICONOGRAPH_FIXTURES)
+DUMP_DIR = TESTBED_ROOT / "L3_fit"
 CACHE = REPO_ROOT / ".cache" / "stages"
 
 DEFAULT_FIXTURES = ("android-head_flat", "gmail", "obsidian")

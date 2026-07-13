@@ -44,6 +44,7 @@ limit by transforming the Parts and RE-RENDERING, not by re-stamping the mask.
 Deterministic (H8): no RNG, fixed candidate-angle order, float64 rotation math,
 integer mirror; render_debug is itself deterministic. When no gate fires the output
 is value-identical to the input. The single public export is cleanup_scene.
+
 """
 from __future__ import annotations
 
@@ -68,12 +69,17 @@ from iconograph.application.compress.common import (
     _compound_mask,
     _iou_bool,
     _mirror_axis,
+    _mirror_point,
     _nb4count,
+    _orbit,
+    _outer_bg,
     _scale,
     _snap,
 )
 from iconograph.application.compress.render import (
+    SYM_AXIS_SEARCH,
     SYM_AXIS_TOL_DEG,
+    _best_flip_axis,
     _flip_mask,
     _topology,
     floor_for,
@@ -81,12 +87,20 @@ from iconograph.application.compress.render import (
     reference_mask,
     render_debug,
 )
+from iconograph.application.common import masks_8adjacent, mst_bridges, nearest_gap
+from iconograph.application.compress.cubify import (
+    _glyph_stroke_relayout,
+    _map_coords,
+    glyph_channel,
+)
 from iconograph.application.compress.straighten import translate_prim
 from scipy.signal import find_peaks
 from skimage.morphology import medial_axis
 
 SYM_OK = 0.95                # render already this self-symmetric → leave it (vscode)
-SYM_AXIS_SEARCH = 6          # ± half-px steps searched for the true flip axis
+# SYM_AXIS_SEARCH + _best_flip_axis: LIFTED to compress/render.py (H5 — cubify's R6
+# dual-axis detection shares them); imported above, same names and semantics.
+# _orbit: LIFTED to compress/common.py alongside _mirror_point for the same reason.
 
 
 def _scene_axis(constructions: list[tuple[list[Part], tuple, str]],
@@ -111,23 +125,6 @@ def _scene_axis(constructions: list[tuple[list[Part], tuple, str]],
     if abs(float(u[1])) <= tol:
         return False
     return None
-
-
-def _best_flip_axis(u_mask: np.ndarray, vertical: bool) -> tuple[int, float] | None:
-    """Search a ±SYM_AXIS_SEARCH half-px window (±3 px) around the silhouette's own
-    centre for the integer flip axis a2 maximising IoU(U, flip(U)) — aligning the mirror
-    with what was drawn. Returns (a2, best_iou) or None on an empty mask."""
-    ys, xs = np.nonzero(u_mask)
-    if xs.size == 0:
-        return None
-    centre = float(xs.mean()) if vertical else float(ys.mean())
-    a2c = int(round(2.0 * centre))
-    best: tuple[int, float] | None = None
-    for a2 in range(a2c - SYM_AXIS_SEARCH, a2c + SYM_AXIS_SEARCH + 1):
-        iou = _iou_bool(u_mask, _flip_mask(u_mask, a2, vertical))
-        if best is None or iou > best[1]:
-            best = (a2, iou)
-    return best
 
 
 def _half_mirror(m: np.ndarray, a2: int, vertical: bool) -> np.ndarray:
@@ -760,6 +757,9 @@ def _diag_fill(b: np.ndarray, s: np.ndarray) -> np.ndarray:
     s_tl, s_tr = s[:-1, :-1], s[:-1, 1:]
     s_bl, s_br = s[1:, :-1], s[1:, 1:]
     fill = np.zeros_like(b)
+    # The corner DOCTRINE below (interior first, deterministic exterior fallback) has ONE
+    # scalar source of truth: _diag_corners — the vectorized expressions here must stay
+    # equivalent to it (the pocket-averse path's byte-identity rests on that equivalence).
     # pat_a → fill TR if interior (or both-exterior fallback), else BL (the interior one)
     fill[:-1, 1:] |= pat_a & (s_tr | ~s_bl)
     fill[1:, :-1] |= pat_a & ~s_tr & s_bl
@@ -769,21 +769,104 @@ def _diag_fill(b: np.ndarray, s: np.ndarray) -> np.ndarray:
     return fill
 
 
+def _diag_touch_list(fg: np.ndarray) -> list[tuple[int, int, str]]:
+    """Row-major sorted diagonal-only 2x2 touches of a bool mask, as (r, c, kind):
+    kind 'a' = own ink on the ╲ diagonal (empty TR/BL), 'b' = on the ╱ (empty TL/BR).
+    THE shared touch enumeration for _connect_averse and connect_disjoint_paired (H5)."""
+    tl, tr = fg[:-1, :-1], fg[:-1, 1:]
+    bl, br = fg[1:, :-1], fg[1:, 1:]
+    return sorted(
+        [(int(r), int(c), "a") for r, c in np.argwhere(tl & br & ~tr & ~bl)]
+        + [(int(r), int(c), "b") for r, c in np.argwhere(tr & bl & ~tl & ~br)])
+
+
+def _diag_corners(r: int, c: int, kind: str, sil: np.ndarray) -> tuple[tuple, tuple]:
+    """Scalar form of _diag_fill's corner doctrine — the SINGLE source of the interior/
+    exterior choice for a diagonal-only 2x2 touch anchored at (r, c): returns
+    (d_int, d_ext) where d_int is the corner _diag_fill would fill (interior preferred,
+    deterministic exterior fallback) and d_ext the other empty corner. kind 'a' = own ink
+    on the ╲ diagonal (empty TR/BL); 'b' = own ink on the ╱ diagonal (empty TL/BR)."""
+    if kind == "a":
+        return (((r, c + 1), (r + 1, c)) if (sil[r, c + 1] or not sil[r + 1, c])
+                else ((r + 1, c), (r, c + 1)))
+    return (((r, c), (r + 1, c + 1)) if (sil[r, c] or not sil[r + 1, c + 1])
+            else ((r + 1, c + 1), (r, c)))
+
+
 def connect_disjoint(outline: np.ndarray, silhouette: np.ndarray, target: int,
-                     max_passes: int = PERIM_MAX_PASSES) -> np.ndarray:
+                     max_passes: int = PERIM_MAX_PASSES,
+                     pocket_averse: bool = False) -> np.ndarray:
     """Make the perimeter FACE-connected (4-connectivity): fill ONE pixel per diagonal-only
     corner touch, interior side preferred. Iterates to a fixpoint (a fill can create a new
     neighbouring touch) capped at max_passes. Additive only — never removes a pixel, so it
     can never open a seam; a no-diagonal outline is a byte-identical no-op (zero regression).
     outline / silhouette: (target,target) uint8 {0,255}. Returns (target,target) uint8.
-    Deterministic (H8)."""
+    Deterministic (H8).
+
+    pocket_averse=True switches to the POCKET-AVERSE variant (the tight-wireframe
+    doctrine: corner connections on the OUTSIDE instead of the inside): per touch, when
+    the default interior fill would shrink/seal a TIGHT pocket, the EXTERIOR empty corner
+    is filled instead — accepted only when it is background, adds no 2x2 blot, gains no
+    foreign 4-adjacency beyond the touch's own two pixels, and strictly reduces the
+    diagonal-only touch count; otherwise the interior fill proceeds as today. The averse
+    variant must ONLY ship through perimeter_ring's arbitration (un-arbitrated it can
+    redirect reopen_channels' carving and CREATE tight pockets — mathematica@16)."""
     out = outline > 0
     sil = silhouette > 0
+    if pocket_averse:
+        return _connect_averse(out, sil, max_passes)
     for _ in range(max_passes):
         fill = _diag_fill(out, sil)
         if not fill.any():
             break
         out = out | fill
+    return (out * 255).astype(np.uint8)
+
+
+def _connect_averse(out: np.ndarray, sil: np.ndarray, max_passes: int) -> np.ndarray:
+    """Scalarized pocket-averse body of connect_disjoint (see its docstring). Enumerates
+    each pass's diagonal-only touches row-major from the pass-start snapshot and applies
+    the IDENTICAL corner choice as _diag_fill unless the swap conditions hold, so cells
+    with no swap are byte-identical to the vectorized path by construction. H8."""
+    h, w = out.shape
+    for _ in range(max_passes):
+        touches = _diag_touch_list(out)
+        if not touches:
+            break
+        any_fill = False
+        for r, c, k in touches:
+            own = ((r, c), (r + 1, c + 1)) if k == "a" else ((r, c + 1), (r + 1, c))
+            d_int, d_ext = _diag_corners(r, c, k, sil)     # the shared corner doctrine
+            if out[d_int]:                                 # already repaired this pass
+                continue
+            trial = out.copy()
+            trial[d_int] = True
+            seals_tight = any(
+                _is_tight(area, ph, pw)
+                and any(abs(d_int[0] - py) + abs(d_int[1] - px) == 1 for py, px in cells)
+                for cells, area, ph, pw, _t, _l in _enclosed_bg(trial))
+            if not seals_tight:                            # today's behaviour, verbatim
+                out[d_int] = True
+                any_fill = True
+                continue
+            ok = not out[d_ext]
+            if ok:
+                ext_trial = out.copy()
+                ext_trial[d_ext] = True
+                ok = (int(np.count_nonzero(_block_corners(ext_trial)))
+                      <= int(np.count_nonzero(_block_corners(out))))
+                if ok:
+                    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        q = (d_ext[0] + dy, d_ext[1] + dx)
+                        if 0 <= q[0] < h and 0 <= q[1] < w and out[q] and q not in own:
+                            ok = False                     # foreign 4-adjacency
+                            break
+                if ok and _diag_touches(ext_trial) >= _diag_touches(out):
+                    ok = False                             # must strictly reduce touches
+            out[d_ext if ok else d_int] = True
+            any_fill = True
+        if not any_fill:
+            break
     return (out * 255).astype(np.uint8)
 
 
@@ -830,15 +913,9 @@ def _significant_holes(mask: np.ndarray, min_feat: int) -> list[np.ndarray]:
             if min(int(st[i, cv2.CC_STAT_WIDTH]), int(st[i, cv2.CC_STAT_HEIGHT])) >= min_feat]
 
 
-def _outer_bg(mask: np.ndarray) -> np.ndarray:
-    """Bool mask of the OUTER (border-connected) background — everything outside the silhouette,
-    excluding interior counters. Border flood-fill (the complement of _significant_holes' bg)."""
-    m = (mask > 0).astype(np.uint8)
-    pad = cv2.copyMakeBorder(m, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
-    ff = np.zeros((pad.shape[0] + 2, pad.shape[1] + 2), np.uint8)
-    flooded = pad.copy()
-    cv2.floodFill(flooded, ff, (0, 0), 2)               # border-connected bg → 2
-    return flooded[1:-1, 1:-1] == 2
+# _outer_bg: LIFTED to compress/common.py (H5 — cubify._is_open and the render-tier
+# witness/curtain machinery share it); imported above with the same name and
+# semantics (the complement of _significant_holes' enclosed bg).
 
 
 def _wall(fg: np.ndarray, hole: np.ndarray, outer_bg: np.ndarray) -> int:
@@ -858,6 +935,351 @@ def _wall(fg: np.ndarray, hole: np.ndarray, outer_bg: np.ndarray) -> int:
             return int(max(fg.shape))
         grown = grown | nxt
     return int(max(fg.shape))
+
+
+CHANNEL_MAX_PASSES = 16   # tunnel/carve fixpoint cap (a carve can expose the next candidate)
+TIGHT_MAX_AREA = 4        # enclosed-bg pockets at/under this area = TIGHT (wireframe too tight)
+TIGHT_SLIT_LEN = 3        # 1xN enclosed runs with N >= this = hollow-3px-stroke middles (intended)
+RELIEF_MAX_PASSES = 3     # a 1x1 pocket exits the tight class in <= 3 outward moves (1x1->2x3)
+
+
+def _enclosed_bg(ring: np.ndarray) -> list[tuple]:
+    """Non-border enclosed background components of a ring image under 4-connectivity,
+    row-major by bbox: [(cells frozenset{(y,x)}, area, h, w, top, left), ...]. Border-
+    label exclusion drops the outer background; 4-conn background cannot leak through a
+    diagonal-only ink touch, so enclosure is stable across connect_disjoint passes. H8."""
+    bg = (~(ring > 0)).astype(np.uint8)
+    n, lbl, st, _c = cv2.connectedComponentsWithStats(bg, connectivity=4)
+    border = set(np.unique(lbl[0, :])) | set(np.unique(lbl[-1, :])) \
+        | set(np.unique(lbl[:, 0])) | set(np.unique(lbl[:, -1]))
+    out = []
+    for i in range(1, n):
+        if i in border:
+            continue
+        out.append((frozenset(map(tuple, np.argwhere(lbl == i))),
+                    int(st[i, cv2.CC_STAT_AREA]),
+                    int(st[i, cv2.CC_STAT_HEIGHT]), int(st[i, cv2.CC_STAT_WIDTH]),
+                    int(st[i, cv2.CC_STAT_TOP]), int(st[i, cv2.CC_STAT_LEFT])))
+    return sorted(out, key=lambda c: (c[4], c[5]))
+
+
+def _is_tight(area: int, h: int, w: int) -> bool:
+    """TIGHT = a too-small enclosed white pocket. A 1xN run with N >= TIGHT_SLIT_LEN is
+    the INTENDED middle of a hollow 3px stroke, never tight (a 1xN with N < TIGHT_SLIT_LEN
+    is already area <= TIGHT_MAX_AREA, so no separate slit-area clause is needed)."""
+    if min(h, w) == 1 and max(h, w) >= TIGHT_SLIT_LEN:
+        return False
+    return area <= TIGHT_MAX_AREA
+
+
+def count_tight_pockets(ring: np.ndarray) -> int:
+    """Number of TIGHT enclosed pockets in a ring — the tight-wireframe gate metric
+    (0 = every enclosed white region is a legitimate counter or hollow-stroke middle)."""
+    return sum(1 for _cells, area, h, w, _t, _l in _enclosed_bg(ring)
+               if _is_tight(area, h, w))
+
+
+def count_tight_ref(ring: np.ndarray, reference: np.ndarray,
+                    protected: np.ndarray | None = None) -> int:
+    """count_tight_pockets EXCLUDING pockets overlapping a (1px-dilated) REFERENCE hole:
+    a counter the ideal geometry prescribes (discord's eyes) is a RESTORED FEATURE, not
+    wireframe tightness — the raw tight count rises when such a counter comes back, which
+    is exactly the metric artifact this ref-aware sibling exists to remove. Dilated 1px
+    because unblot legally moves a counter one pixel off its reference position. The gate
+    metric of the detail-retention rework; perimeter_ring's internal arbitration keeps
+    the RAW count (a ref-blind tail must not chase reference alignment).
+
+    `protected` (assemble_render's accent zone) additionally excludes pockets fully under
+    its 1px dilation — the same exclusion shape as the ref-hole clause: instagram@24's
+    3x3-OUTLINE dot carries a DELIBERATE 1x1 interior hole (user-ratified form) whose
+    canonical is a solid circle, so no reference hole can ever back it; charging it as
+    wireframe tightness would misread a designed accent as a defect."""
+    rz0 = np.zeros(ring.shape, np.uint8)
+    for cells, *_r in _enclosed_bg(reference):
+        for c in cells:
+            rz0[c] = 255
+    rz = cv2.dilate(rz0, _SE3, borderType=cv2.BORDER_CONSTANT, borderValue=0) > 0
+    if protected is not None and protected.any():
+        pz = cv2.dilate((protected > 0).astype(np.uint8), _SE3,
+                        borderType=cv2.BORDER_CONSTANT, borderValue=0) > 0
+        rz = rz | pz
+    return sum(1 for cells, area, h, w, _t, _l in _enclosed_bg(ring)
+               if _is_tight(area, h, w) and not any(rz[c] for c in cells))
+
+
+def _retention_violation(before: np.ndarray, after: np.ndarray,
+                         reference: np.ndarray | None) -> np.ndarray:
+    """Bool mask of REFERENCE-SUPPORTED ink of `before` whose 3x3-local ink `after`
+    lost — whole-feature deletion scores here (android's antennae); a legit 2px->1px
+    thin does not (the surviving offset is adjacent). THE single source of the
+    retention formula (H5): _retention_loss / _retention_comp_max / the harness's
+    ret column all reduce this mask."""
+    if reference is None:
+        return np.zeros(before.shape, bool)
+    removed = (before > 0) & (reference > 0)
+    has = cv2.dilate(after, _SE3, borderType=cv2.BORDER_CONSTANT, borderValue=0) > 0
+    return removed & ~has
+
+
+def _retention_loss(before: np.ndarray, after: np.ndarray,
+                    reference: np.ndarray | None) -> int:
+    """Count of retention-violation px (see _retention_violation)."""
+    return int(np.count_nonzero(_retention_violation(before, after, reference)))
+
+
+def _retention_comp_max(before: np.ndarray, after: np.ndarray,
+                        reference: np.ndarray | None) -> int:
+    """Largest 8-connected component of the retention violation — the accent-budget
+    unit: several sub-budget minority-accent drops are dual-axis symmetrization's
+    normal job; ONE feature-sized ref-supported loss is destruction."""
+    viol = _retention_violation(before, after, reference).astype(np.uint8)
+    if not viol.any():
+        return 0
+    n, _l, st, _c = cv2.connectedComponentsWithStats(viol, connectivity=8)
+    return max(int(st[i, cv2.CC_STAT_AREA]) for i in range(1, n))
+
+
+def _diag_touches(fg: np.ndarray) -> int:
+    """Count of diagonal-only 2x2 touches (the material connect_disjoint repairs) — a
+    'must not increase' guard for the relief/averse moves."""
+    tl, tr = fg[:-1, :-1], fg[:-1, 1:]
+    bl, br = fg[1:, :-1], fg[1:, 1:]
+    return int(np.count_nonzero(tl & br & ~tr & ~bl)
+               + np.count_nonzero(tr & bl & ~tl & ~br))
+
+
+def _clean_loop_counter(fg: np.ndarray, cells: frozenset) -> bool:
+    """True when `cells` (an enclosed pocket) is the interior of an INTENDED outlined
+    dot/ring: its surrounding ink is ONE component, that component is a pure degree-2
+    loop (every px exactly two 4-neighbours), and the pocket is the loop's sole hole
+    (adobe's i-dot, linkedin's box corner, figma's ring dot). Such pockets are glyph
+    features — the relief pass must never inflate them."""
+    h, w = fg.shape
+    n, lbl = cv2.connectedComponents(fg.astype(np.uint8), connectivity=8)
+    comp_ids = set()
+    for (py, px) in cells:
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            qy, qx = py + dy, px + dx
+            if 0 <= qy < h and 0 <= qx < w and fg[qy, qx]:
+                comp_ids.add(int(lbl[qy, qx]))
+    if len(comp_ids) != 1:
+        return False
+    comp = lbl == comp_ids.pop()
+    deg = _nb4count((comp * 255).astype(np.uint8))
+    if not bool(np.all(deg[comp] == 2)):
+        return False
+    holes = _enclosed_bg((comp * 255).astype(np.uint8))
+    return len(holes) == 1 and holes[0][0] == cells
+
+
+def _block_corners(f: np.ndarray) -> np.ndarray:
+    """(H-1, W-1) bool map of 2x2 all-foreground windows (top-left anchored) — the ONE
+    canonical "blot" primitive: a 2px smudge in 1px line art is exactly such a window.
+    Shared by _blot2x2 (count) and _block_spread (corner spread) per H5."""
+    return f[:-1, :-1] & f[1:, :-1] & f[:-1, 1:] & f[1:, 1:]
+
+
+def _block_spread(f: np.ndarray) -> np.ndarray:
+    """True where a pixel participates in ANY 2x2 all-ink block — _block_corners spread
+    back onto its four corners. Shared by reopen_channels and the mirror-paired carve
+    variants (H5 — one copy, was an inline closure)."""
+    blk = _block_corners(f)
+    out = np.zeros_like(f)
+    out[:-1, :-1] |= blk
+    out[1:, :-1] |= blk
+    out[:-1, 1:] |= blk
+    out[1:, 1:] |= blk
+    return out
+
+
+def reopen_channels(ring: np.ndarray, target: int) -> np.ndarray:
+    """NEGATIVE-SPACE continuity, ring tier: carve chain-blot ink out of the final
+    face-connected outline. Where band bends / bunched strokes fuse the two rails
+    (chrome@16's annulus, firefox@16's crescent bend), the ring contains 2x2 all-ink
+    blocks that chop the white channel between rails into pockets. Greedily remove
+    blot px (px inside a 2x2 block) that touch background (4-neighbour or canvas
+    border — carving only ever EXTENDS existing negative space, so no new pinholes),
+    guarded so the ink's face-connected component count never rises. Clean 1px
+    linework has no 2x2 blocks, so counters drawn as clean loops (discord's eyes) are
+    untouchable by construction. Fixpoint to CHANNEL_MAX_PASSES. Deterministic (H8:
+    row-major carve order)."""
+    if not ring.any():
+        return ring
+    base_c4 = cv2.connectedComponents(ring, connectivity=4)[0] - 1
+    # Delegates to the shared _orbit_carve with EMPTY axes (one-point orbits) — the
+    # identical fixpoint carve; carving is ink-monotonic, so the orbit loop's
+    # per-candidate nb<4 re-check can never reject a pass-start candidate (H5: one
+    # carve loop for the unpaired, paired and fold-repair passes).
+    return _orbit_carve(
+        ring.copy(), [],
+        lambda trial: cv2.connectedComponents(trial, connectivity=4)[0] - 1 <= base_c4)
+
+
+_RELIEF_DIRS = (("up", (-1, 0)), ("down", (1, 0)), ("left", (0, -1)), ("right", (0, 1)))
+
+
+def _relief_accept(trial: np.ndarray, base_c4: int, base_blot: int, base_diag: int,
+                   n_encl: int, grown: frozenset,
+                   grown2: frozenset | None = None) -> list | None:
+    """The relief structural-accept GAUNTLET — THE single source for both relief twins
+    (H5): ink c4-component count exactly unchanged, no new 2x2 blot, diagonal-only
+    touches not increased, enclosed-pocket count unchanged, and the relieved pocket(s)
+    == old + wall exactly (grow, never merge; the paired twin checks its partner via
+    grown2). Returns the trial's enclosed-bg list on pass, None on any reject."""
+    if cv2.connectedComponents(trial.astype(np.uint8), connectivity=4)[0] - 1 != base_c4:
+        return None
+    if int(np.count_nonzero(_block_corners(trial))) > base_blot:
+        return None
+    if _diag_touches(trial) > base_diag:
+        return None
+    tps = _enclosed_bg((trial * 255).astype(np.uint8))
+    if len(tps) != n_encl:
+        return None
+    if not any(cc[0] == grown for cc in tps):
+        return None
+    if grown2 is not None and not any(cc[0] == grown2 for cc in tps):
+        return None
+    return tps
+
+
+def _relief_cand(cur: np.ndarray, outer: np.ndarray, wall: list, di: int,
+                 dy: int, dx: int, py0: int, px0: int, ph: int, pw: int,
+                 scy: float, scx: float, trial: np.ndarray) -> tuple:
+    """The relief RANKING tuple (grows-short-dim, outward clearance capped 3,
+    mirror-invariant outwardness, fixed direction index, trial) — THE shared ranking
+    construction for relieve_tight_pockets and its paired variant (H5)."""
+    h, w = cur.shape
+    clr = 3                                                # outward clearance, capped
+    for (y, x) in wall:
+        run = 0
+        for d2 in range(2, 5):
+            q = (y + dy * d2, x + dx * d2)
+            if 0 <= q[0] < h and 0 <= q[1] < w and not cur[q] and outer[q]:
+                run += 1
+            else:
+                break
+        clr = min(clr, 1 + run)
+    outw = dy * ((py0 + ph / 2.0) - scy) + dx * ((px0 + pw / 2.0) - scx)
+    grows_short = 1 if ((ph < pw and dy != 0) or (pw < ph and dx != 0)
+                        or ph == pw) else 0
+    return (grows_short, clr, outw, -di, trial)
+
+
+def _pocket_move(cur: np.ndarray, cells: frozenset, dname: str,
+                 outer: np.ndarray) -> tuple[np.ndarray, frozenset, list] | None:
+    """One directional wall-move OFFER for tight-pocket relief — THE single source of
+    the relief geometry chain (flat contiguous wall -> free-exterior outward -> outer-
+    position corner connectors -> 1px foreign-ink separation), shared by
+    relieve_tight_pockets and its mirror-paired variant (H5: the structural guards
+    c4/blot/diag/pocket-count stay at the CALL SITES — the paired variant re-checks
+    them on the combined primary+partner trial). `cur` bool mask, `outer` = _outer_bg
+    of it. Returns (trial bool mask, grown pocket cells, wall px) or None when blocked."""
+    h, w = cur.shape
+    dy, dx = dict(_RELIEF_DIRS)[dname]
+    face = [(y, x) for (y, x) in cells if (y + dy, x + dx) not in cells]
+    wall = [(y + dy, x + dx) for (y, x) in face]
+    if len({(y if dy else x) for (y, x) in wall}) != 1:
+        return None                                    # staircase face -> not a flat wall
+    axis = 1 if dy else 0
+    coords = sorted(p[axis] for p in wall)
+    if coords != list(range(coords[0], coords[-1] + 1)):
+        return None                                    # gap in the run
+    outward = [(y + dy, x + dx) for (y, x) in wall]
+    if not all(0 <= y < h and 0 <= x < w for y, x in outward):
+        return None                                    # canvas edge
+    if not all((not cur[y, x]) and outer[y, x] for y, x in outward):
+        return None                                    # not free exterior
+    wall_sorted = sorted(wall, key=lambda p: p[axis])
+    step = (0, 1) if axis == 1 else (1, 0)
+    ends = ((wall_sorted[0][0] - step[0], wall_sorted[0][1] - step[1]),
+            (wall_sorted[-1][0] + step[0], wall_sorted[-1][1] + step[1]))
+    anchors = [a for a in ends if 0 <= a[0] < h and 0 <= a[1] < w and cur[a]]
+    conns = []
+    for a in anchors:                                  # corner connection ON THE OUTER POSITION
+        cpx = (a[0] + dy, a[1] + dx)
+        if not (0 <= cpx[0] < h and 0 <= cpx[1] < w):
+            return None
+        if cur[cpx]:
+            continue                                   # already ink -> nothing to add
+        if not outer[cpx]:
+            return None
+        conns.append(cpx)
+    new_ink = outward + conns
+    seed = np.zeros((h, w), np.uint8)
+    for p in wall + anchors:
+        seed[p] = 1
+    loc = seed.copy()                                  # 2-step geodesic ink neighbourhood
+    for _g in range(2):
+        loc = cv2.dilate(loc, _SE3, borderType=cv2.BORDER_CONSTANT,
+                         borderValue=0) & cur.astype(np.uint8)
+    loc |= seed
+    if any(0 <= ny + dy8 < h and 0 <= nx + dx8 < w
+           and cur[ny + dy8, nx + dx8] and not loc[ny + dy8, nx + dx8]
+           for ny, nx in new_ink
+           for dy8 in (-1, 0, 1) for dx8 in (-1, 0, 1)):
+        return None                                    # 1px separation to FOREIGN ink
+    trial = cur.copy()
+    for p in wall:
+        trial[p] = False
+    for p in new_ink:
+        trial[p] = True
+    return trial, frozenset(cells | set(wall)), wall
+
+
+def relieve_tight_pockets(ring: np.ndarray, target: int) -> np.ndarray:
+    """Outward wall relief for TIGHT enclosed pockets — the user's hand-doctrine encoded:
+    a too-tight wireframe section gains interior room by moving its 1px wall one step
+    OUTWARD into free exterior, the reconnecting corner pixels placed on the OUTER
+    positions — never by eating interior white. Per pass (<= RELIEF_MAX_PASSES), per
+    still-tight pocket (row-major; clean-loop counters skipped — intended dot/ring
+    interiors), each direction d offers: wall = the pocket's face+d (must be one flat
+    contiguous run); outward = wall+d (all in-canvas, background AND border-connected
+    exterior — never another pocket); anchors = the along-run ink neighbours at the
+    wall's ends, reconnected via anchor+d corner pixels (ink already, or free exterior).
+    Guards per candidate: 1px stroke separation (no new ink 8-adjacent to FOREIGN ink =
+    ink outside the 2-step geodesic neighbourhood of wall+anchors — blocks slack's
+    two-pill abutment), ink c4-component count EXACTLY unchanged, no new 2x2 blot,
+    diagonal-only touches not increased, enclosed-pocket count unchanged AND the
+    relieved pocket == old + wall exactly (grow, never merge). Rank: (grows-short-dim,
+    outward clearance capped 3, outwardness = d . (pocket centroid - ink centroid) —
+    mirror-invariant, fixed direction index). Interior-locked pockets (react's crossing
+    lattice) and guard-blocked ones are honest partials. Byte-identical no-op when
+    nothing qualifies. Deterministic (H8)."""
+    cur = ring > 0
+    h, w = cur.shape
+    ys, xs = np.nonzero(cur)
+    if xs.size == 0:
+        return ring
+    base_c4 = cv2.connectedComponents(cur.astype(np.uint8), connectivity=4)[0] - 1
+    base_blot = int(np.count_nonzero(_block_corners(cur)))
+    base_diag = _diag_touches(cur)
+    scy, scx = float(ys.mean()), float(xs.mean())
+    for _ in range(RELIEF_MAX_PASSES):
+        changed = False
+        pockets = _enclosed_bg((cur * 255).astype(np.uint8))
+        n_encl = len(pockets)
+        for cells, area, ph, pw, py0, px0 in pockets:
+            if not _is_tight(area, ph, pw) or _clean_loop_counter(cur, cells):
+                continue
+            outer = _outer_bg((cur * 255).astype(np.uint8))
+            cands = []
+            for di, (dname, (dy, dx)) in enumerate(_RELIEF_DIRS):
+                offer = _pocket_move(cur, cells, dname, outer)
+                if offer is None:
+                    continue
+                trial, grown, wall = offer
+                if _relief_accept(trial, base_c4, base_blot, base_diag,
+                                  n_encl, grown) is None:
+                    continue
+                cands.append(_relief_cand(cur, outer, wall, di, dy, dx,
+                                          py0, px0, ph, pw, scy, scx, trial))
+            if cands:
+                cands.sort(key=lambda cnd: cnd[:4], reverse=True)
+                cur = cands[0][4]
+                changed = True
+        if not changed:
+            break
+    return (cur * 255).astype(np.uint8)
 
 
 def _shift_region(mask: np.ndarray, dy: int, dx: int) -> np.ndarray:
@@ -976,7 +1398,8 @@ def _is_radial(sil: np.ndarray) -> bool:
 
 
 def widen_underrepresented(sil: np.ndarray, target: int,
-                           structure_ref: np.ndarray | None = None) -> np.ndarray:
+                           structure_ref: np.ndarray | None = None,
+                           protected_bg: np.ndarray | None = None) -> np.ndarray:
     """Cross-resolution inner-feature CONTINUITY widen. When the @24 sibling (`structure_ref`)
     renders an inner feature as a continuous filled zone but @16 pinches it (gmail's M-centre: a
     1px tip + an unclosed top-centre seam), fill @16 toward @24's footprint so it reads continuous.
@@ -991,11 +1414,25 @@ def widen_underrepresented(sil: np.ndarray, target: int,
 
     NOTE: this is a GENERAL continuity rule; geometrically it ALSO fires on any fixture whose inner
     features are thinner than its @24 (discord's body, etc.) — those are not distinguishable from
-    gmail's by any geometric signal. The harness/caller scopes WHICH fixtures it runs on."""
+    gmail's by any geometric signal. The harness/caller scopes WHICH fixtures it runs on.
+
+    Detail-retention rework: ALL enclosed holes of the input (any size — discord@16's eyes
+    are 1x2, below the min-feat significance floor) are PROTECTED: the widen never fills a
+    hole px, and a fill whose mirror TWIN lands in a hole is skipped (both-or-neither) —
+    the old hole-COUNT topology guard let the widen legally shrink an eye to 1px, which
+    symmetrize's spurious-hole fill then erased. `protected_bg` (optional): a
+    caller-scoped zone (glyph channel / relayout valley) ORed into the enclosed-hole
+    protection — the continuity widen never inks it."""
     if structure_ref is None or not sil.any():               # @24 is authoritative — never widen it
         return sil
     if _is_radial(structure_ref):                            # radial-blade family (claude/firefox)
         return sil                                           # excluded per the project convention
+    protected = np.zeros(sil.shape, bool)                    # ALL enclosed holes of the input:
+    for cells, *_r in _enclosed_bg(sil):                     # a continuity widen must never eat
+        for c in cells:                                      # counter interiors (any size)
+            protected[c] = True
+    if protected_bg is not None:                             # glyph-channel / relayout-valley
+        protected |= protected_bg > 0                        # zone (caller-scoped, W3 guard)
     tgt = cv2.resize(structure_ref, (target, target), interpolation=cv2.INTER_AREA) > WIDEN_TGT_THRESH
     xs = np.nonzero(sil)[1]
     axis = (int(xs.min()) + int(xs.max())) / 2.0          # vertical mirror axis (bbox centre)
@@ -1006,7 +1443,7 @@ def widen_underrepresented(sil: np.ndarray, target: int,
     base = _topology(sil)
     cur = sil.copy()
     for _ in range(WIDEN_MAX_PASS):
-        allow = tgt & (pinch | _flanked(cur))             # @24 wants it, at a pinch or inner gap
+        allow = tgt & (pinch | _flanked(cur)) & ~protected   # @24 wants it, pinch/inner gap, no hole
         nb = cv2.dilate(cur, _SE3, borderType=cv2.BORDER_CONSTANT, borderValue=0)
         cand = (cur == 0) & allow & (nb > 0)
         if not cand.any():
@@ -1015,12 +1452,138 @@ def widen_underrepresented(sil: np.ndarray, target: int,
         for y, x in sorted(map(tuple, np.argwhere(cand))):
             if cur[y, x]:
                 continue
+            tx = int(round(2.0 * axis - x))               # mirror twin (keep symmetry)
+            if 0 <= tx < target and protected[y, tx]:
+                continue                                  # twin lands in a hole: both-or-neither
             trial = cur.copy()
             trial[y, x] = 255
-            tx = int(round(2.0 * axis - x))               # mirror twin (keep symmetry)
             if 0 <= tx < target:
                 trial[y, tx] = 255
             if _topology(trial) == base:
+                cur, changed = trial, True
+        if not changed:
+            break
+    return cur
+
+
+SPECK_MAX = 2            # isolated micro-components at/under this area are despeck candidates
+SPECK_FAMILY_MIN = 4     # >= this many sibling candidates = an intended PATTERN (signal's burst
+#                          dashes), kept; 1-3 are noise (docker's mast/container fragments)
+PEEL_N4 = 2              # outside-ref fringe peel touches px with at most this many ink 4-neighbours
+
+
+def despeck_artifacts(silhouette: np.ndarray, target: int,
+                      reference: np.ndarray | None) -> np.ndarray:
+    """Artifact removal the n4==1-only deburr is structurally blind to (docker's floating
+    specks are n4==0, its tail n4==2). Runs BEFORE widen_underrepresented — widen
+    otherwise fattens a speck into a floating chimney.
+
+    (a) ISOLATED micro-components: area <= SPECK_MAX whose 1px-dilate ring is all-bg
+    (>= 2px of void to any other ink) — ref-BLIND, because docker's mast fragments ARE
+    reference-supported yet read as dirt at icon scale. Two probed-in protections:
+    keep when the candidate's ref overlap lies wholly in TINY separate reference
+    components (the reference itself prescribes a floating feature there), and keep ALL
+    candidates when >= SPECK_FAMILY_MIN qualify (an intended pattern — signal@24's burst
+    dashes, whose reference is ONE fused component so ref-connectivity cannot protect
+    them; the >= 4 family count is the discriminator that survived probing).
+    Hole-count guarded (a speck removal drops a component, never a counter).
+
+    (b) OUTSIDE-REFERENCE excess-width fringe peel, row-major to fixpoint: peel an ink
+    px with reference==0 and n4 <= PEEL_N4 iff its row ink-run AND col ink-run are each
+    LONGER than the longest intersecting reference run in that direction AND at least
+    one direction has NO intersecting ref run at all (the px protrudes into ref-empty
+    space). All three clauses are load-bearing: equal-width protects registration-
+    shifted strokes (linkedin@16's +1-shifted stems), both-excess protects single-
+    direction fat, ref-empty-direction protects staircase corner px of large bodies
+    (instagram@24's ring corners, android@24's head edge — without it the peel broke
+    their symmetrize folds). Exact-topology guarded per px. The scalar run walks are
+    the H2 carve-out (<= 24-length extents from an anchor, 15-25x faster than any
+    vectorized idiom at this scale — scout-benchmarked).
+
+    No-op without a reference. Deterministic (H8: row-major, fixed passes)."""
+    if reference is None or not silhouette.any():
+        return silhouette
+    ref = reference > 0
+    cur = silhouette.copy()
+    base = _topology(cur)
+    rn, rlbl, rst, _rc = cv2.connectedComponentsWithStats(reference, connectivity=8)
+    n, lbl, st, _c = cv2.connectedComponentsWithStats(cur, connectivity=8)
+    cands = []
+    for i in range(1, n):                    # (a) isolated micro-components
+        comp = (lbl == i).astype(np.uint8) * 255
+        if int(st[i, cv2.CC_STAT_AREA]) > SPECK_MAX:
+            continue
+        ring = (cv2.dilate(comp, _SE3, borderType=cv2.BORDER_CONSTANT,
+                           borderValue=0) > 0) & (comp == 0)
+        if bool(np.any(ring & (cur > 0))):
+            continue                         # touches other ink -> not floating
+        ref_ids = {int(r) for r in np.unique(rlbl[(comp > 0) | ring]) if r != 0}
+        if ref_ids and all(int(rst[r, cv2.CC_STAT_AREA]) <= 2 * SPECK_MAX + 1
+                           for r in ref_ids):
+            continue                         # the REFERENCE prescribes a tiny floating
+        #                                      feature here -> intended; a fragment of a
+        #                                      BIG ref body (docker's mast) is render noise
+        cands.append(comp)
+    if len(cands) < SPECK_FAMILY_MIN:
+        for comp in cands:
+            trial = cur.copy()
+            trial[comp > 0] = 0
+            nt = _topology(trial)
+            if nt[1] == base[1] and trial.any():
+                cur, base = trial, nt
+
+    def _run(mask: np.ndarray, y: int, x: int, horiz: bool) -> tuple[int, int]:
+        """[lo, hi] extent of the ink run through (y, x) along the row/column."""
+        line = mask[y, :] if horiz else mask[:, x]
+        i = x if horiz else y
+        lo = i
+        while lo > 0 and line[lo - 1]:
+            lo -= 1
+        hi = i
+        while hi < line.size - 1 and line[hi + 1]:
+            hi += 1
+        return lo, hi
+
+    def _ref_run_max(y: int, x: int, lo: int, hi: int, horiz: bool) -> int:
+        """Longest reference run on the same row/col intersecting [lo, hi]."""
+        line = ref[y, :] if horiz else ref[:, x]
+        best = i = 0
+        while i < line.size:
+            if line[i]:
+                j = i
+                while j < line.size - 1 and line[j + 1]:
+                    j += 1
+                if j >= lo and i <= hi:
+                    best = max(best, j - i + 1)
+                i = j + 1
+            else:
+                i += 1
+        return best
+
+    def _excess(mask: np.ndarray, y: int, x: int) -> bool:
+        m = mask > 0
+        lo, hi = _run(m, y, x, True)
+        rr = _ref_run_max(y, x, lo, hi, True)
+        if hi - lo + 1 <= rr:
+            return False                     # registration-shift protected (equal width)
+        lo, hi = _run(m, y, x, False)
+        rc = _ref_run_max(y, x, lo, hi, False)
+        if hi - lo + 1 <= rc:
+            return False
+        return rr == 0 or rc == 0            # must protrude into ref-EMPTY space
+
+    for _ in range(target):                  # (b) outside-ref excess-width fringe peel
+        n4 = _nb4count(cur)
+        cand = (cur > 0) & (n4 <= PEEL_N4) & ~ref
+        if not cand.any():
+            break
+        changed = False
+        for y, x in sorted(map(tuple, np.argwhere(cand))):
+            if not cur[y, x] or not _excess(cur, y, x):
+                continue
+            trial = cur.copy()
+            trial[y, x] = 0
+            if _topology(trial) == base and trial.any():
                 cur, changed = trial, True
         if not changed:
             break
@@ -1035,8 +1598,10 @@ def deburr_nibs(silhouette: np.ndarray, target: int,
     that neighbour is a SOLID body pixel (>= 3 shared edges) — a lone pixel protruding from a wide
     body. This catches jaggy edge bumps (figma's top row, gmail's arm edges, vscode's ears) while a
     thin-feature TIP is KEPT, because a tip's single neighbour is itself thin (< 3 shared edges — a
-    chevron apex, a 1px antenna). Radial-blade marks (claude/firefox) are exempt via _is_radial on
-    the reference. Topology-guarded (no component split, no lost counter), bounded to `max_nib`
+    chevron apex, a 1px antenna). Radial-blade marks are exempt only when BOTH the reference AND
+    the silhouette read radial (DUAL gate) — a solid box+letters mark whose reference alone
+    crosses the peak threshold (linkedin@24, ref peaks == RADIAL_MIN_PEAKS exactly) is NOT
+    exempted. Topology-guarded (no component split, no lost counter), bounded to `max_nib`
     passes.
 
     ACCEPTED TRADEOFF (user ruling — "aggressive de-jag, all bumps"): the reference and symmetry
@@ -1047,8 +1612,14 @@ def deburr_nibs(silhouette: np.ndarray, target: int,
     Deterministic (H8: no RNG, row-major order, thread-pinned _is_radial, fixed cap)."""
     if reference is None or not silhouette.any():          # no oracle -> never guess
         return silhouette
-    if _is_radial(reference):                              # radial-blade family (claude/firefox) — clean ref
-        return silhouette
+    if _is_radial(reference) and _is_radial(silhouette):   # radial-blade family — DUAL gate: a solid
+        return silhouette                                  # box+letters mark whose REFERENCE alone
+    #                                                        crosses the peak threshold (linkedin@24,
+    #                                                        ref peaks == RADIAL_MIN_PEAKS exactly) no
+    #                                                        longer disables deburr; true radials read
+    #                                                        radial in BOTH masks. The knob itself
+    #                                                        cannot move: spotify/yt-music sit AT 6 and
+    #                                                        normalize's radial family depends on them.
     base = _topology(silhouette)                           # fixed original (components, holes)
     cur = silhouette.copy()
     _NB4 = ((-1, 0), (1, 0), (0, -1), (0, 1))
@@ -1075,62 +1646,180 @@ def deburr_nibs(silhouette: np.ndarray, target: int,
     return cur
 
 
-STROKE_DIAG_FRAC = 0.6   # a <=2px stroke whose 1px centreline is >= this fraction diagonal would
-#                          staircase (8-connected but 4-BROKEN) if thinned -> WIDEN to 3px; a
-#                          predominantly axis-aligned centreline THINS to 1px (vscode's diagonal
-#                          tails widen; instagram's axis-aligned band thins). The user's rule:
-#                          thin unless thinning "breaks the shape" = a 4-connectivity break.
 STROKE_MIN_LEN = 2       # only normalize elongated strokes (a <2px-long speck is not a "line")
 
 
-def normalize_stroke_width(silhouette: np.ndarray, target: int) -> np.ndarray:
-    """Normalize 2px-thick strokes to an ODD width: thin to 1px by default, widen to 3px when
-    thinning would break the shape. A stroke is <=2px where a 3x3 opening removes it (a >=3px core
-    survives). Its half-width reads ~1 (medial_axis dist == ceil(w/2), so 1px and 2px both read 1 —
-    thinning a 1px stroke is a no-op, harmless). The thin-vs-widen call is the stroke centreline's
-    DIAGONALITY: a predominantly-diagonal 1px centreline 4-fragments (each px its own 4-component,
-    _n4/len ~ 1.0) so thinning staircases it (the user's "break"); a predominantly axis-aligned
-    centreline stays face-connected (_n4/len ~ 1/len). Above STROKE_DIAG_FRAC the stroke is WIDENED
-    (radius-1 re-stroke = 3px); below it, THINNED to its 1px skeleton (offset-swept, topology-
-    guarded — if thinning disconnects at every offset it is widened instead). Every change is
-    topology-guarded. Deterministic (H8: rng=0, row-major, fixed). Byte-identical when no <=2px
-    stroke is present. Radial-blade sunbursts (claude) are exempt — their thin blades are intended
-    features, and normalizing them unevenly breaks the radial symmetry."""
-    if not silhouette.any() or _is_radial(silhouette):
+def _blot2x2(mask: np.ndarray) -> int:
+    """Count of 2x2 all-foreground blocks (_block_corners) — the "blot" metric: a 2px
+    smudge in 1px line art is exactly a 2x2 all-ink window, so 0 == clean line art.
+    Pure numpy slice-AND: a cv2.erode with a 2x2 SE needs BORDER_CONSTANT 0 forced
+    (the default border value reads ~foreground and falsely blots a lone corner
+    pixel) and its even-kernel anchor is off-centre; the shifted views have no such
+    traps."""
+    return int(np.count_nonzero(_block_corners(mask > 0)))
+
+
+def normalize_stroke_width(silhouette: np.ndarray, target: int, *,
+                           reference: np.ndarray | None = None,
+                           trace: list | None = None,
+                           protected_bg: np.ndarray | None = None) -> np.ndarray:
+    """Normalize <=2px strokes to an ODD width: per stroke, THIN-to-1px, HOLLOW-
+    WIDEN-to-3px and KEEP compete, and the candidate leaving the least residual blot
+    on the GATE metric (2x2 all-ink blocks in the final face-connected outline) wins
+    — ties rank thin < keep < widen. A stroke is
+    <=2px where a 3x3 opening removes it (a >=3px core survives); removals only ever
+    touch that residue. The widen stamp is a 3x3 SQUARE sweep (cv2.dilate) so every
+    centreline pixel is interior BY CONSTRUCTION and the final perimeter ring reads
+    as two 1px rails + a 1px white middle at ANY angle — the round cv2.circle(r=1)
+    plus-stamp left no interior along diagonal centrelines, so its "widen" still
+    smudged (the old diagonal-blot failure). Every candidate is guarded against the
+    input's (components, holes); a failing trial gets ONE rescue — _break_spurious_
+    loops fills tiny spurious pockets (medial-axis discretization artifacts) and must
+    then match exactly. Radial-blade sunbursts are NOT exempt (the old whole-mark
+    _is_radial early-out also swallowed slack/react/spotify): the blade family is
+    thinned UNIFORMLY — one union-thin move, all blades or none — so the sunburst
+    stays even; widen is never offered there (it merges adjacent blades).
+
+    Detail-retention rework additions: (1) PER-COMP SKELETON REPAIR — global spur
+    pruning can orphan a short thin component's centreline (the pruned skeleton covers
+    a fraction of the comp's own medial axis: vscode@16's chevron arms at 2/5), making
+    thin-skel ship a scatter; when the comp-skel is DEGENERATE (2x its length < the
+    comp's OWN medial-axis length) the centreline is re-derived per component, plus
+    the body-attachment px so the thin stays connected. Gated by a zero-cost exact
+    pre-check (own <= comp area, so 2*len >= area means the repair provably can't
+    fire) — medial_axis costs ~50ms/call REGARDLESS of size, so the call is skipped
+    unless repair is possible. (2) WIDEN ANTI-SPILL — the widen candidate is dropped
+    when its stamp adds ink beyond the 1px-dilated reference (a hollow-widen bulking
+    past ref+1px is fat, not normalization: vscode@16's arm wing, linkedin@16's
+    row-15 bar). (3) PROTECTED-BG GUARD — the widen candidate is also dropped when
+    its 3x3 stamp inks a `protected_bg` pixel (glyph channel / relayout inter-stroke
+    valley; the widen CANDIDATE only — _break_spurious_loops' rescue path is
+    untouched). NO retention test lives here — probed a no-op on the named cells
+    and regressive elsewhere; retention is symmetrize's job.
+
+    Deterministic (H8: rng=0, row-major components, fixed candidate order).
+    Byte-identical when no <=2px stroke is present. trace: append-only harness
+    records; None in production. protected_bg: optional caller-scoped negative-space
+    zone the widen must never ink (see guard (3) above)."""
+    if not silhouette.any():
+        if trace is not None:
+            trace.append({"radial": False, "thin_px": 0, "n_comps": 0})
         return silhouette
     opened = cv2.morphologyEx(silhouette, cv2.MORPH_OPEN, _SE3,
                               borderType=cv2.BORDER_CONSTANT, borderValue=0)
     thin_parts = ((silhouette > 0) & (opened == 0)).astype(np.uint8)   # the <=2px strokes/bands
+    thin_px = int(np.count_nonzero(thin_parts))
     if not thin_parts.any():
+        if trace is not None:
+            trace.append({"radial": False, "thin_px": 0, "n_comps": 0})
         return silhouette
-    skel_raw, dist = medial_axis(silhouette > 0, return_distance=True, rng=0)
-    skel = _prune_spurs(skel_raw.astype(np.uint8) * 255) > 0
     base = _topology(silhouette)
-    n, lbl, _st, _c = cv2.connectedComponentsWithStats(thin_parts, connectivity=8)
+    skel_raw = medial_axis(silhouette > 0, rng=0)
+    skel = _break_spurious_loops(                          # drop spurious medial-axis loops up front
+        _prune_spurs(skel_raw.astype(np.uint8) * 255), base[1]) > 0
+    n, lbl, st, _c = cv2.connectedComponentsWithStats(thin_parts, connectivity=8)
+    radial = _is_radial(silhouette)
+    if trace is not None:
+        trace.append({"radial": radial, "thin_px": thin_px, "n_comps": n - 1})
+    def _accept(trial: np.ndarray) -> np.ndarray | None:
+        """Topology guard with ONE loop-break rescue; a rescue that fills the wrong
+        pocket fails the exact recheck and the candidate drops out."""
+        if _topology(trial) == base:
+            return trial
+        rescued = _break_spurious_loops(trial, base[1])
+        return rescued if _topology(rescued) == base else None
+
+    def _score(mask: np.ndarray) -> int:
+        """Candidate score = the GATE metric itself: 2x2-ink blot of the final
+        face-connected outline. Scoring the raw ring instead misses the blocks
+        connect_disjoint's corner fills complete on staircase rails (android's
+        widened antennae looked clean pre-connect, blotted post-connect)."""
+        return _blot2x2(connect_disjoint(silhouette_outline(mask), mask, target))
+
     cur = silhouette.copy()
+    if radial:                                             # blade family: uniform thin or nothing
+        fam = np.zeros(silhouette.shape, bool)
+        for i in range(1, n):
+            comp = lbl == i
+            if int((skel & comp).sum()) >= STROKE_MIN_LEN:
+                fam |= comp
+        verdict = "radial-leave"
+        if fam.any():
+            id_score = _score(cur)                         # thin must not raise the gate metric
+            for name, drop in (("radial-thin-skel", fam & ~skel),
+                               ("radial-thin-other", fam & skel)):
+                trial = cur.copy()
+                trial[drop] = 0
+                ok = _accept(trial)
+                if ok is not None and _score(ok) <= id_score:
+                    cur, verdict = ok, name
+                    break
+        if trace is not None:
+            trace.append({"comp": 0, "area": int(np.count_nonzero(fam)),
+                          "len": int((skel & fam).sum()), "frag": -1.0,
+                          "verdict": verdict, "base": base})
+        return cur
+
+    refd = None if reference is None else (
+        cv2.dilate(reference, _SE3, borderType=cv2.BORDER_CONSTANT, borderValue=0) > 0)
     for i in range(1, n):
         comp = (lbl == i)
         cskel = skel & comp
         length = int(cskel.sum())
+        area_i = int(st[i, cv2.CC_STAT_AREA])
+        # PER-COMP SKELETON REPAIR (see docstring). Pre-gate is exact: the comp's own
+        # medial axis is a subset of the comp, so 2*length >= area means the degeneracy
+        # condition (2*len < own-len) provably cannot fire — skip the ~50ms call.
+        if 2 * length < area_i:
+            own = medial_axis(comp, rng=0)
+            if 2 * length < int(own.sum()):                # comp-skel DEGENERATE only
+                other = ((cur > 0) & ~comp).astype(np.uint8) * 255
+                join = comp & (cv2.dilate(other, _SE3, borderType=cv2.BORDER_CONSTANT,
+                                          borderValue=0) > 0)
+                cskel = own | join                         # medial + body-attachment px:
+                length = int(cskel.sum())                  # the repaired thin stays CONNECTED
+        rec = {"comp": i, "area": area_i, "len": length,
+               "frag": -1.0, "verdict": "leave", "base": base}
         if length < STROKE_MIN_LEN:                        # not an elongated line -> leave it
+            rec["verdict"] = "skip-minlen"
+            if trace is not None:
+                trace.append(rec)
             continue
         skmask = cskel.astype(np.uint8) * 255
-        frag = (cv2.connectedComponents(skmask, connectivity=4)[0] - 1) / length
-        if frag <= STROKE_DIAG_FRAC:                       # axis-aligned centreline -> THIN to 1px
-            keep_skel = cur.copy(); keep_skel[comp & ~skel] = 0       # keep the medial-axis offset
-            keep_other = cur.copy(); keep_other[comp & skel] = 0      # or the other offset
-            if _topology(keep_skel) == base:
-                cur = keep_skel
-            elif _topology(keep_other) == base:
-                cur = keep_other
-            else:                                          # thinning disconnects at every offset -> widen
-                trial = cur | _restroke(skmask, np.ones_like(dist))
-                if _topology(trial) == base:
-                    cur = trial
-        else:                                              # diagonal centreline -> WIDEN to 3px
-            trial = cur | _restroke(skmask, np.ones_like(dist))
-            if _topology(trial) == base:
-                cur = trial
+        rec["frag"] = round(                               # kept as a trace field only
+            (cv2.connectedComponents(skmask, connectivity=4)[0] - 1) / length, 3)
+        thin_skel = cur.copy(); thin_skel[comp & ~cskel] = 0           # keep the medial-axis offset
+        thin_other = cur.copy(); thin_other[comp & cskel] = 0          # or the other offset
+        widen = cur | cv2.dilate(skmask, _SE3,                         # 3x3 SQUARE sweep -> hollow
+                                 borderType=cv2.BORDER_CONSTANT, borderValue=0)
+        # IDENTITY competes too: an action must BEAT the smudge it replaces on the
+        # gate metric. Tie ranks: thin(0) < keep(1) < widen(2) — thin ties normalize
+        # to odd width; a widen that doesn't reduce blot just bulks (android's antennae).
+        cands = [(_score(cur), 1, 0, -1, "keep", cur)]
+        for name, trial in (("thin-skel", thin_skel), ("thin-other", thin_other),
+                            ("widen", widen)):
+            if name == "widen" and refd is not None and bool(
+                    np.any((trial > 0) & (cur == 0) & ~refd)):
+                continue                                   # ANTI-SPILL: bulking past ref+1px
+            if name == "widen" and protected_bg is not None and bool(
+                    np.any((trial > 0) & (cur == 0) & (protected_bg > 0))):
+                continue                                   # glyph-channel/valley guard (W3):
+            #   hollow-widen must never ink a glyph's negative space — the widen
+            #   CANDIDATE only; _break_spurious_loops' rescue path stays untouched
+            #   (react@24's 1px rescue-fill has zero widen verdicts, scan-proven)
+            ok = _accept(trial)
+            if ok is None:
+                continue
+            cands.append((_score(ok),
+                          0 if name.startswith("thin") else 2,
+                          int(np.count_nonzero(ok != cur)),
+                          len(cands), name, ok))
+        *_key, name, cur = min(cands)                      # min-key: blot, tie-rank, fewest
+        #                                                    changed px, append order — the unique
+        #                                                    index means the ndarray never compares
+        rec["verdict"] = name if len(cands) > 1 else "leave"   # keep=identity won; leave=no action valid
+        if trace is not None:
+            trace.append(rec)
     return cur
 
 
@@ -1182,9 +1871,119 @@ def _label_axes(constructions: list[tuple[list[Part], tuple, str]],
     return axes
 
 
+def _ref_hole_zone(mask: np.ndarray, reference: np.ndarray | None) -> np.ndarray:
+    """Current enclosed-bg px belonging to holes that overlap a 1px-DILATED reference
+    hole (ANY size — dilated because unblot legally moves a counter 1px off its ref
+    position): such a hole is a REF-PRESCRIBED counter (discord@16's 1x2 eyes, below
+    the min-feat significance floor), never 'spurious'."""
+    if reference is None:
+        return np.zeros(mask.shape, bool)
+    rz0 = np.zeros(mask.shape, np.uint8)
+    for cells, *_r in _enclosed_bg(reference):
+        for c in cells:
+            rz0[c] = 255
+    rz = cv2.dilate(rz0, _SE3, borderType=cv2.BORDER_CONSTANT, borderValue=0) > 0
+    if not rz.any():
+        return np.zeros(mask.shape, bool)
+    out = np.zeros(mask.shape, bool)
+    for cells, *_r in _enclosed_bg(mask):
+        if any(rz[c] for c in cells):
+            for c in cells:
+                out[c] = True
+    return out
+
+
+def _exact_axes(sil: np.ndarray) -> list[tuple[bool, int]]:
+    """Axes the mask is EXACTLY symmetric about: [(vertical, a2), ...] with flip-IoU == 1.
+    (a2 is the DOUBLED axis coordinate — even a2 has a genuine fixed row/col, odd a2
+    pairs every pixel with a distinct partner; _orbit handles both.)"""
+    axes = []
+    for vert in (True, False):
+        fa = _best_flip_axis(sil, vert)
+        if fa is not None and fa[1] == 1.0:
+            axes.append((vert, fa[0]))
+    return axes
+
+
+# _orbit: LIFTED to compress/common.py (H5 — cubify's R6 dual-axis moves share it);
+# imported above, same name and semantics.
+
+
+def _orbit_carve(cur: np.ndarray, axes: list[tuple[bool, int]], accept) -> np.ndarray:
+    """THE shared orbit-paired blot-px carve loop (H5): carve 2x2-block ink px with a
+    bg 4-neighbour in whole mirror orbits (both-or-neither; one row-major representative
+    per orbit), fixpoint to CHANNEL_MAX_PASSES. `accept(trial) -> bool` supplies the
+    structural guard — _deblot_paired passes exact-topology equality, reopen_channels_
+    paired the c4-component cap (a plain callable parameter, H4-clean). Deterministic."""
+    for _ in range(CHANNEL_MAX_PASSES):
+        blot = _block_spread(cur > 0)
+        if not blot.any():
+            break
+        cand = blot & (_nb4count(cur) < 4)
+        changed = False
+        for y, x in sorted(map(tuple, np.argwhere(cand))):
+            orb = _orbit(y, x, axes, cur.shape)
+            if orb is None or (y, x) != orb[0]:
+                continue                                   # one representative per orbit
+            blocks_now = _block_spread(cur > 0)
+            nb_now = _nb4count(cur)
+            if not all(cur[p] and blocks_now[p] and nb_now[p] < 4 for p in orb):
+                continue                                   # both-or-neither
+            trial = cur.copy()
+            for p in orb:
+                trial[p] = 0
+            if accept(trial):
+                cur, changed = trial, True
+        if not changed:
+            break
+    return cur
+
+
+def _deblot_paired(sil: np.ndarray, axes: list[tuple[bool, int]],
+                   target: int) -> np.ndarray:
+    """Orbit-paired SILHOUETTE de-blot: the shared _orbit_carve under an exact-topology
+    guard. An exactly-symmetric input stays EXACTLY symmetric — the fold-then-repair
+    step (instagram@16's re-fattened lens ring thins to a clean 1px ring where a
+    normalize re-run scatters it). Deterministic (H8)."""
+    if not sil.any():
+        return sil
+    base = _topology(sil)
+    return _orbit_carve(sil.copy(), axes, lambda trial: _topology(trial) == base)
+
+
+def _fold_or_repair(folded: np.ndarray, before: np.ndarray, target: int,
+                    reference: np.ndarray | None) -> np.ndarray:
+    """FOLD-THEN-REPAIR — replaces the old _no_reblot VETO (which shipped instagram's
+    massive asymmetry to protect a dozen blot px; blot must not outrank identity when
+    the fold can be de-blotted). (1) A fold that destroys a FEATURE-SIZED ref-supported
+    region (largest retention-violation component > min_feat^2 — yt-music@16's 9px
+    flag) is rejected outright: several sub-budget minority-accent drops are dual-axis
+    symmetrization's normal job, ONE feature-sized loss is destruction. (2) The fold is
+    accepted when its pre-tail ring blot <= the input's. (3) Else the orbit-paired
+    silhouette carve repairs the fold's re-fattened bands (exactly-symmetric stays
+    exactly symmetric) and is accepted under the same retention cap + blot bar.
+    (4) Else the input ships (the old veto). Deterministic (H8)."""
+    acc_cap = _min_feat_at(target) ** 2
+    if _retention_comp_max(before, folded, reference) > acc_cap:
+        return before                                      # feature-scale destruction
+
+    def _blot_ring(m: np.ndarray) -> int:
+        return _blot2x2(connect_disjoint(silhouette_outline(m), m, target))
+
+    bar = _blot_ring(before)
+    if _blot_ring(folded) <= bar:
+        return folded
+    repaired = _deblot_paired(folded, _exact_axes(folded), target)
+    if (_retention_comp_max(before, repaired, reference) <= acc_cap
+            and _blot_ring(repaired) <= bar):
+        return repaired
+    return before
+
+
 def symmetrize_render(silhouette: np.ndarray,
                       constructions: list[tuple[list[Part], tuple, str]],
-                      canvas_hw: tuple[int, int], target: int) -> np.ndarray:
+                      canvas_hw: tuple[int, int], target: int,
+                      reference: np.ndarray | None = None) -> np.ndarray:
     """Force the rendered silhouette to the LABEL's mirror symmetry at the pixel level. Detects the
     label's true mirror axes (V and/or H) hole-awarely (_label_axes). A DUAL-axis mark (both V and
     H, e.g. instagram) is symmetrized by a 4-orbit MAJORITY VOTE (a pixel is kept iff >= 2 of its
@@ -1194,8 +1993,18 @@ def symmetrize_render(silhouette: np.ndarray,
     asymmetric accents (components with no mirror partner, <= min-feature^2) then half-mirrors the
     authoritative (cleaner) half onto the other (_half_mirror — corrects a lopsided render), kept
     only if it does not fragment the silhouette; spurious small holes it opens are filled (kept
-    holes = the label's real counters via _significant_holes). No-op when the label has no mirror
-    axis. Deterministic (H8)."""
+    holes = the label's real counters via _significant_holes; ref-hole-backed counters are NEVER
+    spurious). No-op when the label has no mirror axis.
+
+    Detail-retention rework: the accent-drop is RETENTION-GUARDED (a ref-supported feature —
+    android's antenna stubs, signal's bubble tail — is never dropped; a ref-edge jag whose
+    adjacent ink survives still is); the single-axis fold acceptance allows RESTORED
+    ref-supported mirror components (android@24's mirrored antenna) without reading them as
+    fragmentation; and every accepted fold passes _fold_or_repair — fold-then-repair replacing
+    the old _no_reblot veto: a fold whose ring blot rises is REPAIRED by the orbit-paired
+    silhouette carve (exactly-symmetric stays exactly symmetric) and only vetoed when the
+    repair still can't reach the input's blot or the fold/repair destroys a feature-sized
+    ref-supported region (> min_feat^2 in one component). Deterministic (H8)."""
     if not silhouette.any() or not constructions:
         return silhouette
     axes = _label_axes(constructions, canvas_hw)
@@ -1212,7 +2021,18 @@ def symmetrize_render(silhouette: np.ndarray,
         fh = (_flip_mask(cur, ah[0], False) > 0).astype(np.int16)
         fvh = (_flip_mask(_flip_mask(cur, av[0], True), ah[0], False) > 0).astype(np.int16)
         voted = ((fg + fv + fh + fvh) >= 2).astype(np.uint8) * 255
-        return voted if _topology(voted)[1] >= _topology(silhouette)[1] else silhouette   # keep counters
+        if _topology(voted)[1] < _topology(silhouette)[1]:               # keep counters
+            return silhouette
+        # RESOLVED RESIDUAL (R6 → nested-annuli round): the dual-axis vote used to drop
+        # instagram@16's 1px camera dot, and a ref-supported-accent restore was built and
+        # probed OUT — the dot's reference pixel is 8-connected INTO the lens ring's
+        # composite-ref component at 16 (area 27), so no composite-reference gate can
+        # separate an intentional accent from wall wobble (restoring by violation-size
+        # alone un-folds the symmetrization, asym 0->56 at 24). The fix landed UPSTREAM:
+        # refine_perimeter's `protected=` carve-out removes the deliberately-placed accent
+        # before the chain and restores it on the final ring, so this vote never sees it.
+        # The comment stays as the record of why a post-hoc restore HERE cannot work.
+        return _fold_or_repair(voted, silhouette, target, reference)     # fold-then-repair
     min_feat = _min_feat_at(target)
     acc_max = min_feat * min_feat
     for vert in axes:
@@ -1224,48 +2044,433 @@ def symmetrize_render(silhouette: np.ndarray,
         n, lbl, stats, _c = cv2.connectedComponentsWithStats(asym.astype(np.uint8), connectivity=8)
         trial = cur.copy()
         for i in range(1, n):
-            if int(stats[i, cv2.CC_STAT_AREA]) <= acc_max:            # small asymmetric accent -> drop
-                trial[lbl == i] = 0
+            if int(stats[i, cv2.CC_STAT_AREA]) <= acc_max:            # small asymmetric accent -> drop,
+                t2 = trial.copy()                                     # UNLESS it is a ref-supported
+                t2[lbl == i] = 0                                      # FEATURE (android's antenna stubs,
+                if _retention_loss(trial, t2, reference) > 0:         # signal's bubble tail): a ref-edge
+                    continue                                          # jag keeps adjacent ink and stays
+                trial = t2                                            # droppable; a whole feature never
         sym = _half_mirror(trial, a2, vert)
         st_sym, st_cur = _topology(sym), _topology(cur)
-        if st_sym[0] <= st_cur[0] and st_sym[1] >= st_cur[1]:        # no fragment AND no lost counter
+        new_ok = 0
+        if st_sym[0] > st_cur[0] and reference is not None:
+            n2, lbl2 = cv2.connectedComponents(sym, connectivity=8)
+            for j in range(1, n2):                                    # a RESTORED ref-supported mirror
+                comp2 = lbl2 == j                                     # feature (android@24's mirrored
+                if (not bool(np.any(comp2 & (cur > 0)))               # antenna) is not fragmentation —
+                        and bool(np.any(comp2 & (reference > 0)))     # without this allowance the
+                        and int(comp2.sum()) <= 2 * acc_max):         # never-fragment guard rejects the
+                    new_ok += 1                                       # restoring fold
+        if st_sym[0] - new_ok <= st_cur[0] and st_sym[1] >= st_cur[1]:   # no fragment AND no lost counter
             cur = sym
     outer = _outer_bg(cur)                                            # fill spurious (non-counter) holes
     significant = np.zeros(cur.shape, dtype=bool)
     for hole in _significant_holes(cur, min_feat):
         significant |= (hole > 0)
     spurious = (cur == 0) & (outer == 0) & ~significant
+    spurious &= ~_ref_hole_zone(cur, reference)            # a REF-PRESCRIBED counter is never spurious
     if spurious.any():
         cur = cur.copy(); cur[spurious] = 255
-    return cur
+    return _fold_or_repair(cur, silhouette, target, reference)           # fold-then-repair
+
+
+def connect_disjoint_paired(outline: np.ndarray, silhouette: np.ndarray, target: int,
+                            axes: list[tuple[bool, int]],
+                            max_passes: int = PERIM_MAX_PASSES) -> np.ndarray:
+    """Mirror-paired connect_disjoint. connect_disjoint is provably NOT H-mirror-
+    equivariant: its both-exterior fallback always fills TOP corners (pat_a→TR /
+    pat_b→TL), so a mirror-symmetric silhouette can emit an ASYMMETRIC ring
+    (instagram@16's top notch took two exterior fills, the mirrored bottom notch one
+    interior fill). Here each pass enumerates diagonal-only touches row-major from the
+    pass-start snapshot; only each touch-ORBIT's row-major-first touch chooses a corner
+    (the shared _diag_corners doctrine) and the fill lands together with its mirror
+    images — the corner CHOICE itself becomes axis-consistent. Deterministic (H8)."""
+    out = outline > 0
+    sil = silhouette > 0
+    h, w = out.shape
+    for _ in range(max_passes):
+        touches = _diag_touch_list(out)
+        if not touches:
+            break
+        any_fill = False
+        for r, c, k in touches:
+            orbit = {(r, c, k)}                            # orbit of the TOUCH: mirror its two
+            for vert, a2 in axes:                          # own-ink px, re-anchor the window
+                for rr, cc, kk in list(orbit):
+                    own = (((rr, cc), (rr + 1, cc + 1)) if kk == "a"
+                           else ((rr, cc + 1), (rr + 1, cc)))
+                    m1 = _mirror_point(*own[0], vert, a2)
+                    m2 = _mirror_point(*own[1], vert, a2)
+                    (ya, xa), (yb, xb) = sorted((m1, m2))
+                    nr, nc = ya, min(xa, xb)
+                    orbit.add((nr, nc, "a" if xa == nc else "b"))
+            orbit = sorted(orbit)
+            if (r, c, k) != orbit[0]:
+                continue                                   # one representative per orbit
+            d_int, _d_ext = _diag_corners(r, c, k, sil)    # the shared corner doctrine
+            fills = {d_int}
+            for vert, a2 in axes:
+                for p in list(fills):
+                    fills.add(_mirror_point(*p, vert, a2))
+            if any(not (0 <= y < h and 0 <= x < w) for y, x in fills):
+                continue
+            for p in fills:
+                if not out[p]:
+                    out[p] = True
+                    any_fill = True
+        if not any_fill:
+            break
+    return (out * 255).astype(np.uint8)
+
+
+def reopen_channels_paired(ring: np.ndarray, target: int,
+                           axes: list[tuple[bool, int]]) -> np.ndarray:
+    """Mirror-paired reopen_channels: the shared _orbit_carve under the c4-component
+    cap (same bg-adjacency guard as the unpaired pass). axes=[] degenerates to the
+    plain pass. H8."""
+    if not axes:
+        return reopen_channels(ring, target)
+    if not ring.any():
+        return ring
+    base_c4 = cv2.connectedComponents(ring, connectivity=4)[0] - 1
+    return _orbit_carve(
+        ring.copy(), axes,
+        lambda trial: cv2.connectedComponents(trial, connectivity=4)[0] - 1 <= base_c4)
+
+
+def relieve_tight_pockets_paired(ring: np.ndarray, target: int,
+                                 axes: list[tuple[bool, int]]) -> np.ndarray:
+    """Mirror-paired tight-pocket relief: mirror-PARTNER pockets move together (the
+    partner takes the axis-mirrored direction on the combined trial — both or neither),
+    self-mirrored pockets offer only axis-consistent directions. The per-direction
+    geometry/separation chain is the SHARED _pocket_move (H5 — one source of truth with
+    the unpaired pass); the structural guards run on the COMBINED trial. axes=[]
+    degenerates to the plain pass. Deterministic (H8)."""
+    if not axes:
+        return relieve_tight_pockets(ring, target)
+    cur = ring > 0
+    h, w = cur.shape
+    ys, xs = np.nonzero(cur)
+    if xs.size == 0:
+        return ring
+    base_c4 = cv2.connectedComponents(cur.astype(np.uint8), connectivity=4)[0] - 1
+    base_blot = int(np.count_nonzero(_block_corners(cur)))
+    base_diag = _diag_touches(cur)
+    scy, scx = float(ys.mean()), float(xs.mean())
+
+    def _twin_cells(cells: frozenset, vert: bool, a2: int) -> frozenset:
+        return frozenset(_mirror_point(y, x, vert, a2) for y, x in cells)
+
+    def _mirror_dir(dname: str, vert: bool) -> str:
+        m = {True: {"left": "right", "right": "left"},
+             False: {"up": "down", "down": "up"}}[vert]
+        return m.get(dname, dname)
+
+    for _ in range(RELIEF_MAX_PASSES):
+        changed = False
+        pockets = _enclosed_bg((cur * 255).astype(np.uint8))
+        n_encl = len(pockets)
+        pockmap = {cells for cells, *_r in pockets}
+        done: set[frozenset] = set()
+        for cells, area, ph, pw, py0, px0 in pockets:
+            if (cells in done or not _is_tight(area, ph, pw)
+                    or _clean_loop_counter(cur, cells)):
+                continue
+            partner, pvert, pa2 = None, None, None
+            selfdirs = {d for d, _v in _RELIEF_DIRS}
+            for vert, a2 in axes:
+                tw = _twin_cells(cells, vert, a2)
+                if tw == cells:                            # self-mirrored: only axis-consistent dirs
+                    selfdirs -= ({"left", "right"} if vert else {"up", "down"})
+                elif tw in pockmap:
+                    partner, pvert, pa2 = tw, vert, a2
+                    break
+            outer = _outer_bg((cur * 255).astype(np.uint8))
+            cands = []
+            for di, (dname, (dy, dx)) in enumerate(_RELIEF_DIRS):
+                if partner is None and dname not in selfdirs:
+                    continue
+                offer = _pocket_move(cur, cells, dname, outer)
+                if offer is None:
+                    continue
+                trial, grown, wall = offer
+                grown2 = None
+                if partner is not None:                    # mirrored application on the partner
+                    offer2 = _pocket_move(trial, partner, _mirror_dir(dname, pvert), outer)
+                    if offer2 is None:
+                        continue                           # both or neither
+                    trial, grown2, _w2 = offer2
+                if _relief_accept(trial, base_c4, base_blot, base_diag,
+                                  n_encl, grown, grown2) is None:
+                    continue
+                cands.append(_relief_cand(cur, outer, wall, di, dy, dx,
+                                          py0, px0, ph, pw, scy, scx, trial))
+            if cands:
+                cands.sort(key=lambda cnd: cnd[:4], reverse=True)
+                cur = cands[0][4]
+                changed = True
+                if partner is not None:
+                    done.add(partner)
+            done.add(cells)
+        if not changed:
+            break
+    return (cur * 255).astype(np.uint8)
+
+
+def _ring_asym(ring: np.ndarray, axes: list[tuple[bool, int]]) -> int:
+    """Total asymmetry px of a ring about the given exact axes (the paired-tail
+    arbitration term)."""
+    return sum(int(np.count_nonzero(
+        (ring > 0) != (_flip_mask(ring, a2, vert) > 0))) for vert, a2 in axes)
+
+
+def perimeter_ring(sil: np.ndarray, target: int) -> np.ndarray:
+    """The shared stage-4 outline tail (ONE tail, two callers: refine_perimeter and the
+    refine_debug harness — H5). plain and pocket-averse variants (+ a mirror-PAIRED
+    variant when the input silhouette is EXACTLY symmetric about a V/H axis) each run
+    the full connect → reopen → relieve chain and compete on
+    (blot, tight, ring-asym-about-the-input-axes, fixed order plain < averse < paired).
+    blot stays the ABSOLUTE gate — chrome@16's paired carve re-blots and loses; gmail@24's
+    paired variant wins on asym at equal blot/tight (the unpaired tail carved its bottom-
+    left only, shipping an asymmetric ring from a symmetric silhouette). The averse
+    variant must never ship un-arbitrated (mathematica@16 0→3 tight un-arbitrated).
+    axes==[] degenerates to the previous 2-candidate tight-only arbitration.
+    Deterministic (H8)."""
+    axes = _exact_axes(sil)
+    ring = silhouette_outline(sil)
+    cands = []
+    for averse in (False, True):
+        conn = connect_disjoint(ring, sil, target, pocket_averse=averse)
+        cands.append(relieve_tight_pockets(reopen_channels(conn, target), target))
+    if axes:
+        connp = connect_disjoint_paired(ring, sil, target, axes)
+        cands.append(relieve_tight_pockets_paired(
+            reopen_channels_paired(connp, target, axes), target, axes))
+    best = min(enumerate(cands),
+               key=lambda iv: (_blot2x2(iv[1]), count_tight_pockets(iv[1]),
+                               _ring_asym(iv[1], axes), iv[0]))
+    return best[1]
+
+
+def build_reference(constructions: list, canvas_hw: tuple[int, int],
+                    target: int) -> tuple[np.ndarray, np.ndarray | None]:
+    """(reference, relayout_valley_zone): the per-construction ideal-geometry
+    reference union — WITH the W4 stroke-relayout substitution applied (the
+    render idealized medium's M to its own re-laid-out reference; despeck's
+    outside-ref peel and deburr would eat the widened strokes against the raw
+    one). For each construction the relayout re-shaped, the zone of THIN
+    reference-background valleys ((ref==0) that a 3x3 opening removes, scoped to
+    the construction's reference bbox) is returned for the protected_bg guards —
+    hollow-widen must never ink a 1px inter-stroke valley. ONE implementation
+    for production refine_perimeter AND the refine_debug mirror (H5).
+    Deterministic (H8)."""
+    reference = np.zeros((target, target), np.uint8)
+    zone = None
+    for parts, _c, _l in constructions:
+        pp = _glyph_stroke_relayout(parts, canvas_hw, target)
+        rm = reference_mask(pp, canvas_hw, target)
+        reference |= rm
+        if pp is not parts:
+            bg = ((rm == 0).astype(np.uint8)) * 255
+            opened = cv2.morphologyEx(bg, cv2.MORPH_OPEN, _SE3,
+                                      borderType=cv2.BORDER_CONSTANT, borderValue=0)
+            val = (bg > 0) & (opened == 0)
+            ys, xs = np.nonzero(rm)
+            if xs.size:
+                box = np.zeros((target, target), bool)
+                box[ys.min():ys.max() + 1, xs.min():xs.max() + 1] = True
+                val &= box
+            zone = val if zone is None else (zone | val)
+    return reference, zone
+
+
+def glyph_ink_lines(constructions: list, canvas_hw: tuple[int, int],
+                    target: int) -> tuple[np.ndarray, np.ndarray] | None:
+    """(Z, K) for the glyph-channel class (mastodon's white m), or None. Z = the
+    channel ZONE at target (floor-map of the canonical enclosed glyph region);
+    K = the ink-line skeleton at target (floor-map of the region's medial axis).
+    Detection = compress.cubify.glyph_channel — the SAME detector the render
+    curtain uses (one detector, two consumers; H5) — run on the RAW construction
+    parts (the detection gates are robust to the render tier's _widen_gaps
+    state: mastodon 0.232 area / 0.92 subrep, wide margins). USER RULING: the
+    white m (negative space) ships as 1px interior INK lines inside the bubble
+    perimeter ring — refine_perimeter fills the channel before the chain (the
+    chain then works a solid body) and stamps K back inside the ring after.
+    Deterministic (H8)."""
+    S = canvas_hw[0]
+    zone = None
+    kskel = None
+    for parts, _c, _l in constructions:
+        gc = glyph_channel(parts, canvas_hw)
+        if gc is None:
+            continue
+        region_u, skel_u = gc
+        ys, xs = np.nonzero(region_u)
+        ty, tx = _map_coords(ys, xs, S, target, floor_map=True)
+        z = np.zeros((target, target), bool)
+        z[ty, tx] = True
+        ys, xs = np.nonzero(skel_u)
+        ty, tx = _map_coords(ys, xs, S, target, floor_map=True)
+        k = np.zeros((target, target), bool)
+        k[ty, tx] = True
+        zone = z if zone is None else (zone | z)
+        kskel = k if kskel is None else (kskel | k)
+    return None if zone is None else (zone, kskel)
+
+
+def fill_glyph_channels(sil: np.ndarray, zone: np.ndarray) -> np.ndarray:
+    """FILL the glyph channel before the refine chain: every enclosed-bg
+    component overlapping the zone fills to ink, plus leftover zone-white — the
+    chain then processes a SOLID body and has nothing to churn (mastodon probe:
+    +26px@16 / +66px@24 filled; nrm churn 34→8px@24). The m returns as ink
+    lines via stamp_glyph_ink after perimeter_ring."""
+    fill = np.zeros(sil.shape, bool)
+    for cells, *_r in _enclosed_bg(sil):
+        comp = np.zeros(sil.shape, bool)
+        for c in cells:
+            comp[c] = True
+        if bool((comp & zone).any()):
+            fill |= comp
+    fill |= zone & (sil == 0)
+    if not fill.any():
+        return sil
+    out = sil.copy()
+    out[fill] = 255
+    return out
+
+
+def stamp_glyph_ink(ring: np.ndarray, kskel: np.ndarray, target: int) -> np.ndarray:
+    """STAMP the glyph's 1px ink-line skeleton inside the outlined body: re-thin
+    the floor-mapped canonical skeleton at target (medial_axis rng=0 — the
+    library-scout verdict over skimage.thin: repo precedent + H8), prune
+    staircase barbs (_prune_spurs), TRIM to 8-separation from the ring (the
+    masks_8adjacent guarantee — ink lines never touch the wall), and if the trim
+    splits the glyph, reconnect with mst_bridges 1px LINE_4 segments accepted
+    only when the whole bridge stays off the ring's 1px dilation (deliberate
+    junctions never weld to the wall). ONE implementation for production and
+    the refine_debug mirror. Deterministic (H8)."""
+    if not kskel.any():
+        return ring
+    kt = medial_axis(kskel, rng=0)
+    kt = _prune_spurs(kt.astype(np.uint8) * 255) > 0
+    ring_d = cv2.dilate(ring, _SE3, borderType=cv2.BORDER_CONSTANT, borderValue=0) > 0
+    k2 = kt & ~ring_d
+    if not k2.any():
+        return ring
+    nk, klbl = cv2.connectedComponents(k2.astype(np.uint8), connectivity=8)
+    if nk - 1 > 1:
+        for pa, pb in mst_bridges([klbl == q for q in range(1, nk)]):
+            seg = np.zeros(ring.shape, np.uint8)
+            cv2.line(seg, (pa[1], pa[0]), (pb[1], pb[0]), 255, 1, cv2.LINE_4)   # (x,y)
+            if not bool(np.any((seg > 0) & ring_d)):
+                k2 |= seg > 0
+    out = ring.copy()
+    out[k2] = 255
+    return out
+
+
+def carve_accent(sil: np.ndarray, protected: np.ndarray | None
+                 ) -> tuple[np.ndarray, np.ndarray | None, list[np.ndarray], list[bool]]:
+    """Remove the DELIBERATELY-PLACED assembly accent zone from the silhouette
+    before the refine chain (refine's ref-keyed oracles are blind to it — see
+    refine_perimeter). Returns (sil_carved, accent, acc_ccs, acc_attached):
+    accent = the accent ink verbatim (None when protected is None/disjoint);
+    acc_ccs = its 8-connected components; acc_attached = whether each CC was
+    8-adjacent to the REMAINING silhouette at carve time (signal's tail nub is
+    ATTACHED to the bubble, unlike instagram's separated dot) — the restore's
+    re-bridge eligibility. ONE implementation for production refine_perimeter
+    AND the refine_debug harness mirror (the gate-predicate-drift taxonomy)."""
+    if protected is None or not bool(np.any((sil > 0) & (protected > 0))):
+        return sil, None, [], []
+    accent = ((sil > 0) & (protected > 0)).astype(np.uint8) * 255
+    carved = sil.copy()
+    carved[protected > 0] = 0
+    na, albl = cv2.connectedComponents((accent > 0).astype(np.uint8), connectivity=8)
+    acc_ccs = [(albl == q).astype(np.uint8) * 255 for q in range(1, na)]
+    acc_attached = [masks_8adjacent(c, carved) for c in acc_ccs]
+    return carved, accent, acc_ccs, acc_attached
+
+
+def restore_accent(ring: np.ndarray, accent: np.ndarray | None,
+                   acc_ccs: list[np.ndarray], acc_attached: list[bool]) -> np.ndarray:
+    """OR the carved accent back onto the final ring, then ATTACH-REPAIR: an
+    accent CC that was 8-adjacent to the silhouette at carve time but is now
+    8-disconnected from the ring (the chain may legally shift the parent rim
+    ±1px) gets ONE nearest-gap 1px LINE_4 bridge to the nearest ring px.
+    Instagram's dot was never attached → byte-identical no-op there."""
+    if accent is None:
+        return ring
+    out = ring | accent
+    for c, was in zip(acc_ccs, acc_attached):
+        if not was or masks_8adjacent(c, ring):
+            continue
+        if not ring.any():
+            continue
+        pa, pb, _d = nearest_gap(np.argwhere(c > 0), np.argwhere(ring > 0))
+        cv2.line(out, (pa[1], pa[0]), (pb[1], pb[0]), 255, 1, cv2.LINE_4)   # (x,y)
+    return out
 
 
 def refine_perimeter(constructions: list[tuple[list[Part], tuple, str]],
                      rendered_masks: list[np.ndarray],
                      canvas_hw: tuple[int, int], target: int,
-                     structure_ref: np.ndarray | None = None) -> np.ndarray:
+                     structure_ref: np.ndarray | None = None,
+                     protected: np.ndarray | None = None) -> np.ndarray:
     """Stage-4 v1 product: the FACE-CONNECTED 1-px boundary perimeter of the rendered
-    silhouette. Unions the per-construction renders → un-blots small counters → deburrs
+    silhouette. Unions the per-construction renders → un-blots small counters → continuity-widens
+    toward the @24 sibling (`structure_ref`; self-gates to a no-op @24 and on the radial family —
+    ACTIVE since the tight-wireframe rework: production and harness run the same chain) → deburrs
     single-pixel edge nibs that fall OUTSIDE the ideal reference (cubify union-seam raster
-    artifacts, see deburr_nibs) → silhouette → inner ring → diagonal disjoint repair. Signature
-    matches the (cons, masks, (S,S), target) seam (assemble_render's output); `canvas_hw` = (S,S)
-    is the parts' coord frame, used to raster the per-construction reference. `structure_ref` (the
-    @24 sibling silhouette) is accepted for the cross-resolution seam, but the widen pass it would
-    feed is DORMANT here pending a per-fixture scope decision (see widen_underrepresented).
-    Returns (target,target) uint8 {0,255}. Deterministic (H8)."""
+    artifacts, see deburr_nibs) → stroke-width normalize → symmetrize → perimeter_ring (the
+    arbitrated outline tail: connect plain/pocket-averse → reopen → tight-pocket relief).
+    Signature matches the (cons, masks, (S,S), target) seam (assemble_render's output);
+    `canvas_hw` = (S,S) is the parts' coord frame, used to raster the per-construction
+    reference. Returns (target,target) uint8 {0,255}. Deterministic (H8).
+
+    `protected` (assemble_render's accent return): ink of a DELIBERATELY-PLACED assembly
+    accent (instagram's separated camera dot) that refine's oracles are structurally blind
+    to — its reference is empty at the placed position (the r≈0.8px circle never reaches
+    the ≥0.5 downsample coverage at 16, and the nested-ring coordination legitimately moves
+    it), so despeck would eat it as an isolated speck, symmetrize's vote/accent-drop/hole-
+    fill has no retention backing for it, and the tail could deform its interior. CARVE-OUT
+    + RESTORE: the accent zone is removed from the silhouette before the chain (which then
+    processes the exactly-symmetric remainder — `_exact_axes` keeps seeing the clean two-
+    ring mask, so the mirror-paired tail stays available) and OR-ed back verbatim onto the
+    final ring. (A post-hoc ref-gated restore was built and probed OUT in symmetrize — the
+    accent's ref px 8-connects into the ring's composite-ref component; see the KNOWN
+    RESIDUAL note there. Carve-out sidesteps the composite-reference inseparability.)"""
     if not rendered_masks:
         return np.zeros((target, target), np.uint8)
     sil = _composite(rendered_masks, (target, target))
     if not sil.any():
         return sil
+    sil, accent, acc_ccs, acc_attached = carve_accent(sil, protected)
+    if accent is not None and not sil.any():
+        return accent
+    # W3 — mastodon's white m: FILL the glyph channel so the chain works a solid
+    # body (nothing to churn), guard the zone against hollow-widen ink, and stamp
+    # the m back as 1px interior ink lines after the outline (the user ruling).
+    gz = glyph_ink_lines(constructions, canvas_hw, target)
+    glyph_zone = gz[0] if gz is not None else None
+    if gz is not None:
+        sil = fill_glyph_channels(sil, glyph_zone)
     sil = unblot_features(sil, target)
-    reference = _composite(
-        [reference_mask(parts, canvas_hw, target) for parts, _c, _l in constructions],
-        (target, target))
+    reference, valley_zone = build_reference(constructions, canvas_hw, target)
+    if valley_zone is not None:                       # W4: relayout inter-stroke valleys join
+        glyph_zone = (valley_zone if glyph_zone is None
+                      else (glyph_zone | valley_zone))   # the protected_bg guard zone
+    sil = despeck_artifacts(sil, target, reference)   # artifact removal — BEFORE widen (which
+    #                                                   otherwise fattens a speck into a chimney)
+    sil = widen_underrepresented(sil, target, structure_ref,
+                                 protected_bg=glyph_zone)   # @16 continuity widen (self-gated)
     sil = deburr_nibs(sil, target, reference)   # drop cubify union-seam edge nibs (outside-ref)
-    sil = normalize_stroke_width(sil, target)   # 2px lines -> 1px (thin) or 3px (widen)
-    sil = symmetrize_render(sil, constructions, canvas_hw, target)   # fold to the label's mirror axes
-    #   (reflects features, so runs LAST); the chirality guard in _label_axes now excludes the
-    #   over-folding class — chiral pinwheels (slack) and off-V/H-axis mirrors (react) no-op.
-    ring = silhouette_outline(sil)
-    return connect_disjoint(ring, sil, target)
+    sil = normalize_stroke_width(sil, target, reference=reference,
+                                 protected_bg=glyph_zone)   # 2px -> 1px / hollow 3px,
+    #                                             blot-arbitrated; comp-skel repair + anti-spill
+    sil = symmetrize_render(sil, constructions, canvas_hw, target, reference)   # label mirror fold
+    #   (reflects features, so runs LAST); the chirality guard in _label_axes excludes the
+    #   over-folding class, and _fold_or_repair de-blots re-fattening folds instead of vetoing them.
+    ring = perimeter_ring(sil, target)
+    if gz is not None:
+        ring = stamp_glyph_ink(ring, gz[1], target)
+    return restore_accent(ring, accent, acc_ccs, acc_attached)

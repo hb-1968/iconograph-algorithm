@@ -57,7 +57,7 @@ from iconograph.application.compress.decompose import (
 from iconograph.application.compress.contour_parse import draw_shape_overlay, parse_shape
 from iconograph.application.compress.L3_fit import draw_fit_overlay, fit_features
 from iconograph.application.preprocess import preprocess
-from iconograph.cache import CACHE_ROOT, cached, prewarm
+from iconograph.cache import CACHE_ROOT, FIXTURES_ROOT, TESTBED_ROOT, cached, prewarm
 
 ROUTING_LABELS = ("standard", "inverted", "burst")
 
@@ -77,19 +77,19 @@ MISMATCH = (0xC6, 0x28, 0x28)
 AMBER = (0xF5, 0xA6, 0x23)   # marginal-coverage badge (between MATCH and MISMATCH)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-FIXTURES = REPO_ROOT / "fixtures"
+FIXTURES = FIXTURES_ROOT   # env-overridable basis (ICONOGRAPH_FIXTURES)
 README = FIXTURES / "README.md"
-TESTBED_DIR = REPO_ROOT / "testbed" / "categorize"
+TESTBED_DIR = TESTBED_ROOT / "categorize"
 GRID_PATH = TESTBED_DIR / "grid.png"
-PREPROCESS_DIR = REPO_ROOT / "testbed" / "preprocess"
+PREPROCESS_DIR = TESTBED_ROOT / "preprocess"
 PREPROCESS_GRID_PATH = PREPROCESS_DIR / "grid.png"
-ALIGN_DIR = REPO_ROOT / "testbed" / "align"
+ALIGN_DIR = TESTBED_ROOT / "align"
 ALIGN_GRID_PATH = ALIGN_DIR / "grid.png"
-SPC_DIR = REPO_ROOT / "testbed" / "segment_prim_classify"
+SPC_DIR = TESTBED_ROOT / "segment_prim_classify"
 SPC_GRID_PATH = SPC_DIR / "grid.png"
-L2FS_DIR = REPO_ROOT / "testbed" / "L2_feature_segment"
+L2FS_DIR = TESTBED_ROOT / "L2_feature_segment"
 L2FS_GRID_PATH = L2FS_DIR / "grid.png"
-DECOMPOSE_DIR = REPO_ROOT / "testbed" / "decompose"
+DECOMPOSE_DIR = TESTBED_ROOT / "decompose"
 DECOMPOSE_GRID_PATH = DECOMPOSE_DIR / "grid.png"
 
 

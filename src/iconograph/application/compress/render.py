@@ -895,6 +895,7 @@ WHAT YOU ARE WRITING
 from __future__ import annotations
 
 import math
+import time
 import os
 from dataclasses import dataclass, field, replace
 from typing import Literal
@@ -908,6 +909,7 @@ from iconograph.application.compress.common import (
     Circle,
     Ellipse,
     Part,
+    _offset_part,
     Polygon,
     Primitive,
     Rectangle,
@@ -955,6 +957,15 @@ from iconograph.application.compress.straighten import (
     stroke_axis_runs,
     translate_prim,
 )
+from iconograph.application.common import (
+    masks_8adjacent,
+    mst_bridges,
+    nearest_gap,
+)
+from iconograph.application.compress.decompose import decompose_shape
+from iconograph.application.compress.label_clean import clean_labels
+from iconograph.application.compress.segment_prim_classify import Classified
+from iconograph.application.compress.L2_feature_segment import Feature
 
 Role = Literal["dominant", "lobe", "accent", "shave", "counter"]
 
@@ -1667,6 +1678,28 @@ def _flip_mask(mask: np.ndarray, a2: int, vertical: bool) -> np.ndarray:
     return out
 
 
+SYM_AXIS_SEARCH = 6          # ± half-px steps searched for the true flip axis
+
+
+def _best_flip_axis(u_mask: np.ndarray, vertical: bool) -> tuple[int, float] | None:
+    """Search a ±SYM_AXIS_SEARCH half-px window (±3 px) around the silhouette's own
+    centre for the integer flip axis a2 maximising IoU(U, flip(U)) — aligning the mirror
+    with what was drawn. Returns (a2, best_iou) or None on an empty mask. (Lifted from
+    refine/common.py — H5: cubify's R6 dual-axis detection and the stage-4 symmetrize
+    machinery share it; refine re-imports it from here.)"""
+    ys, xs = np.nonzero(u_mask)
+    if xs.size == 0:
+        return None
+    centre = float(xs.mean()) if vertical else float(ys.mean())
+    a2c = int(round(2.0 * centre))
+    best: tuple[int, float] | None = None
+    for a2 in range(a2c - SYM_AXIS_SEARCH, a2c + SYM_AXIS_SEARCH + 1):
+        iou = _iou_bool(u_mask, _flip_mask(u_mask, a2, vertical))
+        if best is None or iou > best[1]:
+            best = (a2, iou)
+    return best
+
+
 def _sym_prep(parts: list[Part], solos: list[np.ndarray],
               canvas_hw: tuple[int, int], target: int
               ) -> tuple[bool, float, int, float, dict[int, int], set[int]] | None:
@@ -2360,13 +2393,34 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
     # _run/arbitration machinery below is retained only for T > 24 (synthetic
     # regression). Lazy import breaks the render<->cubify cycle.
     if target <= CUBIFY_MAX_T:
-        from .cubify import cubify
+        from .cubify import _glyph_stroke_relayout, cubify
+        # W4 — stroke-glyph re-layout (medium's M): a deliberate idealization is
+        # scored against its OWN reference (the round-4/5 ref-substitution
+        # doctrine); fidelity vs the ORIGINAL reference is reported alongside
+        # (fid_ref / "extrapolate") so the idealization cost stays auditable.
+        pp = _glyph_stroke_relayout(parts, canvas_hw, target)
+        fid_orig: float | None = None
+        kind: str | None = None
+        oref = ref
+        if pp is not parts:
+            ref = reference_mask(pp, canvas_hw, target)
+            naive = naive_mask(pp, canvas_hw, target)
+            band = _band_width(ref)
+            topo_ref_v = _topology(ref)
+            topo_canon_v = _topology(_compound_mask(pp, h, w))
+            naive_jag = jag_score(naive)
         # Cross-resolution structure constraint: a smaller feed size uses the largest feed
         # size (@24) as its structural reference (the spine connected throughout). @24 itself
         # has no larger sibling → renders normally (structure_ref=None, byte-identical).
-        structure_ref = (cubify(parts, canvas_hw, CUBIFY_MAX_T)
+        structure_ref = (cubify(_glyph_stroke_relayout(parts, canvas_hw, CUBIFY_MAX_T)
+                                if pp is not parts else parts,
+                                canvas_hw, CUBIFY_MAX_T)
                          if target < CUBIFY_MAX_T else None)
-        cmask = cubify(parts, canvas_hw, target, structure_ref)
+        cmask = cubify(pp, canvas_hw, target, structure_ref)
+        if pp is not parts:
+            fid_orig = min(_iou_bool(cmask, oref),
+                           _boundary_iou(cmask, oref, _band_width(oref)))
+            kind = "extrapolate"
         return RenderResult(
             mask=cmask, ref=ref, naive=naive, records=[],
             jag=jag_score(cmask), jag_naive=naive_jag,
@@ -2377,6 +2431,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
             topo_render=_topology(cmask),
             topo_ref=topo_ref_v, topo_canon=topo_canon_v,
             staircase=_staircase_total(cmask),
+            fid_ref=fid_orig, ref_kind=kind,
         )
 
     coverage = reference_coverage(parts, canvas_hw, target)   # refiner target
@@ -4390,3 +4445,757 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
 def render(parts: list[Part], canvas_hw: tuple[int, int], target: int) -> np.ndarray:
     """The R1 render: (target, target) uint8 {0,255}. Deterministic (H8)."""
     return render_debug(parts, canvas_hw, target).mask
+
+
+# ── the cross-construction ASSEMBLY layer + construction builder (production;
+#    lifted from the render_debug harness so application/pipeline.py never
+#    imports a debug module — the harness imports these back) ──
+
+_FX_BG = (238, 238, 238)   # composite background: white-on-white features stay visible
+
+
+def build_constructions(fs, sub_case: str, tag: str = "?"):
+    """Per-segment CSG constructions in FULL-canvas coords from an L2
+    FeatureSegmentation (PURE — no disk I/O; the production build and the
+    render_debug harness both call this; the harness's _fixture_constructions
+    is the thin pkl-reading wrapper). Classified -> 1-part add; Feature ->
+    decompose_shape (computed once, target-independent) offset by (bbox - pad),
+    label-cleaned. Returns (S, cons, src): cons = [(parts, color_rgb, label)],
+    src = the SOURCE silhouette at S (the union of the segments' own masks —
+    the _bridge_source_gaps connectivity ground truth)."""
+    S = int(fs.image_shape[0])
+    min_feat = _min_feature_px(S)
+    cons: list[tuple[list[Part], tuple[int, int, int], str]] = []
+    src = np.zeros((S, S), np.uint8)
+    n_residual = 0
+    for si, seg in enumerate(fs.segments):
+        if isinstance(seg, Classified):
+            src |= _raster_part(seg.primitive, S, S)
+            cons.append(([Part(seg.primitive, "add")], seg.color_rgb,
+                         f"#{si} L1 {type(seg.primitive).__name__}"))
+            continue
+        if not isinstance(seg, Feature):
+            continue
+        _bx, _by, _bw, _bh = seg.bbox
+        src[_by:_by + _bh, _bx:_bx + _bw] |= (seg.mask > 0).astype(np.uint8) * 255
+        t0 = time.time()
+        d = decompose_shape(seg.mask, min_feat, seg.shape_hint,
+                            ring=seg.ring_geom, bbox_xy=(seg.bbox[0], seg.bbox[1]))
+        # WS2 label-cleaner: prune/merge/re-fit/normalize/re-select before render.
+        # Rebuild the SAME padded target the decomposer scored against
+        # (decompose.py builds target from seg.mask at d.pad / d.shape).
+        _th, _tw = seg.mask.shape[:2]
+        _src = np.zeros(d.shape, np.uint8)
+        _src[d.pad:d.pad + _th, d.pad:d.pad + _tw] = seg.mask
+        d = clean_labels(d, _src, sub_case, min_feat)
+        dt = time.time() - t0
+        if d.residual is not None:
+            n_residual += 1
+        if not d.parts:
+            print(f"  {tag}#{si}: decompose returned no parts — deferred "
+                  f"(R3 residual territory) [{dt:.1f}s]")
+            continue
+        ox, oy = seg.bbox[0] - d.pad, seg.bbox[1] - d.pad
+        parts = [_offset_part(p, ox, oy) for p in d.parts]
+        cons.append((parts, seg.color_rgb, f"#{si} D2 n={len(parts)}"))
+        print(f"  {tag}#{si} decomposed: {len(parts)} parts "
+              f"cov a{d.coverage:.2f}/b{d.boundary_cov:.2f} [{dt:.1f}s]")
+    if n_residual:
+        print(f"  {tag}: {n_residual} feature(s) carry a residual "
+              f"(R3 tier, not rendered)")
+    return S, cons, src
+
+
+
+
+SEP_MIN_CONS = 4   # divots fire only on OVERREPRESENTED multi-element marks (>= this many
+#                    constructions — slack's 8-pill pinwheel). A 2-3 piece glyph (adobe's
+#                    A + i-stem + i-dot) is NOT force-separated: the i-dot stays attached to
+#                    its stem (user: 'dot attached to stem'). A size guard can't do this —
+#                    at 16px slack's short pills are the SAME size as the i-dot — so the
+#                    discriminator is piece COUNT (the user's 'overrepresented' principle).
+
+
+HARM_COPY_IOU = 0.95      # centered solo-raster IoU gate: group members must be translated COPIES
+
+
+def _harmonize_singles(masks: list[np.ndarray], cons, S: int, target: int
+                       ) -> tuple[list[np.ndarray], frozenset]:
+    """R1 cross-construction stamp harmonization (docker's nine container squares):
+    constructions that are single-add-part translated COPIES with near-equal canonical
+    extents — detected by `render._regularity_groups` on the flat single-part list (H5
+    reuse) — are re-rendered as ONE shared stamp placed on per-axis integer pitch
+    combs, so every member rasterizes the SAME HxW at the same grid parity
+    (independent per-construction rounding made docker's squares 2x1…3x2, some not
+    even square). Returns (masks, protected construction indices); protected members
+    must not be eaten by _separate_divots' contact-clear (the whale render spills into
+    the container rows — probe-proven). Fires only when >= 3 single-part constructions
+    form an aligned size group (probe: docker alone across the fixture set).
+    Deterministic (H8: sorted orders, median/first-cluster anchors, integer combs)."""
+    singles = [i for i, (parts, _c, _l) in enumerate(cons)
+               if len(parts) == 1 and parts[0].op == "add"]
+    if len(singles) < 3:
+        return masks, frozenset()
+    flat = [cons[i][0][0] for i in singles]
+    det = _regularity_groups(flat, (S, S))
+    if det is None:
+        return masks, frozenset()
+    groups, _snapped = det
+    out = list(masks)
+    protected: set[int] = set()
+    tol = REG_ALIGN_TOL * S
+
+    def _cluster_means(vals: list[float]) -> list[float]:
+        means: list[list[float]] = []
+        for v in sorted(vals):
+            if means and v - means[-1][-1] <= tol:
+                means[-1].append(v)
+            else:
+                means.append([v])
+        return [sum(c) / len(c) for c in means]
+
+    for grp in groups["size"]:
+        mem = [singles[j] for j in grp]                    # construction indices
+        if len(mem) < 3:
+            continue
+        solos = [_compound_mask(cons[ci][0], S, S) for ci in mem]
+        cents, boxes, ok = [], [], True
+        for m in solos:
+            ys, xs = np.nonzero(m)
+            if xs.size == 0:
+                ok = False
+                break
+            cents.append((float(ys.mean()), float(xs.mean())))
+            boxes.append((int(ys.max() - ys.min() + 1), int(xs.max() - xs.min() + 1)))
+        if not ok:
+            continue
+
+        def _centered(m: np.ndarray, cy: float, cx: float) -> np.ndarray:
+            dy, dx = int(round(S / 2 - cy)), int(round(S / 2 - cx))
+            c = np.zeros_like(m)
+            ys, xs = np.nonzero(m)
+            c[np.clip(ys + dy, 0, S - 1), np.clip(xs + dx, 0, S - 1)] = 255
+            return c
+
+        ref0 = _centered(solos[0], *cents[0])
+        if any(_iou_bool(_centered(solos[q], *cents[q]) > 0, ref0 > 0) < HARM_COPY_IOU
+               for q in range(1, len(mem))):
+            continue                                       # not translated copies
+        row_means = _cluster_means([c[0] for c in cents])
+        col_means = _cluster_means([c[1] for c in cents])
+        f = target / S
+
+        def _comb(means: list[float]) -> dict[int, int]:
+            """cluster index -> target-space position on an integer pitch comb."""
+            base = int(round(means[0] * f))
+            if len(means) < 2:
+                return {0: base}
+            pitch = max(1, int(round((means[-1] - means[0]) / (len(means) - 1) * f)))
+            return {q: base + q * pitch for q in range(len(means))}
+
+        rows_t, cols_t = _comb(row_means), _comb(col_means)
+        med_h = sorted(b[0] for b in boxes)[len(boxes) // 2]
+        med_w = sorted(b[1] for b in boxes)[len(boxes) // 2]
+        row_pitch = (max(rows_t.values()) - min(rows_t.values())) // max(1, len(rows_t) - 1) \
+            if len(rows_t) > 1 else target
+        col_pitch = (max(cols_t.values()) - min(cols_t.values())) // max(1, len(cols_t) - 1) \
+            if len(cols_t) > 1 else target
+        sh = min(max(1, int(round(med_h * f))), max(1, row_pitch - 1))
+        sw = min(max(1, int(round(med_w * f))), max(1, col_pitch - 1))
+
+        def _nearest(q_means: list[float], v: float) -> int:
+            return min(range(len(q_means)), key=lambda q: (abs(q_means[q] - v), q))
+
+        for ci, (cy, cx) in zip(mem, cents):               # sorted flat order (mem ascending)
+            py = rows_t[_nearest(row_means, cy)]
+            px = cols_t[_nearest(col_means, cx)]
+            y0 = min(max(0, py - sh // 2), target - sh)
+            x0 = min(max(0, px - sw // 2), target - sw)
+            stamp = np.zeros((target, target), np.uint8)
+            stamp[y0:y0 + sh, x0:x0 + sw] = 255
+            out[ci] = stamp
+            protected.add(ci)
+    return out, frozenset(protected)
+
+
+def _canon_masks(cons, S: int) -> list[np.ndarray]:
+    """Per-construction canonical (S,S) compound masks — the source-truth footprints
+    the cross-construction assembly steps key on (divot separation's abut test, the
+    source-gap bridge's component vote). One helper, not per-step comprehensions (H5)."""
+    return [_compound_mask(parts, S, S) for parts, _c, _l in cons]
+
+
+def _separate_divots(masks: list[np.ndarray], cons, S: int,
+                     protected: frozenset = frozenset()) -> list[np.ndarray]:
+    """Re-open 1px divots between constructions that are SEPARATE in the source but whose
+    rendered masks fused at the feed resolution (slack's 8 pinwheel pills 'glob together
+    for no good reason'). Gated to OVERREPRESENTED marks (>= SEP_MIN_CONS constructions);
+    a 2-3 piece glyph is left as rendered. Source-separate iff CANONICAL footprints are
+    8-disconnected at canvas res (unambiguous, before the feed-res downsample globs the
+    gaps — slack's gaps are sub-pixel in the reference at 16, so a reference-based test
+    under-separates). Where such a pair's rendered masks touch, the contact pixels are
+    cleared from the later (area-sorted smaller, drawn on top) construction so each label
+    keeps a >=1px gap; pairs that genuinely abut in the source are left fused. `protected`
+    (R1 harmonized-stamp members) are never eaten: a protected-vs-unprotected contact
+    clears from the UNPROTECTED side (the whale render spills into docker's container
+    rows and would otherwise erase the 1px stamps); protected-vs-protected contacts are
+    left (stamps of one comb never touch by construction). (H8)."""
+    if len(masks) < SEP_MIN_CONS:
+        return masks
+    k = np.ones((3, 3), np.uint8)
+    canon = _canon_masks(cons, S)
+    out = [m.copy() for m in masks]
+    for i in range(len(masks)):
+        di = cv2.dilate(masks[i], k)
+        ci = cv2.dilate(canon[i], k)
+        for j in range(i + 1, len(masks)):
+            if np.any((ci > 0) & (canon[j] > 0)):
+                continue                              # abut in source — preserve the join
+            contact = (di > 0) & (masks[j] > 0)
+            if not np.any(contact):
+                continue
+            if j in protected and i not in protected:
+                back = (cv2.dilate(masks[j], k) > 0) & (out[i] > 0)
+                out[i] = out[i].copy()
+                out[i][back] = 0                      # clear from the unprotected side
+            elif not (i in protected and j in protected):
+                out[j] = out[j].copy()
+                out[j][contact] = 0
+    return out
+
+
+NEST_MIN_GAP = 3      # min inter-ring band (px) between nested label rings — the user's
+#                       "enough space for a 3x3 square between them": a 1px accent then
+#                       clears both rings by 1px inside the band's corner pocket
+NEST_ACC3_GAP = 5     # band width that hosts the RATIFIED 3x3-OUTLINE accent (@24): 3px
+#                       dot + 1px clearance to each ring; falls back to a 1px accent in a
+#                       NEST_MIN_GAP band when the interior can't afford 2x5 + a viable ring
+NEST_ACC_DIM_FRAC = 0.2   # accent's canonical max-dim <= this x min(outer box dims) — a
+#                           sub-speck mark (instagram's camera dot), never a sibling glyph
+
+
+def _coordinate_nested_rings(masks: list[np.ndarray], cons, S: int, target: int
+                             ) -> tuple[list[np.ndarray], np.ndarray | None]:
+    """Coordinate NESTED label-ring constructions + their inter-ring accent (instagram:
+    body ring ⊃ lens ring + camera dot). Per-construction cubify renders each ring alone,
+    so nothing guarantees the composed geometry: the lens lands off-center (unequal gaps),
+    and the dot's floor-mapped center collides with a ring corner (it OVERLAPPED both
+    rings @24). This assembly pass re-derives the composition from the same `label_ring_spec`
+    the label path renders (one source of truth): the inner ring is RE-CENTERED in the
+    outer's interior (equal per-axis gaps, parity-matched), SHRUNK when the natural band
+    is under NEST_MIN_GAP (the user's 3x3-pocket floor) or when the RATIFIED 3x3-OUTLINE
+    accent needs a NEST_ACC3_GAP band, and the accent is PLACED in the interior-corner
+    pocket nearest its canonical centroid with >= 1px clearance to both rings — the
+    user-ratified forms: 3x3 hollow square (1px stroke) when the band affords 5px, else a
+    single px. Fires only when exactly TWO constructions carry ring specs, one strictly
+    containing the other, BOTH rendered as their spec rings (the label path actually won),
+    and a sub-speck single-add accent lives in the canonical inter-ring band — otherwise
+    byte-identical passthrough (youtube-music: one spec; android: zero).
+
+    Returns (masks, accent_protected): accent_protected = the FILLED dxd accent bbox
+    (uint8 255; the 3x3 outline's 1x1 interior hole is protected territory too) — the
+    zone refine_perimeter carves out and restores, since refine's reference is empty at
+    the placed position (composite-ref inseparability, the documented @16 residual).
+    Deterministic (H8): spec-derived integer boxes, fixed corner order TL<TR<BL<BR."""
+    from .cubify import _map_coords, label_ring_spec, ring_mask  # lazy: breaks the render<->cubify cycle
+    specs = [label_ring_spec(parts, (S, S), target) for parts, _c, _l in cons]
+    ringed = [i for i, sp in enumerate(specs) if sp is not None]
+    if len(ringed) != 2:
+        return masks, None
+
+    def _contains(ob, ib) -> bool:
+        oy, ox, oh, ow = ob
+        iy, ix, ih, iw = ib
+        return (oy < iy and ox < ix
+                and iy + ih < oy + oh and ix + iw < ox + ow)
+
+    a, b = ringed
+    if _contains(specs[a][0], specs[b][0]):
+        o, inr = a, b
+    elif _contains(specs[b][0], specs[a][0]):
+        o, inr = b, a
+    else:
+        return masks, None
+    if (not np.array_equal(masks[o], ring_mask(*specs[o], target))
+            or not np.array_equal(masks[inr], ring_mask(*specs[inr], target))):
+        return masks, None                 # a ring lost the label path — don't compose blind
+    # accent: sub-speck single-add construction whose canonical centroid sits in the
+    # inter-ring band (inside the OUTER ring's subtract box, outside the INNER's add box)
+    h_c, w_c = S, S
+    ob_can = cv2.boundingRect(_raster_part(cons[o][0][1].primitive, h_c, w_c))
+    ib_can = cv2.boundingRect(_raster_part(cons[inr][0][0].primitive, h_c, w_c))
+    oo_can = cv2.boundingRect(_raster_part(cons[o][0][0].primitive, h_c, w_c))
+    canon = _canon_masks(cons, S)
+    acc = None
+    for ci, (parts, _c, _l) in enumerate(cons):
+        if ci in (o, inr) or len(parts) != 1 or parts[0].op != "add":
+            continue
+        ys, xs = np.nonzero(canon[ci])
+        if xs.size == 0:
+            continue
+        bh = int(ys.max() - ys.min() + 1)
+        bw = int(xs.max() - xs.min() + 1)
+        if max(bh, bw) > NEST_ACC_DIM_FRAC * min(oo_can[2], oo_can[3]):
+            continue
+        cy, cx = float(ys.mean()), float(xs.mean())
+        in_outer = (ob_can[1] <= cy < ob_can[1] + ob_can[3]
+                    and ob_can[0] <= cx < ob_can[0] + ob_can[2])
+        in_inner = (ib_can[1] <= cy < ib_can[1] + ib_can[3]
+                    and ib_can[0] <= cx < ib_can[0] + ib_can[2])
+        if in_outer and not in_inner:
+            acc = (ci, cy, cx)
+            break                          # lowest index wins (deterministic)
+    if acc is None:
+        return masks, None
+    ai, acy, acx = acc
+    (oy, ox, oh, ow), wo = specs[o]
+    iy0, ix0 = oy + wo, ox + wo            # outer ring interior
+    ih_i, iw_i = oh - 2 * wo, ow - 2 * wo
+    (_ny, _nx, nih, niw), wi = specs[inr]  # natural inner ring size
+    d = 3 if min(ih_i, iw_i) - 2 * NEST_ACC3_GAP >= 2 * wi + 1 else 1
+    g_req = NEST_ACC3_GAP if d == 3 else NEST_MIN_GAP
+    lh = min(nih, ih_i - 2 * g_req)
+    lw = min(niw, iw_i - 2 * g_req)
+    if (ih_i - lh) % 2:
+        lh -= 1                            # parity-match so the gaps split evenly
+    if (iw_i - lw) % 2:
+        lw -= 1
+    if min(lh, lw) < 2 * wi + 1:
+        return masks, None                 # honest partial: no viable inner ring
+    gy, gx = (ih_i - lh) // 2, (iw_i - lw) // 2
+    out = list(masks)
+    out[inr] = ring_mask((iy0 + gy, ix0 + gx, lh, lw), wi, target)
+    # corner pocket (gy x gx at the interior corners) nearest the accent's floor-mapped
+    # canonical centroid; ties in fixed TL<TR<BL<BR order
+    ty, tx = _map_coords(np.array([acy]), np.array([acx]), S, target, True)
+    ty, tx = float(ty[0]), float(tx[0])
+    corners = (
+        (iy0, ix0, "t", "l"), (iy0, ix0 + iw_i - gx, "t", "r"),
+        (iy0 + ih_i - gy, ix0, "b", "l"), (iy0 + ih_i - gy, ix0 + iw_i - gx, "b", "r"),
+    )
+    py, px, vk, hk = min(
+        corners,
+        key=lambda c: ((c[0] + (gy - 1) / 2.0 - ty) ** 2
+                       + (c[1] + (gx - 1) / 2.0 - tx) ** 2))
+    sy, sx = gy - d, gx - d                # slack biased toward the OUTER corner
+    dy0 = py + (sy // 2 if vk == "t" else sy - sy // 2)
+    dx0 = px + (sx // 2 if hk == "l" else sx - sx // 2)
+    dot = np.zeros((target, target), np.uint8)
+    dot[dy0:dy0 + d, dx0:dx0 + d] = 255
+    if d == 3:
+        dot[dy0 + 1, dx0 + 1] = 0          # the RATIFIED hollow form (1px stroke)
+    out[ai] = dot
+    prot = np.zeros((target, target), np.uint8)
+    prot[dy0:dy0 + d, dx0:dx0 + d] = 255   # FILLED bbox: the hole px are protected too
+    return out, prot
+
+
+def _bridge_source_gaps(masks: list[np.ndarray], cons, S: int,
+                        src: np.ndarray | None) -> list[np.ndarray]:
+    """Re-CONNECT constructions the SOURCE connects but the rendered composite left
+    apart (android@24's left antenna: the decomposition opened a ~2px hairline at S —
+    sub-pixel at feed res — and independent per-construction rounding blew it up to a
+    2px gap). The dual of `_separate_divots`: divots separates only source-8-DISCONNECTED
+    pairs, this bridges only within a source-8-CONNECTED group — disjoint scopes, no
+    oscillation. Constructions vote their source component by majority canonical-px
+    label (bincount argmax = lowest label on ties); a group whose rendered union splits
+    into >1 c8 components gets `mst_bridges` 1px `LINE_4` bridges, each drawn into the
+    lowest-index endpoint-owning construction's mask. Keyed on source-at-S connectivity,
+    NEVER a downsampled source (INTER_AREA fuses adobe's dots / shatters youtube-music)
+    and NEVER canonical proximity (instagram's dot sits sub-pixel-close at feed res —
+    bridging it would fight the separation doctrine). Deterministic (H8). Blast radius
+    at introduction: android-head_flat@24 alone across the fixture set."""
+    if src is None or len(masks) < 2:
+        return masks
+    lbl = cv2.connectedComponents((src > 0).astype(np.uint8), connectivity=8)[1]
+    canon = _canon_masks(cons, S)
+    groups: dict[int, list[int]] = {}
+    for ci in range(len(cons)):
+        if not np.any(masks[ci]):
+            continue
+        labs = lbl[canon[ci] > 0]
+        labs = labs[labs > 0]                     # drop bg label 0 — it must never win the vote
+        if labs.size == 0:
+            continue
+        groups.setdefault(int(np.bincount(labs).argmax()), []).append(ci)
+    out = list(masks)
+    for g in sorted(groups):
+        mem = groups[g]
+        if len(mem) < 2:
+            continue
+        union = np.zeros_like(out[mem[0]])
+        for ci in mem:
+            union |= out[ci]
+        nc, clbl = cv2.connectedComponents((union > 0).astype(np.uint8), connectivity=8)
+        if nc - 1 <= 1:
+            continue
+        for pa, pb in mst_bridges([clbl == q for q in range(1, nc)]):
+            owner = min(ci for ci in mem
+                        if out[ci][pa[0], pa[1]] or out[ci][pb[0], pb[1]])
+            om = out[owner].copy()
+            cv2.line(om, (pa[1], pa[0]), (pb[1], pb[0]), 255, 1, cv2.LINE_4)   # (x,y)
+            out[owner] = om
+    return out
+
+
+RAD_MIN_MEMBERS = 6   # >= this many constructions on a shared radius = a radial family
+#                       (signal 15; slack's 4 corner droplets excluded — the only other
+#                       radial arrangement in the 30-fixture scan; adobe's 3 dots below any bar).
+#                       Membership keys on MASK geometry (radius/size/slot), NOT part
+#                       structure — signal's dashes decompose into 1-7 part mixed-op
+#                       constructions (only 4 are single-add)
+RAD_R_TOL = 0.15      # |r - median_r| / median_r membership band. Signal's dashes sit at
+#                       +-3.1%; the annular-sector corner piece at +21.6% is EXCLUDED — which
+#                       is what keeps the tail slot empty (it keeps its own construction render)
+RAD_SIZE_TOL = 1.5    # member area within [1/tol, tol] x median (signal's long flanks: 1.33)
+RAD_SLOT_TOL = 0.25   # member-to-slot angular deviation / pitch (signal measured max 0.093)
+
+
+def _stamp_slot_bar(canvas: np.ndarray, cy: int, cx: int, ang: int, length: int) -> None:
+    """Draw a 1px-thick LENGTH-px bar through (cy, cx) at slope-grid angle
+    `ang` in {0, 45, 90, 135} — numpy index arrays, NOT cv2.line (LINE_4
+    staircases a true diagonal into 3px Ls). Bounds via a boolean mask on BOTH
+    index arrays — never np.clip (it silently pins duplicate edge px)."""
+    t = canvas.shape[0]
+    k = np.arange(length) - length // 2
+    if ang == 0:
+        ys, xs = np.full_like(k, cy), cx + k
+    elif ang == 90:
+        ys, xs = cy + k, np.full_like(k, cx)
+    elif ang == 45:
+        ys, xs = cy - k, cx + k
+    else:
+        ys, xs = cy + k, cx + k
+    valid = (ys >= 0) & (ys < t) & (xs >= 0) & (xs < t)
+    canvas[ys[valid], xs[valid]] = 255
+
+
+def _harmonize_radial(masks: list[np.ndarray], cons, S: int, target: int
+                      ) -> tuple[list[np.ndarray], frozenset, int, np.ndarray | None]:
+    """Radial sibling of _harmonize_singles (signal's 15 burst dashes): constructions
+    whose canonical masks sit on a shared radius at a near-uniform angular pitch
+    (part structure irrelevant — the dashes decompose 1-7 parts each) re-render as
+    ONE shared 1px bar stamped on a uniform angular comb — an orderly dashed ring
+    instead of the ~12-component scatter independent rounding produced. Slots with
+    no member (signal's tail gap at ~135deg — the corner piece fails RAD_R_TOL by
+    design) are never stamped. Sub-representable combs decimate by halving the
+    slot count while the per-slot dash length is < 2px (the blade-decimation
+    doctrine); returns (masks, protected member indices, n_decimated) where
+    n_decimated = stamps lost to decimation, fed to the topo audit's drops escape.
+    Detection is pure numpy/math trigonometry — NO cv2.warpPolar (H8; the
+    documented thread-nondeterminism hazard). Deterministic: sorted orders,
+    median anchors, argmin-with-fixed-tie parity. Fires on signal alone
+    (30-fixture scan)."""
+    if len(cons) < RAD_MIN_MEMBERS + 1:      # family + at least the mark it orbits
+        return masks, frozenset(), 0, None
+    canon = _canon_masks(cons, S)
+    comp = np.zeros((S, S), np.uint8)
+    for cm in canon:
+        comp |= cm
+    ys, xs = np.nonzero(comp)
+    if xs.size == 0:
+        return masks, frozenset(), 0, None
+    cy0, cx0 = float(ys.mean()), float(xs.mean())
+    mem, radii, angs, areas = [], [], [], []
+    for ci in range(len(cons)):
+        mys, mxs = np.nonzero(canon[ci])
+        if mxs.size == 0:
+            continue
+        mem.append(ci)
+        my, mx = float(mys.mean()), float(mxs.mean())
+        radii.append(math.hypot(my - cy0, mx - cx0))
+        angs.append(math.degrees(math.atan2(my - cy0, mx - cx0)) % 360.0)
+        areas.append(float(mxs.size))
+    if len(mem) < RAD_MIN_MEMBERS:
+        return masks, frozenset(), 0, None
+    med_r = float(np.median(radii))
+    med_a = float(np.median(areas))
+    if med_r <= 0.0 or med_a <= 0.0:
+        return masks, frozenset(), 0, None
+    keep = [k for k in range(len(mem))
+            if abs(radii[k] - med_r) <= RAD_R_TOL * med_r
+            and med_a / RAD_SIZE_TOL <= areas[k] <= med_a * RAD_SIZE_TOL]
+    if len(keep) < RAD_MIN_MEMBERS:
+        return masks, frozenset(), 0, None
+    kang = sorted(angs[k] for k in keep)
+    gaps = [(kang[(i + 1) % len(kang)] - kang[i]) % 360.0 for i in range(len(kang))]
+    med_gap = float(np.median(gaps))
+    if med_gap <= 0.0:
+        return masks, frozenset(), 0, None
+    n_slots = max(2, int(round(360.0 / med_gap)))
+
+    def _phase(n: int) -> float:
+        # circular mean at n-fold — render.py:1911-1913's formula verbatim (a
+        # private symbol there, and _radial_family needs a hub Part; the x n
+        # fold is what maps n-fold-equivalent angles onto one direction)
+        sx = sum(math.cos(math.radians(a * n)) for a in kang)
+        sy = sum(math.sin(math.radians(a * n)) for a in kang)
+        return math.degrees(math.atan2(sy, sx)) / n % (360.0 / n)
+
+    pitch = 360.0 / n_slots
+    phase = _phase(n_slots)
+
+    def _dev(a: float, ph: float, pt: float) -> float:
+        d = (a - ph) % pt
+        return min(d, pt - d)
+
+    if any(_dev(a, phase, pitch) > RAD_SLOT_TOL * pitch for a in kang):
+        return masks, frozenset(), 0, None
+    # shared dash form + the decimation ladder (per-slot length must be >= 2px)
+    longs = [max(cv2.minAreaRect(cv2.findNonZero(canon[mem[k]]))[1]) for k in keep]
+    ink_frac = min(0.95, float(np.median(longs)) * n_slots / (2.0 * math.pi * med_r))
+    f = target / S
+    r_t = med_r * f
+    n_full = n_slots
+    while True:
+        period = 2.0 * math.pi * r_t / n_slots
+        len_t = min(int(round(period * ink_frac)), max(1, int(math.floor(period)) - 1))
+        if len_t >= 2 or n_slots <= 2:
+            break
+        n_slots //= 2
+    if len_t < 2:
+        return masks, frozenset(), 0, None
+    if n_slots != n_full:
+        pitch_full = 360.0 / n_full
+        pitch = 360.0 / n_slots
+        # decimation parity: the halved comb sits on the even or odd full-comb
+        # slots; argmin total member->slot cost, tie -> parity 0
+        cands = [phase % pitch, (phase + pitch_full) % pitch]
+        costs = [sum(_dev(a, ph, pitch) for a in kang) for ph in cands]
+        phase = cands[int(np.argmin(costs))]
+    # 1px-thick bars: median canonical thickness x f rounds to 1 at both feed
+    # sizes (signal ~46px x 0.014/0.021); the all-1px-line doctrine's width
+    # stamp per OCCUPIED slot; each stamp lands in the nearest member's mask
+    # (lowest index on ties); unassigned members are cleared (decimation)
+    slot_members: dict[int, list[int]] = {}
+    for k in keep:
+        q = int(round(((angs[k] - phase) % 360.0) / pitch)) % n_slots
+        slot_members.setdefault(q, []).append(k)
+    out = list(masks)
+    for k in keep:                       # clear all members first (deterministic)
+        out[mem[k]] = np.zeros((target, target), np.uint8)
+    n_stamped = 0
+    for q in sorted(slot_members):
+        theta = math.radians(phase + q * pitch)
+        py = int(round((cy0 + med_r * math.sin(theta)) * f))
+        px = int(round((cx0 + med_r * math.cos(theta)) * f))
+        tang = (math.degrees(theta) + 90.0) % 180.0
+        ang = min((0, 45, 90, 135), key=lambda a: min(abs(tang - a), 180 - abs(tang - a)))
+        owner = min(slot_members[q],
+                    key=lambda k: (_dev(angs[k], phase + q * pitch, 360.0), mem[k]))
+        stamp = out[mem[owner]]
+        _stamp_slot_bar(stamp, py, px, ang, len_t)
+        n_stamped += 1
+    print(f"      harmonize_radial n={len(keep)} slots={n_slots} stamped={n_stamped} "
+          f"len={len_t}px decimated={max(0, len(keep) - n_stamped)}")
+    zone = np.zeros((target, target), np.uint8)
+    for k in keep:
+        zone |= out[mem[k]]
+    # the comb is a DELIBERATE assembly decision refine's ref-oracles cannot
+    # see (the dash references are EMPTY at 16, sub-0.5-coverage — the
+    # instagram-dot class): its stamps join the protected accent union and are
+    # carved out of the chain + restored verbatim (despeck's ref-less peel ate
+    # them, and symmetrize churned on the deliberately-asymmetric ring).
+    return out, frozenset(mem[k] for k in keep), max(0, len(keep) - n_stamped), zone
+
+
+SUBREP_ACC_MIN_DIM = 4   # canonical minAreaRect short side of a part's EXCLUSIVE zone >=
+#                          this px = a real identity lobe (signal's tail ~95px; a fit
+#                          hairline like adobe's RotatedEllipse sliver ~1.6px is noise)
+SUBREP_ACC_MAX_PX = 8    # cov>=0.5 target footprint <= this px = sub-representable
+#                          (the tail: 3px at both feed sizes; a representable lobe is 10s+)
+
+
+def _stamp_subrep_accents(masks: list[np.ndarray], cons, S: int, target: int,
+                          skip: frozenset = frozenset()
+                          ) -> tuple[list[np.ndarray], np.ndarray | None]:
+    """Represented-geometry minimum for SUB-REPRESENTABLE IDENTITY PARTS fused
+    inside a construction (signal's speech-bubble tail: a first-class Triangle
+    add whose feed-res footprint is a 1-2px nub that greedy tooth-clear erodes
+    and despeck then eats — the instagram accent class, but structurally outside
+    the ring-nest machinery). Per add part of a multi-add construction, the
+    part's EXCLUSIVE canonical zone (its raster minus the other adds') is
+    stamped at its >= _min_feature_px(target)^2 coverage footprint, USING ONLY
+    px outside the construction's already-rendered mask — interior lobes
+    (adobe's crossbar) have an empty outside-parent set, making the pass a
+    structural byte-identical no-op there: that property IS the blast-radius
+    guard. The stamp ORs into the mask (bridged by one 1px LINE_4 segment if
+    not already 8-adjacent) and its outside-parent zone joins the PROTECTED
+    accent union that refine carves out and restores. Deterministic (H8):
+    coverage-desc/row-major inflation, fixed part order."""
+    from .cubify import _glyph_stroke_relayout  # lazy: render<->cubify cycle
+    min_feat = _min_feature_px(target)
+    need = min_feat * min_feat
+    out = None
+    accent = None
+    for ci, (parts, _c, _l) in enumerate(cons):
+        if ci in skip:
+            continue                 # radial-harmonized members: the stamp IS their form
+        adds = [p for p in parts if p.op == "add"]
+        if len(adds) != 2:
+            continue                 # the DIAGNOSED class only: one accent riding one
+            #                          single-primitive body (signal's Ellipse+Triangle).
+            #                          Multi-add unions (reddit's ears, docker's fin,
+            #                          whatsapp/homebrew/obsidian/spotify protrusions)
+            #                          pass the hull gate too but regress cells (reddit@24
+            #                          PASS->FAIL) — the 3rd no-geometric-signal instance;
+            #                          documented follow-on, not this round's scope
+        if _radial_family(parts, [i for i, q in enumerate(parts)
+                                  if q.op == "add"]) is not None:
+            continue                 # radial families are comb-policed (claude's
+            #                          blades decimate BY DESIGN — a stamp fights it)
+        if _glyph_stroke_relayout(parts, (S, S), target) is not parts:
+            continue                 # relayout-fired construction: the re-layout IS the
+            #                          representation decision — raw-part zones no longer
+            #                          align with the moved render (medium's serif)
+        rasters = [_raster_part(p.primitive, S, S) for p in adds]
+        parent = masks[ci] > 0
+        for pi in range(len(adds)):
+            excl = rasters[pi] > 0
+            for qi in range(len(adds)):
+                if qi != pi:
+                    excl &= ~(rasters[qi] > 0)
+            if not np.any(excl):
+                continue
+            (rw, rh) = cv2.minAreaRect(cv2.findNonZero(excl.astype(np.uint8)))[1]
+            if min(rw, rh) < SUBREP_ACC_MIN_DIM:
+                continue
+            # PARENT-REPRESENTABILITY gate: an accent hangs off a REPRESENTABLE
+            # body (signal's bubble ~200px @16). When the rest of the
+            # construction is itself near-sub-representable (a burst dash's
+            # other half: 2-4px), the "accent" is just a part split — skip
+            # (this is what stopped the pass from stamping every dash part).
+            par = np.zeros((S, S), bool)
+            for qi in range(len(adds)):
+                if qi != pi:
+                    par |= rasters[qi] > 0
+            pcov = cv2.resize(par.astype(np.uint8) * 255, (target, target),
+                              interpolation=cv2.INTER_AREA)
+            if int(np.count_nonzero(pcov >= 128)) <= SUBREP_ACC_MAX_PX:
+                continue
+            # HULL-PROTRUSION gate: the accent must protrude OUTSIDE the
+            # parent's convex hull (signal's tail off the disc). A dominantly-
+            # exclusive part INSIDE the hull is a union constituent, not an
+            # appendage (adobe's crossbar 0.985 exclusive yet interior;
+            # discord/firefox/apple/mathematica sliver zones likewise).
+            eys, exs = np.nonzero(excl)
+            hull = cv2.convexHull(cv2.findNonZero(par.astype(np.uint8)))
+            if cv2.pointPolygonTest(
+                    hull, (float(exs.mean()), float(eys.mean())), False) >= 0:
+                continue
+            cov = cv2.resize(excl.astype(np.uint8) * 255, (target, target),
+                             interpolation=cv2.INTER_AREA)
+            n50 = int(np.count_nonzero(cov >= 128))
+            if n50 == 0 or n50 > SUBREP_ACC_MAX_PX:
+                continue
+            core = (cov >= 128) & ~parent
+            if not np.any(core):
+                continue                 # fully rendered already — the structural no-op
+            # (a missing-fraction gate was probed and DROPPED: the zone hugs the
+            #  parent rim, so rendered rim px dilute the measure — the HULL-
+            #  PROTRUSION gate below is the real appendage/constituent separator)
+            stamp = core.copy()
+            if int(stamp.sum()) < need:
+                # inflate from cov>0 outside-parent px: coverage desc, then
+                # row-major (argsort stable on the negated flat array)
+                pool = (cov > 0) & ~parent & ~stamp
+                order = np.argsort(-cov.ravel().astype(np.int32), kind="stable")
+                flat_pool = pool.ravel()
+                st = stamp.ravel()
+                tt = core.shape[0]
+
+                def _makes_block(flat, idx):
+                    # would setting idx complete a 2x2 all-ink block? (the
+                    # tail must stay an L, not a blot square)
+                    y, x = divmod(int(idx), tt)
+                    m = flat.reshape(tt, tt)
+                    for oy in (-1, 0):
+                        for ox in (-1, 0):
+                            y0, x0 = y + oy, x + ox
+                            if 0 <= y0 < tt - 1 and 0 <= x0 < tt - 1:
+                                blk = m[y0:y0 + 2, x0:x0 + 2].copy()
+                                blk[y - y0, x - x0] = True
+                                if blk.all():
+                                    return True
+                    return False
+
+                for pass_blocks in (False, True):   # non-blocking px first
+                    for idx in order:
+                        if int(st.sum()) >= need:
+                            break
+                        if flat_pool[idx] and not st[idx] and (
+                                pass_blocks or not _makes_block(st, idx)):
+                            st[idx] = True
+                    if int(st.sum()) >= need:
+                        break
+                stamp = st.reshape(core.shape)
+            stamp_u8 = stamp.astype(np.uint8) * 255
+            if out is None:
+                out = list(masks)
+            pre = out[ci]
+            newm = pre | stamp_u8
+            if pre.any() and not masks_8adjacent(stamp_u8, pre):
+                pa, pb, _d = nearest_gap(np.argwhere(stamp), np.argwhere(pre > 0))
+                cv2.line(newm, (pa[1], pa[0]), (pb[1], pb[0]), 255, 1, cv2.LINE_4)
+            out[ci] = newm
+            az = stamp_u8.copy()
+            accent = az if accent is None else (accent | az)
+            print(f"      subrep_accent cons#{ci} part{pi} "
+                  f"{int(stamp.sum())}px @{target}")
+    return (masks if out is None else out), accent
+
+
+def _assemble_masks(base_masks: list[np.ndarray], cons, S: int, target: int,
+                    src: np.ndarray | None):
+    """The cross-construction ASSEMBLY chain — ONE orchestration, two callers
+    (`assemble_render` and `_process_fixture`; H5): stamp harmonization → radial
+    harmonization → divot separation → nested-ring coordination → sub-representable
+    accent stamps → source-gap bridge. Returns (masks, accent, protected, n_dec):
+    `accent` = the union of deliberately-placed protected-accent zones (None when
+    neither the nest nor the subrep pass fired); `protected` = harmonized-stamp
+    construction indices (the szspread gate column's input — the RADIAL member set
+    is divot-protected internally but NOT returned here, its diagonal stamp bboxes
+    would pollute szspread); `n_dec` = radial slots lost to decimation (the topo
+    audit's drops escape)."""
+    hmasks, protected = _harmonize_singles(base_masks, cons, S, target)
+    rmasks, prot_rad, n_dec, rad_zone = _harmonize_radial(hmasks, cons, S, target)
+    masks = _separate_divots(rmasks, cons, S, protected | prot_rad)
+    masks, accent = _coordinate_nested_rings(masks, cons, S, target)
+    masks, acc2 = _stamp_subrep_accents(masks, cons, S, target, skip=prot_rad)
+    for az in (acc2, rad_zone):
+        if az is not None:
+            accent = az if accent is None else (accent | az)
+    masks = _bridge_source_gaps(masks, cons, S, src)
+    return masks, accent, protected, n_dec
+
+
+def assemble_render(cons, S: int, target: int, src: np.ndarray | None = None):
+    """Add all the render pieces together for ONE target size.
+
+    cons: [(parts, color_rgb, label), ...] from _fixture_constructions (decomposed
+    + label-cleaned once, target-independent). Renders every construction
+    INDEPENDENTLY on the shared (S, S) grid (per-feature, no cross-feature CSG
+    group collisions — the strip path's contract), composites the
+    per-construction R1 masks in segment order (area-sorted upstream → smaller
+    features draw on top), then runs the cross-construction assembly chain
+    (_assemble_masks — one orchestration, two callers): stamp harmonization →
+    RADIAL harmonization → divot separation → nested-ring coordination →
+    sub-representable accent stamps → the source-gap bridge (`src` = the source
+    silhouette at S from _fixture_constructions; None skips the bridge).
+
+    Returns (masks, icon, accent): masks = per-construction (target, target)
+    uint8 {0,255} R1 masks; icon = (target, target, 3) uint8 composited render;
+    accent = the UNION of deliberately-placed protected zones — the nested-ring
+    accent, the radial-comb stamps, and the sub-representable accent stamps (None
+    when none fired) — pass it to refine_perimeter's `protected=` so refine
+    honors the placements. The tuple
+    (cons, masks, (S, S), target) is exactly what stage-4
+    refine.common.refine_outline consumes — this function IS the seam refine
+    touches up next."""
+    rrs = [render_debug(parts, (S, S), target) for parts, _c, _l in cons]
+    masks, accent, _protected, _n_dec = _assemble_masks(
+        [r.mask for r in rrs], cons, S, target, src)
+    icon = np.full((target, target, 3), _FX_BG, np.uint8)
+    for m, (_p, c, _l) in zip(masks, cons):
+        icon[m > 0] = c
+    return masks, icon, accent

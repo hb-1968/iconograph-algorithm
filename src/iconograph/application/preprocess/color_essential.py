@@ -382,15 +382,13 @@ GOTCHAS
 
 import cv2
 import numpy as np
-from skimage.color import lab2rgb
-from sklearn.cluster import AgglomerativeClustering
 
 from iconograph.application.categorize import (
     Categorization,
     ALPHA_OPAQUE_THRESHOLD,
 )
 
-from .common import compose_bw, lab_kmeans
+from .common import compose_bw, shade_groups
 
 # Tunable thresholds — single source so testbed iteration is fast (H1).
 CE_PALETTE_K = 6         # KMeans centroid count — matched to expected dominant colours
@@ -400,40 +398,15 @@ CE_FEATURE_FLOOR = 0.10  # min (colour area / total canvas area) to keep a colou
 
 
 def universalize(cat: Categorization, rgba: np.ndarray) -> np.ndarray:
+    # Shade-group the opaque palette (lifted to common.shade_groups, H5) and remap
+    # every opaque pixel to its group's area-dominant colour.
     alpha = rgba[..., 3]
     opaque = alpha > ALPHA_OPAQUE_THRESHOLD
     opaque_rgb = rgba[opaque][:, :3]
-
-    centroids_lab, labels = lab_kmeans(opaque_rgb, CE_PALETTE_K)
-
-    ac = AgglomerativeClustering(
-        n_clusters=None,
-        distance_threshold=CE_SHADE_DELTA,
-        linkage="average",
-        metric="euclidean",
-        compute_full_tree=True,
-    ).fit(centroids_lab)
-    shade_labels = ac.labels_
-
-    counts = np.bincount(labels, minlength=centroids_lab.shape[0])
-    n_groups = int(shade_labels.max()) + 1
-    universal_idx = np.zeros(n_groups, dtype=np.int32)
-    for g in range(n_groups):
-        members = np.where(shade_labels == g)[0]
-        universal_idx[g] = members[int(np.argmax(counts[members]))]
-    universal_lab = centroids_lab[universal_idx]
-
-    universal_rgb = (
-        (lab2rgb(universal_lab[np.newaxis, ...]) * 255.0)
-        .round()
-        .clip(0, 255)
-        .astype(np.uint8)[0]
-    )
-
-    universal_per_pixel = universal_rgb[shade_labels[labels]]
-
+    universal_rgb, _area, pixel_group = shade_groups(
+        opaque_rgb, CE_PALETTE_K, CE_SHADE_DELTA)
     out = rgba.copy()
-    out[opaque, :3] = universal_per_pixel
+    out[opaque, :3] = universal_rgb[pixel_group]
     return out
 
 
