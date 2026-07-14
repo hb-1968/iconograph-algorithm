@@ -33,6 +33,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from dataclasses import replace
 from PIL import Image
 
 from iconograph import manifest
@@ -57,6 +58,16 @@ THEMES: tuple[tuple[Path, str, tuple[int, int, int]], ...] = (
     (LIGHT_DIR, "Iconograph", (0, 0, 0)),
     (DARK_DIR, "Iconograph Dark", (255, 255, 255)),
 )
+
+# Manual icon overrides (user tweak): a pack app whose generated icon is replaced by a
+# designated fixture's output — keyed by the app's `Icon=` value → (fixture source,
+# monogram name). Vesktop is a Discord client → use the Discord logo; Edge's installed
+# 256px raster decomposes poorly, its 1024px fixture renders cleanly. The output still
+# lands under the app's own basename; only the SOURCE + monogram name change.
+OVERRIDES: dict[str, tuple[str, str]] = {
+    "dev.vencord.Vesktop": ("fixtures/discord.png", "Discord"),
+    "com.microsoft.Edge": ("fixtures/microsoft-edge.png", "Microsoft Edge"),
+}
 
 
 def _index_theme(name: str) -> str:
@@ -188,7 +199,14 @@ def run_build(cores: int | None = None, update: bool = False,
                          or fnmatch.fnmatch(entry.icon, only)):
             n_filtered += 1
             continue
-        src = resolve_icon(entry.icon)
+        if entry.icon in OVERRIDES:
+            fx_rel, ov_name = OVERRIDES[entry.icon]
+            fx_path = REPO_ROOT / fx_rel
+            src = (IconSource(fx_path, "png", "override", 0)
+                   if fx_path.exists() else None)
+            entry = replace(entry, name=ov_name)   # monogram from the override name
+        else:
+            src = resolve_icon(entry.icon)
         if src is None:
             manifest.prune_outputs(man, ICONS_ROOT, lookup)  # was-built → unresolved
             manifest.record_unresolved(man, lookup, icon=entry.icon,

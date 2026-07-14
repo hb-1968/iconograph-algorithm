@@ -45,6 +45,10 @@ Precedence = Literal["outer", "inner"]
 ENVELOPE_DOM = 0.72            # KMeans(2)-on-opaque dominance to call uniform envelope
 INNER_AREA_FLOOR = 0.025       # inner_largest_cc / bbox_area floor
 INNER_LIGHT_L = 88.0           # L threshold for light-inner fallback (white only, not gradient corner)
+LIGHT_GLYPH_FRAC = 0.15        # a light glyph this large ON a silhouette that COLLAPSES to a simple
+                               # primitive (generic badge) is the identity even if it reaches the badge
+                               # edge (Steam's pipe) — admit despite non-containment. homebrew (37% light
+                               # but non-collapsing mug) is excluded by the collapse gate.
 INNER_CONTAINMENT_MARGIN = 0.04  # inner-bbox must sit inside overall bbox by this fraction
 FILLED_ENVELOPE = 0.55         # envelope_area / envelope_bbox floor for alpha-hole fallback
 MINOR_AB_STD_MAX = 22.0        # max within-cluster ab-spread of the minor cluster (bimodality)
@@ -297,9 +301,21 @@ def _compound_via_light_inner(
     """
     L = lab[..., 0]
     high = (L > INNER_LIGHT_L) & opaque
-    if not _contained_largest_cc(high, x, y, w, h):
+    if _contained_largest_cc(high, x, y, w, h):
+        inner = _significant_components(high, SIGNIFICANT_CC_PX, contain_bbox=(x, y, w, h))
+    else:
+        # Steam case: a SUBSTANTIAL light glyph on a silhouette that COLLAPSES to a
+        # simple primitive is the identity even though it reaches the badge edge (the
+        # Steam pipe). The gradient badge is discardable background → inverted, not a
+        # cutout. Distinguished from AA fringe rings (no light area) and from real
+        # shapes like homebrew (badge does NOT collapse) by the collapse + area gates.
+        if high.sum() < LIGHT_GLYPH_FRAC * opaque.sum():
+            return None, None
+        if fit_simple_primitive(opaque.astype(np.uint8))[1] < COLLAPSE_IOU:
+            return None, None
+        inner = _significant_components(high, SIGNIFICANT_CC_PX)   # allow edge-touch
+    if not inner.any():
         return None, None
-    inner = _significant_components(high, SIGNIFICANT_CC_PX, contain_bbox=(x, y, w, h))
     env = opaque & ~inner
     return env, inner
 

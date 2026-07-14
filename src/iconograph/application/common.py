@@ -25,7 +25,11 @@ _SE3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 # single simple primitive AND the interior has enclosed colour-contrast marks, the
 # identity lives in colour" (user ruling). Tunables shared by all three consumers.
 COLLAPSE_IOU = 0.92      # fit_simple_primitive IoU at/above which the silhouette "collapses"
-MARK_DELTA = 40.0        # Lab ΔE beyond the badge colour that counts as a contrast mark
+MARK_DELTA = 24.0        # Lab ΔE beyond the badge colour that counts as a contrast mark.
+                         # 24 (was 40) so pale interior LINES survive, not just strong dials
+                         # (EasyEffects' slider tracks): regression-verified — no new
+                         # color_carried firings, existing cutouts unchanged (ptyxis/electron/
+                         # zoom identical), and it drops a virt-viewer false positive.
 MARK_MIN_AREA_FRAC = 3e-4  # despeckle: drop mark components below this fraction of opaque area
 MARK_FRAC_FLOOR = 0.015  # interior marks must cover >= this fraction of opaque to fire
 _DOM_BIN = 8.0           # coarse Lab bin width for the area-dominant (badge) colour

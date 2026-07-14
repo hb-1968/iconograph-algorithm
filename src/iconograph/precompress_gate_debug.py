@@ -52,6 +52,7 @@ EXPECTED_STRUCTURE: dict[str, str] = {
     "easyeffects": "color", "ptyxis": "color", "electron": "color",
     "discord": "mono", "gmail": "mono", "claude": "mono",
     "chrome": "mono", "firefox": "mono", "figma": "mono", "vscode": "mono",
+    "steam": "mono",   # light glyph on a discardable gradient disc → inverted, not cutout
 }
 
 
