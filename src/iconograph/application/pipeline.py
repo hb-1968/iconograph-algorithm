@@ -1,16 +1,8 @@
-"""Stage 1 → 5 orchestrator for the application-icon pipeline (PRODUCTION).
+"""Build application icons from source PNGs and names.
 
-The per-app compute path the `build` command drives: source PNG → categorize →
-preprocess → align → L1 classify → L2 features (all through `cache.cached()`,
-namespaced by the source path's stem) → constructions (`compress.render.
-build_constructions`) → assembly (`assemble_render`, protected accents included)
-→ stage-4 refined outlines @16/@24 (`refine_perimeter`; @16 seeded with the
-accent-carved @24 silhouette) → stage-5 monogram compose + snake per conversion
-(16-logo → 24 canvas, 24-logo → 32 canvas).
-
-This module OWNS the path; the debug harnesses (`monogram_compose_debug` etc.)
-import from here — production never imports a debug module (the D3 boundary,
-branch-primitive audit 2026-07-11). Deterministic (H8) end to end.
+Cache categorization through feature segmentation, then construct, render and
+refine 16/24-pixel outlines. Compose them on 24/32-pixel monogram canvases and
+connect the pieces. Debug harnesses reuse this production path.
 """
 from __future__ import annotations
 

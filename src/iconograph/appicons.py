@@ -1,22 +1,8 @@
-"""appicons.py — installed-app census + icon resolution (the production source layer).
+"""Resolve installed applications to source icons.
 
-ONE home for "what apps exist on this machine and where do their icons live" (H5),
-shared by the `build` command (per-name resolution) and the dev sampler
-(`sample_icons.py`, pool scan). The resolution chain is the user-ratified order:
-the app's OWN libraries lead, **Adwaita** is the designated fallback —
-
-    hicolor (system) → hicolor (user, ~/.local — the Edge-PWA location) →
-    flatpak exports → pixmaps → Adwaita → AdwaitaLegacy (incl. */legacy/ dirs) →
-    absolute-path Icon= values
-
-arcticons/breeze theme RESTYLES are deliberately NOT sources (round-2 lesson: theme
-packs alias thousands of apps that are not installed; and their line art restyles
-brand identity). Within a tier: SVG preferred, else the largest raster (≥128 px
-preferred, any size accepted — AdwaitaLegacy generics top out at 48). Census =
-.desktop files (Type=Application, not NoDisplay/Hidden; configparser with
-interpolation=None, strict=False, optionxform=str — the three load-bearing options).
-
-Deterministic (H8): sorted directory walks, fixed tier order, no RNG.
+Respect desktop-file precedence and resolve named icons through brand sources,
+then Adwaita fallbacks. Exclude absolute-path Icon entries, which bypass themes.
+Build and sampling share this resolution path. SVG materialization uses CairoSVG.
 """
 from __future__ import annotations
 

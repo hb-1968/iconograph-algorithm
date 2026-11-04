@@ -1,14 +1,8 @@
-"""Testbed driver — per-stage in-development runners, plus the `bench`
-harness. Each runner maps a per-fixture worker across a fork()-mode
-multiprocessing.Pool and writes the stage's H7 artifact. Upstream stages
-flow through iconograph.cache so reruns and downstream testbeds skip
-recompute.
+"""Run cached stages over fixtures and write comparison grids.
 
-Performance: the master process pre-decodes every fixture PNG into
-_FIXTURE_RGBA before forking the pool, and pre-warms the cache RAM tier
-from existing on-disk pkls. Both dicts are COW-inherited by every worker,
-so workers do pure-RAM dict lookups for upstream stages instead of disk
-reads. Per H6 the disk pickle store remains the source of truth.
+Predecode fixtures and prewarm cached stages before forking, so workers
+inherit read-mostly arrays. The disk pickle store remains the persistent
+cache; bench times the implemented stages.
 """
 
 from __future__ import annotations
@@ -93,7 +87,7 @@ DECOMPOSE_DIR = TESTBED_ROOT / "decompose"
 DECOMPOSE_GRID_PATH = DECOMPOSE_DIR / "grid.png"
 
 
-# ─── Parallel-fixture runner infrastructure ───────────────────────────
+# Parallel-fixture runner infrastructure
 #
 # Each testbed runner maps a per-fixture worker across a multiprocessing.Pool
 # (fork context — workers inherit the parent's already-imported modules and
@@ -648,7 +642,7 @@ def _draw_centered_text(
     draw.text((x + (w - tw) // 2, y + (h - th) // 2 - 1), text, font=font, fill=fill)
 
 
-# ─── Stage 2 preprocess testbed ───────────────────────────────────────
+# Stage 2 preprocess testbed
 
 
 @dataclass(frozen=True)
@@ -884,7 +878,7 @@ def _compose_preprocess_grid(
     print(f"Saved {PREPROCESS_GRID_PATH.relative_to(REPO_ROOT)}")
 
 
-# ─── Stage 3 align testbed ────────────────────────────────────────────
+# Stage 3 align testbed
 
 
 @dataclass(frozen=True)
@@ -1108,7 +1102,7 @@ def _compose_align_grid(
     print(f"Saved {ALIGN_GRID_PATH.relative_to(REPO_ROOT)}")
 
 
-# ─── Stage 3 L1 segment_prim_classify testbed ─────────────────────────
+# Stage 3 L1 segment_prim_classify testbed
 
 
 @dataclass(frozen=True)
@@ -1382,7 +1376,7 @@ def _compose_segment_prim_classify_grid(
     print(f"Saved {SPC_GRID_PATH.relative_to(REPO_ROOT)}")
 
 
-# ─── Stage 3 L2 feature_segment testbed ───────────────────────────────
+# Stage 3 L2 feature_segment testbed
 
 
 @dataclass(frozen=True)
@@ -1625,7 +1619,7 @@ def _compose_l2_feature_segment_grid(
     print(f"Saved {L2FS_GRID_PATH.relative_to(REPO_ROOT)}")
 
 
-# ─── Stage 3 D2 decompose — coverage testbed ──────────────────────────
+# Stage 3 D2 decompose — coverage testbed
 #
 # Scores the contour-driven decomposer against the EXISTING cached L2
 # output. It raw-reads .cache/stages/<stem>/{align,L2_feature_segment}.pkl
@@ -1950,7 +1944,7 @@ def run_decompose_testbed(panels: bool = False) -> int:
     return 0 if not failures else 1
 
 
-# ─── bench harness ────────────────────────────────────────────────────
+# bench harness
 
 
 WORKER_BY_STAGE: dict = {

@@ -1,19 +1,6 @@
-"""monogram_compose_debug.py — Stage-5 phases 2+3 harness (compose logo + letters).
+"""Inspect monogram composition using the production outline path.
 
-For each fixture, composes the final icon at both conversions — 16-logo → 24
-canvas and 24-logo → 32 canvas — and writes a comparison strip
-`[outline@16 | icon@24 | outline@24 | icon@32]` to testbed/monogram/<stem>.png.
-Checks the hard 1-px separation invariant (letters never 8-touch the logo) and,
-with --twice, H8 byte-determinism.
-
-    python -m iconograph.monogram_compose_debug              # 5 default fixtures
-    python -m iconograph.monogram_compose_debug discord vscode
-    python -m iconograph.monogram_compose_debug --twice      # determinism assert
-    python -m iconograph.monogram_compose_debug --fresh      # bypass the outline cache
-
-The refined outlines are slow to produce (decompose+render+refine, ~85s/fixture),
-so they are cached under .cache/monogram_outlines/ keyed by stem — pass --fresh
-after any upstream (stage 1-4) change.
+Write layout strips and use --twice to check repeatability.
 """
 from __future__ import annotations
 

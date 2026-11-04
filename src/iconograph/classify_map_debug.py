@@ -1,21 +1,6 @@
-"""Pre-render classifier/fitting map — the labeling chain that FEEDS the render stage.
+"""Visualize the classification and decomposition inputs to rendering.
 
-For each logo, show what every pre-render stage classified/fit, so you can judge
-whether a logo reaches render with meaningful features. NOTE: annular hints
-(annular_band/sector/gapped_annulus) carry a HARDCODED best_fit_iou=0.0 sentinel —
-they are DEFERRED to the D2/D3 annular decomposer (with a RingGeom), which recovers
-them (clocks 0.93, chrome 0.96 area cov). The map shows those as "→D3", NOT a failed
-fit; pass --decompose for the true per-feature coverage.
-
-    categorize (routing/flags) → L1 primitives → L2 features → decompose parts
-
-    python -m iconograph.classify_map_debug [stem ...]      # text table (default: all fixtures)
-    python -m iconograph.classify_map_debug --dump <stem>   # source | L1 | L2 | decompose strip
-    python -m iconograph.classify_map_debug --dump-all      # write every fixture's strip
-
-Loads cached upstream stages (self-heals crash-truncated caches by recomputing
-serially). BLAS pinned to one thread. Reuses the L1/L2 overlays + build_constructions
-+ debug_common panel helpers (H5) — no new rendering logic.
+Show fitted primitives, segmented features and their labels per fixture.
 """
 
 from __future__ import annotations
@@ -96,7 +81,7 @@ def _load(p: Path, decompose: bool = False):
     return cat, aligned, sc, fs, S, cons
 
 
-# ── label summaries ───────────────────────────────────────────────────────
+# label summaries
 
 def _cat_str(cat) -> str:
     flags = [cat.routing]
@@ -153,7 +138,7 @@ def _decomp_str(cons) -> str:
     return f"{len(cons)} cons / {n_parts} parts: {' '.join(per)}" if cons else "(no constructions)"
 
 
-# ── panels ────────────────────────────────────────────────────────────────
+# panels
 
 def _rgb(img: np.ndarray) -> np.ndarray:
     if img.ndim == 2:
@@ -212,7 +197,7 @@ def dump(stem: str, decompose: bool = False) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    # --decompose (opt-in): also run the slow D2/D3 decompose + panel. Default OFF —
+    # decompose (opt-in): also run the slow D2/D3 decompose + panel. Default OFF —
     # classification (categorize/L1/L2) only, so the whole set runs fast.
     decompose = "--decompose" in argv
     argv = [a for a in argv if a != "--decompose"]

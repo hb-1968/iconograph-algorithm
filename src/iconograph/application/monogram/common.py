@@ -1,21 +1,8 @@
-"""Shared monogram helpers — name-derived letter selection (stage 5, phase 1).
+"""Choose two letters from an application name.
 
-`select_monogram_letters(name)` picks the two most "defining" letters of an app
-name as its monogram: letter 1 = the first letter; letter 2 = the onset of the
-next prosodic unit — the initial of the second WORD if the name is multi-word
-(Adobe Illustrator -> AI), else the onset consonant of a later SYLLABLE
-(dis-Cord, an-Droid). Syllable boundaries come from pyphen (deterministic, H8).
-
-Selection is a tiered candidate rank: a new word's initial out-ranks a syllable
-onset, which out-ranks a bare interior consonant, which out-ranks a vowel. Tier
-dominates position; position only breaks ties within a tier. The tiers make the
-result robust to pyphen's coarseness on brand names — e.g. pyphen splits
-"medium" as "medi-um" (not "me-di-um"), so the vowel-led "um" yields no syllable
-onset and selection falls through to the interior consonant 'd' -> MD.
-
-Branch-agnostic: both `standard` and `inverted` logos use this same selector;
-the OCR / embedded-mark extraction paths (standard.py / inverted.py) are the
-deferred, non-primary route.
+Keep the first letter. Rank the second by word initial, syllable onset,
+interior consonant, then vowel; position breaks ties within a tier. Pyphen
+supplies syllable boundaries. The selector does not use OCR.
 """
 from __future__ import annotations
 

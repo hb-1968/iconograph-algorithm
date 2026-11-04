@@ -1,26 +1,8 @@
-"""Stage 5 phase 3 — compose the native logo + two 1px-outline letters on the canvas.
+"""Place a native-size logo with two one-pixel frame letters.
 
-Per the user's ideal (`~/Pictures/ideal_discord_preconnect.png`): the letters are big
-1px-stroke GEOMETRIC OUTLINE forms (from `glyphs.render_letter`) stretched NON-uniformly
-to fill the canvas to its boundary (maximize coverage); the logo stays NATIVE (1:1, never
-rescaled) and nests inside a letter's interior negative space (or a gap). Everything is
-1px; all three components are kept 1px-separated (an 8-connected gap) — a future phase 5
-connects them into ONE continuous snake-line.
-
-Every letter is authored as a FRAME form (glyphs.py — hugs the border, bounds a large open
-interior bay), so three candidate layouts are computed and the highest-COVERAGE one wins:
-  - frame-weave: ONE letter stretched to a full-canvas frame, the native logo + the partner
-    letter nested in its largest open body (figma: F fills the canvas, logo + M in the body).
-  - side-by-side: two flush full-height letters, logo nested in the host's hollow (discord:
-    narrow D, wide open C, logo in C).
-  - fallback: logo flushed to a side, the two letters filling the opposite region.
-`compose_icon` picks `max` over the three by `_layout_key`: LEGIBILITY first (both letters
-square-or-tall, not squashed to a wide lozenge — this keeps discord side-by-side), then bbox
-span (reach the boundary), then letter ink (frame-weave wins exact ties).
-
-Separation is a mask op: `masks_8adjacent(a, b)` is true iff a and b are <=1px apart — the
-nested content never 8-touches a frame stroke ("the non-overlay rule on a pixel basis").
-Deterministic (H8): fixed candidate order, integer geometry, `cv2.polylines`/`dilate` only.
+Compare frame-weave, side-by-side and fallback layouts. Rank letter legibility
+before canvas span and ink coverage. Keep components separated by an
+8-connected gap; connect_snake joins them afterward.
 """
 from __future__ import annotations
 

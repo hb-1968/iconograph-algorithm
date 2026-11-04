@@ -1,27 +1,8 @@
-"""Stage 3 — diff_fit: test-time differentiable CSG refinement (torch CPU, NO training).
+"""Refine candidate CSG geometry with optional CPU PyTorch optimization.
 
-An OPTIONAL refiner inside D2's candidate pool: decompose_shape lazily imports
-refine_candidates when its best deterministic candidate is sub-adequate, hands it the
-top-k candidates' Part lists as warm starts, and re-enters every refined Part list
-through _decomp_from_parts → _arbitrate. The refiner NEVER bypasses arbitration and
-never reports its own soft score — decoded parts are re-scored by the hard cv2
-rasterizer like every other candidate, so a bad decode simply loses.
-
-Method: each primitive becomes a signed-distance field; occupancy o = σ(−sdf/τ)
-(τ = blur width in px, annealed wide→crisp so parts feel the target from far away
-early and sharpen late); gated parts (σ(gate) = soft existence switch, so the
-optimizer can fade a useless part to zero instead of parking it); smooth per-group
-CSG whose 0/1 limit equals _compound_mask (including NEGATIVE groups); one
-boundary-band-weighted soft-IoU loss + a small gate-parsimony term; Adam descent;
-alternating optimize/spawn rounds (spawns are deterministic: connected components of
-the hard under/over-coverage); an optional mirror-symmetry seed that ties parameters
-by evaluating each part on the grid AND the reflected grid.
-
-Determinism (H8): no RNG anywhere — all initialization derives from the input mask
-and the warm-start parts; the seed/thread/deterministic-algorithms trio is defense in
-depth (verified bitwise-identical across processes on this build). torch is NOT a
-core dependency: only this module imports it (pyproject extra `diff`); decompose.py
-imports this module lazily inside its fire gate.
+Optimize an individual mask at test time; this is not model training. Compare
+hard-rasterized candidates through the decomposer's existing arbitration and
+retain the original when no candidate improves it.
 """
 
 from __future__ import annotations
@@ -60,7 +41,7 @@ from iconograph.application.compress.common import (
     _snap,
 )
 
-# ── knobs ───────────────────────────────────────────────────────────────
+# knobs
 SEED = 0
 DIFF_RES = 160           # max side of the optimization grid (hard scoring at full res is upstream)
 DIFF_STEPS = 250         # Adam budget per round (fixed → deterministic; plateau-stop allowed)
@@ -87,7 +68,7 @@ _EPS = 1e-9
 _F64 = torch.float64
 
 
-# ── differentiable geometry (pure functions) ────────────────────────────
+# differentiable geometry (pure functions)
 def _make_grid(hs: int, ws: int) -> torch.Tensor:
     """(hs·ws, 2) float64 pixel-center coords; [:, 0] = x (col), [:, 1] = y (row)."""
     cols = torch.arange(ws, dtype=_F64) + 0.5
@@ -224,7 +205,7 @@ def _diff_loss(soft: torch.Tensor, tgt: torch.Tensor, wmap: torch.Tensor,
     return 1.0 - inter / (union + _EPS) + W_GATE * gate_sum
 
 
-# ── encode / decode ──────────────────────────────────────────────────────
+# encode / decode
 def _t(vals: list[float]) -> torch.Tensor:
     # torch.tensor with explicit dtype — torch's default is float32 and as_tensor
     # silently inherits it; float64 keeps the decode round-trip exact.
@@ -320,7 +301,7 @@ def _decode_part(e: _Enc, s: float, h: int, w: int, min_feat: int) -> Part | Non
     return Part(prim, e.op, e.group)
 
 
-# ── optimizer ────────────────────────────────────────────────────────────
+# optimizer
 def _optimize(encs: list[_Enc], tgt: torch.Tensor, wmap: torch.Tensor,
               xy: torch.Tensor, xy_ref: torch.Tensor | None = None) -> None:
     """In-place Adam over params/angles/gates: two param groups (angles in radians
@@ -344,7 +325,7 @@ def _optimize(encs: list[_Enc], tgt: torch.Tensor, wmap: torch.Tensor,
             break
 
 
-# ── discrete spawn moves ─────────────────────────────────────────────────
+# discrete spawn moves
 def _spawn(parts: list[Part], target: np.ndarray, min_feat: int,
            h: int, w: int) -> list[Part]:
     """Deterministic topology moves the gradients can't make: one primitive per
@@ -391,7 +372,7 @@ def _spawn(parts: list[Part], target: np.ndarray, min_feat: int,
     return out
 
 
-# ── mirror symmetry (vscode-class glyphs) — core helpers lifted to common.py ──
+# mirror symmetry (vscode-class glyphs) — core helpers lifted to common.py
 def _dedupe_mirror(parts: list[Part], p: np.ndarray, u: np.ndarray,
                    h: int, w: int) -> list[Part]:
     """Drop a part whose reflection duplicates an already-kept part — its twin is
@@ -408,7 +389,7 @@ def _dedupe_mirror(parts: list[Part], p: np.ndarray, u: np.ndarray,
     return keep
 
 
-# ── public entry ─────────────────────────────────────────────────────────
+# public entry
 def refine_candidates(seeds: list[list[Part]], target: np.ndarray, min_feat: int,
                       h: int, w: int, symmetry: bool = True) -> list[list[Part]]:
     """One refined Part list per usable seed (+ one mirror-symmetric variant of the

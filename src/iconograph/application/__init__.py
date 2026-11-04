@@ -1,1 +1,1 @@
-"""Application-icon pipeline — current focus (per CLAUDE.md §3)."""
+"""Application-icon pipeline."""

@@ -1,16 +1,8 @@
-"""Single-process debug harness for the PRE-COMPRESSION categorization gate.
+"""Report interior color detail lost before geometric compression.
 
-Runs application.precompress_gate.evaluate_precompress over cached stage-1/2 outputs
-and prints a per-fixture PASS/FAIL table + a `suspects` list — the validation surface
-for categorize._color_carried. A logo is colour-carried when its alpha silhouette
-collapses to one simple primitive AND holds enclosed interior colour-contrast marks
-(EasyEffects' EQ knobs on a disc, Ptyxis' prompt on a square). Report-only.
-
-    python -m iconograph.precompress_gate_debug [stem ...]     # default: all fixtures
-    python -m iconograph.precompress_gate_debug --dump <stem>  # source|silhouette|marks strip
-
-Basis = FIXTURES_ROOT (ICONOGRAPH_FIXTURES-overridable). Loads cached categorize +
-preprocess directly; serial-recomputes on miss. BLAS pinned to one thread.
+Read or compute categorization/preprocessing outputs and print suspect cases.
+--dump writes source, silhouette and color-group panels. This diagnostic is
+report-only; a failure does not veto the build.
 """
 
 from __future__ import annotations

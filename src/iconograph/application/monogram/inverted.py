@@ -1,1 +1,1 @@
-"""Stage 5 — inverted logos: alternate luminance threshold for letter extraction."""
+"""Unimplemented inverted-logo letter extraction; production uses the app name."""

@@ -1,1 +1,1 @@
-"""(scale, x-offset, y-offset) fill-maximization search per Fedora hicolor size."""
+"""Unused per-target fitting placeholder."""

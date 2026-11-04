@@ -129,7 +129,7 @@ def categorize(image_path: Path) -> Categorization:
     return Categorization(final_routing, False, True, prec, env_mask, inner_mask)
 
 
-# ─── load ─────────────────────────────────────────────────────────────
+# load
 
 
 def _load_rgba(path: Path) -> np.ndarray:
@@ -146,7 +146,7 @@ def _load_rgba(path: Path) -> np.ndarray:
 load_rgba = _load_rgba
 
 
-# ─── (a) color_essential: radial multihue ─────────────────────────────
+# (a) color_essential: radial multihue
 
 
 def _color_essential(lab: np.ndarray, opaque: np.ndarray) -> bool:
@@ -205,7 +205,7 @@ def _color_essential(lab: np.ndarray, opaque: np.ndarray) -> bool:
     return False
 
 
-# ─── (b) compound detection ───────────────────────────────────────────
+# (b) compound detection
 
 
 def _compound(
@@ -433,7 +433,7 @@ def _inner_is_real(inner: np.ndarray, bbox_area: int) -> bool:
     return int(sizes.max()) >= floor
 
 
-# ─── (c) precedence ───────────────────────────────────────────────────
+# (c) precedence
 
 
 def _precedence(env: np.ndarray, inner: np.ndarray) -> Precedence:

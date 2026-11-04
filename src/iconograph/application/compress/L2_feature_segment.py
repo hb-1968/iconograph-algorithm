@@ -1,29 +1,8 @@
-"""Stage 3 L2 — feature segmentation (split, don't fit).
+"""Split L1 misses into features with geometric hints.
 
-Pipeline position:
-    align (L0) → segment_prim_classify (L1) → L2_feature_segment (THIS) → fitting (deferred)
-
-L1 hands L2 the connected components no single primitive could fit (`L1Miss`).
-L2 does NOT fit them — it SPLITS each into minimal, near-fittable sub-features and
-tags each with a `shape_hint` for the deferred fitting layer. Per miss:
-
-  1. global read (no categorize internals, H6) — a structure single-primitive
-     carving shouldn't shatter, kept WHOLE and tagged `global`:
-       • ring   — surrounds an empty centre (centroid over background + the
-                  foreground wraps it), open band or closed annulus (Edge, Chrome);
-       • holed  — an interior counterform/hole (the "A", Instagram) → needs negation;
-       • sunburst — many radial spikes (Claude, Firefox).
-  2. local — a body with thin appendages → **body + appendages** split:
-     morphological opening (adaptive kernel from the body inradius) removes the
-     thin protrusions; the body is kept EXACT (mask − appendage components); each
-     part is classified: a flat-chord-plus-arc body → `half_circle`, an otherwise
-     single-primitive part → `primitive`, anything still complex → `defer`.
-A narrow cross-component pre-pass groups shared-centre misses that tile a ring
-(Chrome's sectors) into one `global` ring — the only grouping L2 does.
-
-Library scrutiny: ring/half-disc/appendage signals all reuse primitives already
-here (distance transform, concavity, contour, min-enclosing circle via `common`);
-`MORPH_OPEN` only seeds the appendages (body kept exact). Deterministic (H8).
+Preserve rings, holes and sunbursts as global structures. Separate thin
+appendages from bodies without changing their union; group shared-centre
+ring fragments before splitting. Fitting happens downstream.
 """
 
 from __future__ import annotations
@@ -58,7 +37,7 @@ if TYPE_CHECKING:
     from iconograph.application.categorize import Categorization
 
 
-# ── classification knobs ───────────────────────────────────────────────
+# classification knobs
 SEG_FIT_IOU = 0.90               # a part is a single-primitive when best fit IoU ≥ this
 # global: sunburst
 SUNBURST_MIN_VTX = 20
@@ -135,9 +114,9 @@ def _angular_coverage(mask: np.ndarray, cx: float, cy: float) -> float:
     return float(np.count_nonzero(counts)) / RING_ANGULAR_BINS
 
 
-# --------------------------------------------------------------------------- #
+# #
 # the fittable metric (REUSE common's min-enclosing fitters — H5)
-# --------------------------------------------------------------------------- #
+# #
 def _best_fit(mask: np.ndarray, h: int, w: int) -> tuple[str, float]:
     """(winning shape name, best IoU) over the axis-aligned + rotated fitters — the
     per-feature identification metric."""
@@ -168,9 +147,9 @@ def _best_fit_iou(mask: np.ndarray, h: int, w: int) -> float:
     return _best_fit(mask, h, w)[1]
 
 
-# --------------------------------------------------------------------------- #
+# #
 # global structure reads
-# --------------------------------------------------------------------------- #
+# #
 def _is_sunburst(mask: np.ndarray) -> bool:
     c = _largest_contour(mask)
     if c is None:
@@ -220,9 +199,9 @@ def _global_shape(mask: np.ndarray) -> ShapeHint:
     return None
 
 
-# --------------------------------------------------------------------------- #
+# #
 # local: half-disc + body/appendage split
-# --------------------------------------------------------------------------- #
+# #
 def _is_half_disc(mask: np.ndarray) -> bool:
     """area / (π·r²) ≈ 0.5 (half the min-enclosing circle), near-convex, AND round — the
     elongation gate (minAreaRect aspect) rejects thin capsules/antennae that also hit ≈0.5."""
@@ -267,9 +246,9 @@ def _body_appendages(mask: np.ndarray) -> tuple[np.ndarray, list[np.ndarray]]:
     return body, appendages
 
 
-# --------------------------------------------------------------------------- #
+# #
 # cross-miss global ring pre-pass (the only grouping L2 does)
-# --------------------------------------------------------------------------- #
+# #
 def _group_global_ring(
     sc: SegmentClassification, misses: list[L1Miss], s: int
 ) -> tuple[list[int], np.ndarray, tuple[int, int, int, int]] | None:
@@ -311,9 +290,9 @@ def _group_global_ring(
     return near, combined, (x0, y0, x1 - x0 + 1, y1 - y0 + 1)
 
 
-# --------------------------------------------------------------------------- #
+# #
 # polar-unroll ring resolver — split a detected ring into its sub-features
-# --------------------------------------------------------------------------- #
+# #
 def _ring_centre(mask: np.ndarray) -> tuple[float, float, float] | None:
     """(cx, cy, outer_r) of the ring — the min-enclosing circle over ALL foreground points
     (not the largest contour): a grouped multi-sector ring has several contours, and the
@@ -446,9 +425,9 @@ def _resolve_ring(mask: np.ndarray, ox: int, oy: int,
     return feats
 
 
-# --------------------------------------------------------------------------- #
+# #
 # public API
-# --------------------------------------------------------------------------- #
+# #
 def _feature(part: np.ndarray, ox: int, oy: int, h: int, w: int,
              color: tuple[int, int, int]) -> Feature:
     """Identify one local part by its best-fitting shape; crop to its tight bbox."""
@@ -522,9 +501,9 @@ def segment_features(
     return FeatureSegmentation(image_shape=sc.image_shape, segments=out)
 
 
-# --------------------------------------------------------------------------- #
+# #
 # overlay renderer (testbed / H7 strip + the l2seg_debug --dump share this)
-# --------------------------------------------------------------------------- #
+# #
 _FEATURE_PALETTE: tuple[tuple[int, int, int], ...] = (
     (0xE6, 0x19, 0x4B), (0x3C, 0xB4, 0x4B), (0x43, 0x63, 0xD8), (0xF5, 0x82, 0x31),
     (0x91, 0x1E, 0xB4), (0x42, 0xD4, 0xF4), (0xF0, 0x32, 0xE6), (0xBF, 0xEF, 0x45),

@@ -1,18 +1,7 @@
-"""Stage 3 — compress sub-pipeline.
+"""Alignment, primitive classification and feature segmentation.
 
-Sub-stages in order:
-    align (L0)  →  segment_prim_classify (L1)  →  L2_feature_segment (L2)  →  L3_fit (L3)
-
-L0 axis-aligns dominant straight features. L1 binarizes, labels 8-connected
-components, and per-region fits one of {Circle, Rectangle, Triangle, Ellipse};
-regions that don't fit any single primitive are tagged L1Miss and carry their
-cropped mask forward to L2. L2 splits each miss (it does NOT fit it): global
-structures (ring / holed / sunburst) are kept whole — a detected ring is
-polar-unrolled and resolved into annular sub-features — and a body+appendages
-shape is split, each part tagged with a `shape_hint`. L3 fits every miss-derived
-feature into an overlapping-CSG construction (union / negation of rotated
-primitives, two-pass greedy + cleanup); a feature it cannot fit to an adequate IoU
-becomes a `Deferral` instead of a forced low-quality shape.
+The production renderer uses contour-based decomposition after L2. L3_fit
+retains the older beam-search fitter for comparison.
 """
 
 from iconograph.application.compress.align import align

@@ -1,23 +1,8 @@
-"""Stage-4 refine — scene_fit: test-time differentiable SCENE optimizer (torch CPU, NO training).
+"""Optional CPU PyTorch optimizer for a complete rendered scene.
 
-diff_fit/render_fit's proven pattern (lazy torch, `_torch_determinism`, soft-optimize →
-decode → re-score HARD by the caller) lifted to SCENE scale. It optimizes a PER-
-CONSTRUCTION rigid translation only — the parts inside a construction are frozen
-(detached); a single (dx, dy) per construction shifts the whole segment — to maximize
-the WHOLE-COMPOSITE mirror symmetry about the shared CANONICAL axis, while a fidelity
-term (stay near the incumbent render) + a prior (small shifts) keep the result honest.
-This is the cross-construction symmetry coordination per-construction render structurally
-cannot reach (render runs each construction blind to the others); for a single
-construction it can only rigid-shift the whole silhouette, so its niche is multi-segment
-marks. It returns decoded half-px shifts in CANVAS px; cleanup_scene applies them
-(translate_prim), re-renders, and re-scores HARD (symmetry must improve + stay close to
-the incumbent + topology preserved), so a bad decode simply loses — nothing here ships
-unvetted.
-
-Reuses diff_fit's SDF + soft-CSG + per-primitive encode and _torch_common's determinism
-trio (H5). The axis is passed in (computed by cleanup_scene from the supersampled
-reference) so this module never imports refine.common — no import cycle. Fires only
-behind cleanup_scene's gate; importing this module pulls torch (the `diff` extra)."""
+Optimize proposed geometry at test time and evaluate it with hard-render
+constraints. This helper is separate from the production perimeter chain.
+"""
 
 from __future__ import annotations
 

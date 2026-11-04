@@ -1,6 +1,13 @@
-# fixtures-sample — random installed-app-icon basis (UNCURATED)
+# Installed-app sample
 
-Deterministic sample: seed 20260711, n 64, pool 521 icons (64 eligible after curated-set exclusion). SVGs rasterized by cairosvg 2.9.0 at width 512. Sub-case labels are TBD until triage (H9 recurrence path) — the categorize accuracy table skips unlabeled rows by design. Run the pipeline against this basis with `ICONOGRAPH_FIXTURES=fixtures-sample`; NOTE: the stage cache namespace is shared, so curated `--all` cache scans will also see these stems — sample runs use explicit stem lists.
+This saved sample contains 64 icons selected with seed 20260711 from an installed
+pool of 521; 64 were eligible after excluding the curated set. SVGs were rasterized
+at width 512 with CairoSVG 2.9.0. Routing labels have not been assigned, so these
+rows do not contribute to categorization accuracy.
+
+Set `ICONOGRAPH_FIXTURES=fixtures-sample` to use this basis. Outputs go under
+`testbed/fixtures-sample/`. Stage caches share a stem namespace with the curated
+set; use explicit stems when selecting cached sample outputs.
 
 | slug | icon name | source | fmt | size | app name |
 |---|---|---|---|---|---|

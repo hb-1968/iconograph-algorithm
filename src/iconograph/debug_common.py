@@ -1,9 +1,4 @@
-"""Shared panel helpers for the single-process debug harnesses (H5 lift).
-
-d1_debug / l3_debug / diff_debug / render_debug each emit H7 comparison strips
-from the same three moves: caption a panel, stack panels with separators, and
-normalize panel height. One definition here instead of one copy per harness.
-"""
+"""Shared image-panel helpers for debug harnesses."""
 
 from __future__ import annotations
 

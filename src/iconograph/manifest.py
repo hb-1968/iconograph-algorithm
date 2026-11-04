@@ -1,21 +1,8 @@
-"""Hash + skip-don't-rebuild logic shared across pipelines (per H8).
+"""Track built, unresolved and failed application icons.
 
-The `build` command's progress ledger. The manifest lives WITH the icon pack
-(`<pack>/manifest.json`) so pack + state travel together. One entry per app
-lookup name:
-
-    {lookup: {"icon": <Icon= verbatim>, "name": <app name>,
-              "source": <resolved path>, "source_hash": sha256[:16],
-              "code": <cache._code_version()>,        # recorded for audit ONLY
-              "outputs": ["24x24/apps/<icon>.png", ...],
-              "status": "built" | "unresolved" | "failed", "reason": <str, failed only>}}
-
-SKIP RULE (default incremental run): status == "built" AND source_hash matches the
-current source file AND every output exists on disk. A code change does NOT
-auto-trigger rebuilds — `build --update` is the user's explicit code-change lever
-(no surprise multi-hour rebuilds after small edits); the recorded `code` field
-makes stale entries auditable. The manifest is FLUSHED after every app so an
-interrupted run resumes exactly where it stopped.
+Skip a built entry only when its source hash matches and every output exists.
+Code version is recorded for provenance, not used to trigger a rebuild.
+The builder flushes this manifest after each app.
 """
 from __future__ import annotations
 

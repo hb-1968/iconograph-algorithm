@@ -1,20 +1,7 @@
-"""Lightweight, single-process debug harness for the stage-3 diff_fit refiner.
+"""Inspect optional differentiable decomposition refinement.
 
-No fork pool, no full testbed wiring — loads the cached L0 align + L2 segmentation
-(raw pickle reads, same as the decompose testbed: no cached() code-version stampede),
-runs decompose_shape per feature as the deterministic "before", refines its winning
-parts with diff_fit.refine_candidates, hard-scores everything with _compound_score,
-and emits a per-fixture H7 strip plus a numeric report.
-
-    python -m iconograph.diff_debug                  # default: homebrew, mastodon, vscode
-    python -m iconograph.diff_debug <stem> [stem …]  # specific fixtures
-    python -m iconograph.diff_debug --twice [stem …] # run the refiner twice, assert
-                                                     # byte-identical decodes (H8)
-
-Strip panels per feature: target | before (deterministic winner) | refined (best
-variant by hard min(area, boundary)) | refined disagreement (under=red, over=blue).
-BLAS/OpenMP pinned to one thread BEFORE imports — torch's pool initializes at import
-time, and the determinism guarantee depends on it.
+Compare the original and refined candidates; --twice checks repeated masks.
+PyTorch is imported only for the refinement path.
 """
 
 from __future__ import annotations

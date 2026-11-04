@@ -1,1 +1,1 @@
-"""File-icon pipeline — DEFERRED. See README.md and CLAUDE.md §3."""
+"""Unimplemented file-icon pipeline; the build handles application icons."""

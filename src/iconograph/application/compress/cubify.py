@@ -1,24 +1,9 @@
-"""Stage-3 R1 cubify (WS3), the feed-resolution render at T <= 24. HYBRID, two paths:
+"""Render constructions on small grids with label and silhouette rules.
 
-A) LABEL-DRIVEN (simple round labels) — a construction that is one round ADD (circle /
-   ellipse) with at most one round concentric SUBTRACT is rendered straight from its
-   geometry: the add's axis-aligned BOUNDING-BOX square minus the subtract's bounding
-   square. A circle -> a square; an annulus -> a SQUARE RING, robust at any size. This
-   represents the LABEL (user ruling: "it's NOT about fitting the shapes, it's about
-   representing their labels") — IoU vs the round raster is irrelevant (a square outline
-   barely overlaps a circle outline).
-
-B) SILHOUETTE-CUBIFY (compound constructions) — everything else (a head + eyes, an M, an
-   X) is cubified at the pixel level from the naive raster: a deterministic two-phase
-   greedy 1px-brush search that reconnects a fragmented naive (Phase A, area-IoU), then
-   blockifies it (Phase B, jag + accuracy), under anti-glob + topology guards, with
-   mirror-pair moves when a global axis is detected (exact symmetry). Per-primitive cubic
-   forms shatter a compound silhouette (bbox-squares fragment, diagonals staircase), so
-   compound LABELS are represented by cubifying their composed silhouette.
-
-Deterministic (H8): no RNG; greedy best-improvement over a fixed total order. Dispatched
-from render.render_debug for target <= CUBIFY_MAX_T; geometry render kept for T > 24.
-
+Simple round adds and concentric subtracts become bounding-box squares and
+square rings. Compound silhouettes use ordered pixel edits to reconnect and
+straighten them under topology and anti-globbing constraints. The production
+renderer selects this path for target sizes <=24.
 """
 
 from dataclasses import replace
@@ -102,7 +87,7 @@ TRI_EPS_FRAC = 0.04  # approxPolyDP epsilon (× hull perimeter): coarse enough t
 TRI_AGREE = 0.90     # min IoU(coarse hull-polygon, solid silhouette) to call it a triangle —
 #                      a deep bottom notch (the polygon would over-fill it) fails the gate
 
-# ── neck divots: cubify-tier OUTLINE SEPARATION (figma's stacked lobes) ───
+# neck divots: cubify-tier OUTLINE SEPARATION (figma's stacked lobes)
 # Mirrors render.py:_outline_gaps (the GEOMETRY-tier T>24 doctrine) at the cubify tier
 # (T<=24, the shipping feed res), but detects necks from PART-PAIR GEOMETRY (robust where
 # the union outline is convex <1px) instead of silhouette convexity defects. A "deliberate"
@@ -130,7 +115,7 @@ DIVOT_MAX_T = 16          # T<=16 only (user ruling). At T=24 the neck column is
 #                           glob) keeps the separation. Raise to 24 to re-enable both-size divots.
 
 
-# ── path A: label-driven cubic forms (simple round labels) ───────────────
+# path A: label-driven cubic forms (simple round labels)
 
 
 def _bbox_square(prim, canvas_hw: tuple[int, int], target: int) -> np.ndarray:
@@ -342,7 +327,7 @@ def _triangle_label(parts: list[Part], canvas_hw: tuple[int, int],
     return outer
 
 
-# ── path B: silhouette pixel-cubify (compound constructions) ─────────────
+# path B: silhouette pixel-cubify (compound constructions)
 
 
 def _candidates(mask: np.ndarray, nb: np.ndarray,
@@ -581,7 +566,7 @@ def _close_to_canon(mask: np.ndarray, topo_canon: tuple[int, int],
     return mask
 
 
-# ── neck divots (cubify-tier outline separation) ─────────────────────────
+# neck divots (cubify-tier outline separation)
 
 _LOBE = (Circle, Ellipse, RotatedEllipse, RoundedRectangle)
 
@@ -683,7 +668,7 @@ def _carve_necks(mask: np.ndarray, vertical: bool,
     return mask
 
 
-# ── widen narrow OPEN negative-space gaps (gmail M-valley) ────────────────────────────
+# widen narrow OPEN negative-space gaps (gmail M-valley)
 # A narrow OPEN concavity (gmail's M central V — negative space that opens to the background)
 # renders ~1px at feed res and blots: the gap nearly closes, the outline rims merge, and
 # refine's disjoint repair eats what's left. No existing pass WIDENS (pockets/_outline_gaps/
@@ -1094,10 +1079,10 @@ def _widen_gaps(parts: list[Part], canvas_hw: tuple[int, int], target: int) -> l
     return out
 
 
-# ── dispatch ─────────────────────────────────────────────────────────────
+# dispatch
 
 
-# ── cross-resolution structure constraint (@24 → @16) ─────────────────────
+# cross-resolution structure constraint (@24 → @16)
 # Each feed size cubifies INDEPENDENTLY, so @16 can scatter a structure that @24 renders
 # coherently (figma's spine: @24 a solid connected bar; @16 thin-bridged scattered blocks —
 # 1-connected but visually incoherent). The larger sibling (@24) is the structural authority:

@@ -1,1 +1,1 @@
-"""iconograph — logos → Fedora hicolor icon sets."""
+"""Convert application logos into pixel icons and monograms."""

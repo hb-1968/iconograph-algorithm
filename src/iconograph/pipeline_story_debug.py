@@ -1,36 +1,8 @@
-"""pipeline_story_debug.py — the FULL-pipeline transformation storyboard (H1/H7 deliverable).
+"""Write per-fixture storyboards of the application-icon pipeline.
 
-For each fixture, emits ONE annotated strip that walks the whole application pipeline —
-every stage, every phase — left→right, with stage 3 (geometric decomposition) broken out
-into its actual sub-layers. Each panel is captioned with the stage/sub-layer name AND a
-brief methodology callout, so the transformation reads at a glance:
-
-  0 source | 1 categorize+align | 3a L1 classify | 3b L2 features | 3c D1 contour-parse |
-  3d D2/D3 CSG | 3e render R1 | 4 refine | 5 glyphs | 5 compose | 5 connect
-
-The 24-logo→32-canvas conversion is the headline path (bigger, clearer than 16→24). Each
-panel reuses the SHIPPED stage entry point against the cached upstream state (H6) — no
-logic is re-implemented here, this is pure visualization:
-
-  1 categorize   categorize.pkl (routing) + align.pkl (aligned RGB, L0 axis-align)
-  3a L1 classify segment_prim_classify.pkl → compress.draw_overlay (per-CC primitive fit)
-  3b L2 features L2_feature_segment.pkl → compress.draw_feature_overlay (typed features)
-  3c D1 parse    contour_parse.parse_shape + draw_shape_overlay (typed straight/arc runs)
-  3d D2/D3 CSG   _fixture_constructions → primitive outlines, add=blue / subtract=red
-  3e render (R1) render_debug.assemble_render → cubified color icon @24
-  4 refine       refine.common.refine_perimeter → 1-px perimeter outline @24
-  5 glyphs       monogram.common.select_monogram_letters + glyphs.render_letter
-  5 compose      monogram.compose.compose_icon → logo+letters woven on the N=32 canvas
-  5 connect      monogram.connect.connect_snake → single continuous stroke
-
-    python -m iconograph.pipeline_story_debug                 # discord, figma, gmail
-    python -m iconograph.pipeline_story_debug discord slack   # explicit stems
-    python -m iconograph.pipeline_story_debug --fresh         # bypass the decompose cache
-
-Strips → testbed/story/<stem>.png. The slow decompose (~75 s/fixture) is cached under
-.cache/story/; presentation tweaks re-run instantly (--fresh after a stage 1-3 change).
-Deterministic (H8): cached reads + fixed-order deterministic ops (INTER_NEAREST upscales,
-cv2.putText, no RNG).
+Panels cover source, categorization, segmentation, decomposition, rendering,
+refinement, monogram composition and connection. Use the production stage
+helpers so the storyboard follows the build path.
 """
 from __future__ import annotations
 
@@ -85,7 +57,7 @@ _BG = (255, 255, 255)
 _FX_BG = (238, 238, 238)       # render composite background (white-on-white stays visible)
 
 
-# ── content builders (each returns a BOX×BOX×3 RGB visual) ─────────────────
+# content builders (each returns a BOX×BOX×3 RGB visual)
 
 
 def _square(img: np.ndarray, nearest: bool) -> np.ndarray:
@@ -157,7 +129,7 @@ def _d1_shapes(fs):
             for seg in fs.segments if isinstance(seg, Feature)]
 
 
-# ── slow-bundle cache: only _fixture_constructions (decompose ~75s/fixture) is slow;
+# slow-bundle cache: only _fixture_constructions (decompose ~75s/fixture) is slow;
 #    everything downstream is fast, so presentation tweaks re-run instantly. --fresh bypasses.
 STORY_CACHE = REPO_ROOT / ".cache" / "story"
 
@@ -177,7 +149,7 @@ def _bundle(stem: str, fresh: bool):
     return bundle
 
 
-# ── annotated panel + strip assembly ──────────────────────────────────────
+# annotated panel + strip assembly
 
 
 def _wrap(text: str, width: int) -> list[str]:
@@ -253,7 +225,7 @@ def _process(stem: str, name: str, fresh: bool) -> None:
         _panel(_square(aligned, nearest=False), "1  categorize + align",
                f"Sub-case detect, alpha/bg fixup, canvas trim, then axis-align (L0). "
                f"routing = {routing}."),
-        # ── stage 3 geometric decomposition, sub-layer by sub-layer ──
+        # stage 3 geometric decomposition, sub-layer by sub-layer
         _panel(_square(draw_overlay(aligned, sc), nearest=False), "3a  L1 classify",
                "Label 8-connected components; fit ONE primitive each (circle / rect / "
                "triangle / ellipse). Unfittable region -> L1Miss, carried on."),
@@ -269,7 +241,7 @@ def _process(stem: str, name: str, fresh: bool) -> None:
         _panel(_square(icon, nearest=True), f"3e  render R1  @{T}",
                "Idealize onto the hicolor grid: pixel-cubify at T<=24 (round-identity "
                "cubes), composite by segment color."),
-        # ── stage 4 + stage 5 ──
+        # stage 4 + stage 5
         _panel(_square(_mask_rgb(outline), nearest=True), f"4  refine  @{T}",
                "1-px perimeter outline: connect disjoint, normalize stroke width, "
                "mirror-symmetrize the silhouette."),

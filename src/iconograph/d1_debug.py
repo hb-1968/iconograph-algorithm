@@ -1,11 +1,4 @@
-"""D1 contour-parse debug harness — typed-contour strips on select fixtures.
-
-    python -m iconograph.d1_debug                 # default: android-head_flat, docker-mark-black, obsidian, gmail
-    python -m iconograph.d1_debug <stem> [stem …]
-
-Per-fixture strip: aligned (target) | parsed contour (straight=blue, arc=red, corner=green dot,
-smooth=orange dot). Reads cached upstream through L2; computes D1 fresh; BLAS pinned to one thread.
-"""
+"""Write typed-contour strips for selected fixtures."""
 
 from __future__ import annotations
 

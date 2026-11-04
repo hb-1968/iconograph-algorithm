@@ -1,15 +1,12 @@
-# fixtures/
+# Curated fixtures
 
-Per CLAUDE.md §3 (Bootstrap) and **H9**: maintain **n ≥ 20** application logos
-covering the sub-case space. Single-fixture wins are over-fits — every accepted
-heuristic must hold across the full dataset.
+Reference logos for routing and geometry checks. The table records each source
+and its expected routing; later additions include explicitly provisional labels.
+These are development fixtures, not an independent recognition benchmark.
 
-Bootstrap is **not complete** until the dataset is at n ≥ 20 with each entry
-labeled below.
+## Sub-case labels
 
-## Sub-case labels (H9 coverage tags)
-
-Reference labels — extend as new sub-cases are encountered (per H3 recurrence):
+Coverage labels:
 
 - `standard` — opaque foreground on transparent/solid background
 - `inverted` — light foreground on dark background
@@ -26,7 +23,7 @@ Reference labels — extend as new sub-cases are encountered (per H3 recurrence)
 
 These columns are the **Stage-1 categorizer ground truth** that
 `src/iconograph/application/categorize.py` must reproduce on every fixture.
-They are a separate ontology from the H9 `sub-case` column above — `sub-case`
+They are separate from the `sub-case` column above: `sub-case`
 is for dataset diversity auditing; the routing fields decide pipeline
 branching:
 
@@ -56,8 +53,7 @@ branching:
 
 ## Dataset
 
-The five non-negotiable seeds (per H9) are listed first. Add additional rows
-until n ≥ 20.
+The five original seed fixtures are listed first.
 
 | filename | sub-case | color_essential | is_compound | precedence | routing | rationale |
 | --- | --- | --- | --- | --- | --- | --- |

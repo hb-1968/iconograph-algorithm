@@ -1,17 +1,6 @@
-"""Stage 2 — color-carried cutout branch.
+"""Preserve interior color contrast as holes in an envelope silhouette.
 
-For a solid single-primitive badge whose identity lives in interior colour-contrast
-marks (categorize.color_carried: EasyEffects' EQ knobs/tracks on a blue disc, Ptyxis'
-prompt on a dark square), the alpha-only `standard` branch collapses the whole thing
-to one filled blob and the marks vanish. This branch keeps the badge and CARVES the
-enclosed marks out as negative-space HOLES, so stage 3's recursive hole decomposition
-renders them (a disc/square outline with mark-shaped counters) instead of a block.
-
-The marks are the enclosed pixels far (Lab ΔE) from the area-dominant badge colour —
-`application.common.interior_mark_mask`, the SAME definition categorize._color_carried
-and the pre-compression gate use, so "the marks" is defined once. Like standard.py /
-inverted.py, `universalize` returns a SOURCE-resolution (H,W,3) BW image; the
-dispatcher in preprocess/__init__.py applies frame_with_margin.
+Used when the outer shape alone would discard the identifying marks.
 """
 
 import numpy as np

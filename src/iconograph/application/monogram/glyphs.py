@@ -1,23 +1,7 @@
-"""Stage 5 phase 3 — the monogram STROKE font (scalable 1px geometric letter forms).
+"""Render scalable, one-pixel geometric frame letters.
 
-A vector stroke font: each letter is a list of strokes, each stroke `(points, closed)`
-with `points` in normalized [0,1]^2 (x left->right, y top->bottom). `render_letter`
-scales the points to an arbitrary (w, h) box and rasterizes each stroke as a crisp 1px
-`cv2.LINE_4` polyline (4-connected — no diagonal-only cuts). Non-uniform stretch is free
-(x and y scale independently), so the same "D" fills a tall-narrow box or a squat-wide one.
-
-These are MINIMAL GEOMETRIC FRAME forms (per the user: "give every letter F's frame
-feature"): each hugs the canvas border on 2-3 sides + any divider strokes, so when stretched
-to fill the canvas it bounds ONE large open interior bay that can HOST the native logo + the
-partner letter (1px-separated). C/D/G/L/F are natural frames; M/V/S were reshaped (shallow M
-notch, wide-top V, blocky 3-bar S) to open a usable body. They read by silhouette, not by
-typographic fidelity, and each is a continuous 1px stroke (snake-connectable in the future
-phase 5). NOT a bitmap (the old FONT_5X7/etc. upscale made thick FILLED strokes) and NOT TTF
-(counters -> multi-loop, and mush at small sizes).
-
-Full **A-Z** authored (+ '?' fallback). `render_letter` ends with `common.face_connect` to
-guarantee connectivity-4 even for narrow M/W/Q, where `skeletonize` (fired by the thickness
-guard) and LINE_4 vertices otherwise leave diagonal-only steps that split the glyph.
+Each letter bounds open space for the logo or partner letter. Composition
+chooses dimensions and layout; this module rasterizes the glyph strokes.
 """
 from __future__ import annotations
 
@@ -48,7 +32,7 @@ STROKES: dict[str, list[tuple[list[tuple[float, float]], bool]]] = {
     "B": ([([(0.0, 1.0), (0.0, 0.0), (0.9, 0.0), (0.9, 1.0)], True),   # 日 — two stacked bays
            ([(0.0, 0.5), (0.9, 0.5)], False)]),
     "U": ([([(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)], False)]),  # square cup
-    # ── spine-and-bar SKELETON frames (all H/V; the strongest hosts, like F) ────────────
+    # spine-and-bar SKELETON frames (all H/V; the strongest hosts, like F)
     "E": ([([(1.0, 0.0), (0.0, 0.0), (0.0, 1.0), (1.0, 1.0)], False),   # C + a mid-bar
            ([(0.0, 0.5), (0.8, 0.5)], False)]),
     "F": ([([(1.0, 0.0), (0.0, 0.0), (0.0, 1.0)], False),

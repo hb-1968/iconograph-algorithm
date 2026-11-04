@@ -1,895 +1,14 @@
-"""R1 render tier — idealize/linearize stage-3 Parts onto a small pixel grid.
+"""Render signed primitive groups and assemble small-grid masks.
 
-Takes a Decomposition's `parts` (signed primitives under grouped CSG, canonical
-padded canvas) as ground truth and re-renders the shape at a hicolor target size,
-tweaking each part's degree of straightening, size, and placement to minimize
-"jag" (staircase aliasing from curves and off-grid diagonals) — a circle as the
-sole feature becomes a square; a bevel keeps more of its curve.
+At target sizes <=24, use label cleaning and cubify. Larger targets use
+role-based straightening and ordered candidate search, constrained by fidelity,
+topology and feature retention. Assembly coordinates sibling features, gaps
+and protected accents before refinement.
 
-Doctrine:
-  * Roles are inferred STRUCTURALLY (Parts carry no semantic labels; stage 3 is
-    frozen): per positive group the largest add is `dominant`, other adds are
-    `lobe`/`accent` by area share; subtracts are `counter` (interior bite) or
-    `shave` (boundary bite) via an erode-band test; negative groups are counters.
-  * The curvature budget allowed_degree(role, extent_px) = base extent ladder +
-    role offset — dominant/lobe straighten HARDEST, shaves/counters keep more
-    curve. Extent ≥ FORCE_TRUE_EXTENT px renders the true curve (straightening a
-    large smooth curve is vandalism). The budget is a maximum; the search prefers
-    straighter, fidelity arbitrates.
-  * The search is a deterministic 2-pass dominant-first coordinate descent over
-    per-part candidates (degree × integer-extent snap × grid-position snap),
-    scored lexicographically: feasibility → global jag ↓ → min(area, boundary)
-    IoU vs the supersampled reference ↑ → lower degree → candidate order (H8:
-    fully ordered, no RNG).
-  * Composition constraints (the size-compromise clauses): subordinate inflation
-    cap, shave bite-growth cap (a straightened rounding must not eat more of its
-    parent), sibling retention (no feature may starve another), and the global
-    proportionality FLOOR — deliberately LOW for now. Infeasible parts fall back
-    to their most faithful form and are flagged; the renderer never crashes.
-  * Sub-min-feature parts: dominant/lobe clamp UP, shave/accent DROP (a sub-2-px
-    bevel is noise stealing silhouette pixels), counters force-merge if the
-    surrounding material survives, else drop (annulus → disc is the legal
-    extreme-T degradation). All drops are recorded; the topology audit must
-    account for them 1:1.
-
-Round 2 — symmetrization + label collapse (the naive baseline looked better
-than R1 because per-part snapping breaks the mirror/radial symmetry the
-constructions inherently carry, and the jag metric is blind to it):
-
-  * SYMMETRIZATION. A construction's mirror axis is detected once at canonical
-    res (common._mirror_axis, near-vertical/horizontal only — a diagonal mirror
-    cannot be enforced on an integer raster), snapped to the half-px grid at
-    target scale, and the whole construction rigidly shifted onto it. Parts are
-    paired by reflection-matching at canonical res; each FOLLOWER renders as
-    the exact integer raster FLIP of its leader about the snapped axis —
-    pixel-exact symmetry by construction. (Never rasterize reflected polygons:
-    fillPoly's round-half-up tie bias is not mirror-equivariant, so even an
-    analytically exact reflection can land one pixel off its twin.) On-axis
-    parts (self-paired) keep only flip-invariant candidates. Drops are
-    pair-coherent. When no global axis exists, LOCAL mirror pairs (vscode's
-    two X bars) get the same flip machinery about their own snapped pair axis.
-    Symmetrized search REPLACES the plain one when an axis fires; a plain
-    fallback ships only if the symmetric render misses the floor.
-  * LABEL COLLAPSE ("a convolution"): at T ≤ COLLAPSE_MAX_T, each positive
-    group's add-set may collapse into ONE label fitted to the group silhouette
-    (adds minus shave-solos at canonical res — shaves are ABSORBED, counters
-    RETAINED and re-carve the label; discord@16 = squircle face + two eyes).
-    Radial families (hub + N blades) also offer a star-polygon label with
-    phase snapped modulo the pitch. Variants must fit the silhouette to
-    ≥ COLLAPSE_MIN_IOU at canonical res, then run the SAME pair-aware search
-    and compete on (feasible, jag, fidelity, fewer-parts) — the topology
-    clause makes a collapsed face that loses its counters INFEASIBLE.
-  * WEDGES (user doctrine): strict pixel-detail; a wedge's rotation is a
-    SUPPRESSIBLE degree of freedom — orientation-normalized candidates
-    (sector rotated onto the 45° grid, sweep preserved) are offered at EVERY
-    chord-detail level and listed first, so a wedge can keep detail while its
-    straight edges lie on the pixel grid; fidelity arbitrates honestly.
-
-R2 (junction overrepresentation) and R3 (residual layering) are later tiers;
-this module reads ONLY parts + canvas + target. Harness:
-src/iconograph/render_debug.py (synthetic + --fixtures modes).
-
-────────────────────────────────────────────────────────────────────────────
-ROUND-3 BRIEF (H10: you implement) — J₂ digital-line metric, anti-globbing,
-pronouncedness, build symmetry, refiner hook. Theory: README §R1 "Round 3".
-Before-strips for the four new harness cases are already in testbed/render/
-(long_diag 0.974/0.893; asterisk6 star LOSS @32; thin_x LOSSES + sub-floor;
-tab_body's tab DROPPED — your gates). Constants below are the H1-tunable
-surface. The straighten.py brief (SLOPE_GRID_DEG/K45/snap_slope) lands first.
-
-New constants (with the constraint block):
-    W_STEP = 1.0          # J₂: per 1-px tooth beyond the chamfer allowance
-    POCKET_MIN = 3        # px — significant negative-space pocket floor
-    POCKET_RETAIN = 0.5   # fraction of pocket pixels that must stay open
-    PRON_MIN_DEPTH = 1.5  # px — protrusion significance floor
-    PRON_FRAC = 0.6       # d_render ≥ this × d_ref
-    RETAIN_NARROW = 0.4   # retention floor for narrowed cands w/ pron. held
-RenderResult gains: pairs: int = 0 (local pairs fired), staircase: float = 0.0
-(J₂'s W_STEP term on the final mask) — both for the harness audit columns.
-
-— R3-1: J₂ (the metric swap; calibrate FIRST) ————————————————
-  Position: beside jag_score.
-      def _staircase_penalty(contour: np.ndarray) -> float:
-          # raw CHAIN_APPROX_NONE contour → moves via np.diff(pts, axis=0)
-          # + wraparound row (pts[0]−pts[-1]); CHAIN_APPROX_NONE guarantees
-          # unit king-moves (max(|dx|,|dy|)==1, no zero-moves). diagonal =
-          # (dx!=0)&(dy!=0). Split the move string into maximal STAIRCASE
-          # REGIONS (substrings over one {axis-code, diagonal-code} alphabet
-          # pair); per region n_dd = count of consecutive diagonal-diagonal
-          # move PAIRS; penalty += max(0, n_dd − (K45 − 1)). Pure numpy on
-          # the move array — vectorize the n_dd count (diag & shifted-diag).
-      def jag2(mask: np.ndarray) -> float:
-          # = V_dp + W_OFF·len(off-Θ DP segments) + W_STEP·Σ _staircase_penalty
-          # off-grid test switches from the 45° grid to SLOPE_GRID_DEG
-          # (straighten.py): theta-to-nearest-Θ-member ≤ JAG_ANGLE_TOL.
-          # REUSE the same findContours call as jag_score's; while both
-          # metrics live, factor the contour walk so each is one pass.
-  Transition protocol (honesty): jag2 lands BESIDE jag_score; the harness
-  prints both per cell for ONE full run; three calibration assertions gate
-  the swap (gmail naive < gmail r2-render under J₂ at 16/32; a hand-built
-  2:1-V M < naive; circle@16 octagon ordering preserved); then every J call
-  site (search keys, harmonization, arbitration, harness) switches and
-  jag_score dies. Never compare numbers across metrics.
-
-— R3-2: separation + pocket retention (anti-globbing) ————————————
-  Position: beside distinct_ok inside _run (they share solo_now/baseline
-  machinery and the newly-violated doctrine).
-      sep_pairs: list[tuple[int, int]]   # precomputed once per _run: live add
-          # pairs with dilate3x3(true_solo_i) ∩ true_solo_j == 0 (G = 1 px)
-      def separation_ok(own, baseline_adj, over=None, cand_mask=None) -> bool:
-          # infeasible iff a sep_pair becomes 8-adjacent that wasn't adjacent
-          # in the baseline state, or the evaluated part's own pair fuses
-      pockets: list[np.ndarray]          # once per render_debug call, from
-          # close(R_T, 3×3 RECT, borderType=BORDER_CONSTANT, borderValue=0)
-          # AND-NOT R_T → connectedComponentsWithStats ≥ POCKET_MIN px.
-          # borderValue=0 is load-bearing: dilation must not bridge the
-          # canvas edge. 3×3 closes mouths ≤1 px wide; wider wedge mouths
-          # need iterations=2 — start with iterations=2 so vscode-class
-          # 2-3 px mouths register, gate on the thin_x quadrant pockets.
-      def pockets_ok(over=None, cand_mask=None) -> bool:
-          # every pocket keeps ≥ POCKET_RETAIN of its pixels background in
-          # the trial compound; newly-violated semantics vs the baseline
-  Both join _optimize_part feasibility, harmonization's final check, AND the
-  final arbitration _feasible() (that is how a collapse/decimation variant
-  honestly beats a globbed incumbent).
-
-— R3-3: pronouncedness + narrowing (discord's wings, tab_body) ——————
-  Position: beside the constraint helpers.
-      def _protrusion_depth(feat_solo, body) -> float:
-          # dt = cv2.distanceTransform(cv2.bitwise_not(body), DIST_L2,
-          #      DIST_MASK_PRECISE)  — repo convention; bitwise_not because
-          # distanceTransform measures nonzero→nearest-zero
-          # return max(dt[feat_solo > 0]) (0.0 if empty)
-      pron_ref: dict[int, float]   # per subordinate add with exclusive ≥ 4 px:
-          # d_ref vs body = compound of the OTHER live parts' true solos;
-          # significant iff d_ref ≥ PRON_MIN_DEPTH
-      def pronounced_ok(...) -> bool:   # d_render ≥ PRON_FRAC·d_ref,
-          # newly-violated semantics; joins feasibility + arbitration
-  Plus two one-line reconciliations: _inflation_ok extends to role "lobe"
-  (the uncapped forced-extension bug-class), and retention_ok accepts
-  RETAIN_NARROW instead of RETAIN_FRAC for candidates whose local fx·fy < 1
-  IFF pronounced_ok holds for that part (protrusion substitutes for area).
-  Narrow CANDIDATES: extend _candidates' anisotropic targets for elongated
-  subordinate adds with short-axis targets down to min_feat (length kept or
-  +1), crossed with snap_slope-hardened angles.
-
-— R3-4: build symmetry ————————————————————————————————
-  (a) Twin harmonization: the per-degree loop becomes a per-(d, fx, fy) loop
-  over tuples present in EVERY member's candidate set (sorted, deterministic)
-  — twins render identical up to placement; snaps stay free.
-  (b) Radial spacing harmonization: for kept blades of a detected family,
-  each blade gains a comb-snapped variant (rotated about the hub to
-  phase + k·360/n); the uniform-spacing choice competes set-wide on (J₂, fid)
-  — offered, never forced (claude's ±8° may honestly win fidelity at 32).
-  (c) Final-mask audit: connected components of the final mask below
-  min-feature that no live part's solo claims ≥ 50% of are REMOVED and
-  RECORDED in drops (the gmail@32 stray-pixel class); re-check sym after —
-  when a global axis fired, sym must be exactly 1.0.
-  (d) RenderResult.pairs = len(leader_of) so the harness EXPECTED_SYM table
-  can audit local-pair fires; .staircase = the W_STEP term of the final mask.
-
-— R3-5: blade decimation (sub-pixel gap doctrine) ——————————————
-  Position: in _collapse_variants, beside the star variant.
-  For a detected radial family at T ≤ COLLAPSE_MAX_T whose MEDIAN target-
-  scale inter-blade gap < 1 px: offer the sub-family keeping every 2nd blade
-  (sorted by angle, keep even indices — deterministic), widths clamped to
-  min-feature, hub retained; absorbed = the dropped blades with reason
-  "decimated: gap unrepresentable at T"; competes through the same search.
-  Never relax the asterisk's gates to compensate.
-
-— R3-6: staircase-escalation clause ————————————————————
-  Position: _optimize_part's budget split. If EVERY within-budget candidate's
-  solo has _staircase_penalty > 0, treat degrees ≤ budget+1 as within-budget
-  for that part (else circle@32 regresses to a bare square once J₂ prices
-  the octagon's 45° edges). Deterministic, per-part, computed from the memo'd
-  cand_rasters.
-
-— R3-7: refiner hook + coverage refactor ———————————————————
-  Split reference_mask: new `reference_coverage(parts, canvas_hw, target,
-  k=SUPERSAMPLE) -> np.ndarray` returning the float32 pre-threshold coverage
-  map; reference_mask delegates (`(coverage >= 0.5)·255`). render_fit needs
-  the float target. Fire gate at the end of render_debug, AFTER arbitration:
-      if torch importable AND (best has violations OR any sep/pocket/pron
-      infeasibility OR J₂ ratio vs naive > 0.95 OR fid < floor + 0.05):
-          from .render_fit import refine_tweaks   # lazy
-          runs.append(refine_tweaks(...))         # one more _Run, same key
-  torch absent → silent skip (existing `diff` extra).
-
-GOTCHAS (scout/auditor-verified)
-  - CHAIN_APPROX_NONE guarantees unit king-moves; single-point contours have
-    no moves (existing len<3 guard covers). Winding direction is irrelevant
-    to run statistics.
-  - morphologyEx(MORPH_CLOSE) MUST pass borderType=BORDER_CONSTANT,
-    borderValue=0 — the default cannot be trusted to not bridge canvas edges.
-  - distanceTransform input is the INVERTED body (cv2.bitwise_not), {0,255}
-    is fine as-is; DIST_MASK_PRECISE per repo convention.
-  - All three new constraints use the newly-violated baseline semantics —
-    gating the whole state deadlocks descent from fused/globbed inits
-    (distinct_ok's comment records the lesson).
-  - Feasibility saturation watch: at T=16 the stacked constraints can exclude
-    everything → mass fallbacks; the significance floors (POCKET_MIN,
-    PRON_MIN_DEPTH, exclusive ≥ 4) are the designed guard — if violation
-    counts jump, tune floors under H1, never silently skip a constraint.
-  - J₂ ratio gates only — thin diagonals legitimately carry run-1 boundaries
-    on BOTH render and naive; never introduce absolute-J gates.
-────────────────────────────────────────────────────────────────────────────
-ROUND-4 BRIEF (BUILT — !fc; kept as doctrine. See the BUILT-DIVERGENCES
-block at the end of the round-4 amendment for where the implementation
-deliberately departs from this brief) — removal on globbing evidence.
-User doctrine: "Features can be 'removed' if they produce globbing, such as
-with Claude's spurs." Today a part whose every candidate globs falls back to
-most-faithful + violation, and arbitration ships an infeasible glob as
-least-bad (claude@32: decimation over-fires, then fid 0.490 viol 7). Round 4
-makes removal a RECORDED, OFFERED-AND-ARBITRATED outcome: phase A = incumbent
-+ collapse variants (existing); iff NO run is _feasible AND the incumbent
-carries glob evidence, phase B appends removal variants; one arbitration,
-key unchanged. Theory + measured ground facts: README §R1 "Round 4".
-Ground facts (measured on the real claude decomposition): hub r=59.6 + 12
-RoundedRectangle blades, organic gaps 22.6°–42.6°; blades classify as LOBES
-(area ≥ 0.25×hub) — family membership, never role, keys blade removal. The
-per-gap test below: claude@16 → 9/12 sub-representable (decimate, correct);
-claude@32 → 1/12 (do NOT decimate — the open-item-(b) fix); asterisk6 → 0/6
-both sizes under old AND new rules (it never decimated; star6 wins @16).
-
-New constants (with the round-3 constraint block):
-    GAP_FUSE_FRAC = 0.5    # ring fused-fraction above which a gap is
-    #                        sub-representable at T
-    REMOVE_MAX_FRAC = 0.25 # accent-removal budget: max fraction of reference
-    #                        ink removable per run (family decimation exempt)
-    GLOB_ATTR_FRAC = 0.25  # pocket attribution: accent owns a glob if its solo
-    #                        covers ≥ this of the pocket's filled pixels
-RenderResult gains: fid_live: float | None = None (fid vs the survivors-only
-reference when a removal/decimation variant wins), removed_ink: int = 0
-(reference px attributed to removed parts) — print both per cell (truth).
-
-— R4-1: decimation evidence gate + ladder (closes README open item (b)) ——
-  Position: _collapse_variants' decimation block — replaces the binary
-  any-8-adjacency `fused` count. Imports: none new (numpy + the existing
-  cv2.dilate idiom; library-scout adjudicated np.bincount ring histograms
-  over warpPolar, which aliases 1-px blades at T=16–32).
-      def _subrep_pairs(tsol: dict[int, np.ndarray], order_b: list[int],
-                        cx_t: float, cy_t: float, target: int) -> list[float]:
-          # per consecutive (wrapping) blade pair: fraction of the pair's
-          # shared RADIAL span that is fused. Precompute ONCE:
-          #   yy, xx = np.indices((target, target))
-          #   r_map = np.hypot(xx - cx_t, yy - cy_t).astype(np.int32)
-          # CAUTION: cx_t/cy_t are TARGET-scale — hub.primitive.cx * ft, NOT
-          # canonical coords (tsol is target-scale, hub-zone already excluded).
-          # Per pair (a, b) = (order_b[k], order_b[(k+1) % n]):
-          #   contact = cv2.dilate(tsol[a], se3l) & tsol[b]     # uint8, vetted
-          #   bins_x  = np.bincount(r_map[tsol[x] > 0], minlength=r_max)
-          #   both    = (bins_a > 0) & (bins_b > 0)   # rings w/ BOTH present
-          #   frac    = ((bins_contact > 0) & both).sum() / both.sum()
-          #   empty denominator → 0.0; minlength=r_max MANDATORY (silent
-          #   truncation otherwise corrupts the & comparison)
-  Gate swap: sub = count(frac ≥ GAP_FUSE_FRAC); offer [::2] iff
-  sub * 2 >= len(order_b) (majority clause unchanged) and the existing
-  RADIAL_MIN_BLADES check. Absorbed reason embeds the evidence:
-  f"decimated: {sub}/{len(order_b)} gaps sub-representable at T={target}".
-  LADDER (the removal ladder for families — deeper uniform decimation, never
-  per-blade): after keep = order_b[::2], re-run _subrep_pairs on the KEPT
-  subfamily (same hub zone, consecutive pairs of `keep`); iff still
-  majority-sub-representable AND len(order_b[::3]) >= 3, ALSO offer the
-  order_b[::3] variant — both compete, arbitration decides depth.
-  _collapse_variants' out tuples gain a 5th element vkind:
-  "label" | "star" | "asterisk" | "decimate" (every append site; the
-  render_debug loop unpacks 5 and builds rinfo for "decimate" — R4-4).
-
-— R4-2: glob-class violation tagging ————————————————————
-  Position: global_ok becomes a wrapper; the body is renamed.
-      def _global_fail(own, base, over=None, cand_mask=None, trial=None,
-                       narrowed=frozenset()) -> str | None:
-          # IDENTICAL body; each `return False` returns its class instead:
-          # "retention" | "distinct" | "conn" | "sep" | "pocket" | "pron";
-          # passing returns None. global_ok(...) = _global_fail(...) is None —
-          # all existing call sites unchanged.
-  In _optimize_part's candidate loop: when per_part_ok and fid >= floor,
-  call _global_fail once (replacing the global_ok call); feasible = gf is
-  None; gf in ("sep", "pocket") sets glob_seen for this part. On the
-  fallback branch classify part_viol_class[i] (run-scope dict):
-  "glob" iff glob_seen (a candidate cleared per-part + floor and failed
-  ONLY on sep/pocket), elif best fid seen < floor → "floor", else "other";
-  suffix " [glob]"/" [floor]"/" [other]" into the violation string.
-  thin_x@16's sub-floor bars classify "floor" — the weak-evidence guard.
-
-— R4-3: battery breakdown + offender attribution (_run tail) ————————
-  Position: beside base_abs / the battery computation.
-  When battery is False OR part_violation non-empty (else skip — zero cost
-  on clean runs), compute on the FINAL state, all sorted/deterministic:
-      glob_pairs   = [pr for pr in sep_pairs
-                      if _adjacent(solo_now(pr[0]), solo_now(pr[1]))]
-      glob_pockets = [j for j, pk in enumerate(pockets)
-                      if _pocket_open(final, pk) < POCKET_RETAIN]
-      glob_offenders = sorted({both endpoints of each glob_pair}
-                              | {live add i whose solo_now(i) covers
-                                 ≥ GLOB_ATTR_FRAC of (pk & final) for some
-                                 under-retained pocket pk})
-  _Run gains: glob_offenders: list[int] = field(default_factory=list),
-  viol_class: dict[int, str] = field(default_factory=dict). Indices are in
-  the RUN's part list — only the INCUMBENT's (= original indices) feed
-  phase B; role filtering happens there, not here.
-
-— R4-4: removal-variant phase + floor waiver ———————————————
-  Position: render_debug, between the collapse-variant loop and _feasible.
-  runs tuples gain a 5th element rinfo: dict | None →
-  (run, vlabel, absorbed, imap, rinfo); incumbent + label/star variants get
-  None; "decimate" variants get rinfo (budget-exempt — sub-representable ink
-  cannot be drawn at T; it is not "identity spent").
-      def _feasible(r: _Run, absorbed=None, rinfo=None) -> bool:
-          # fid clause: fidelity(r.mask) >= floor OR (rinfo is not None
-          #   and rinfo["glob_evidenced"] and rinfo["fid_live"] >= floor)
-          # topology excuse: ... or bool(r.drops) or bool(absorbed)
-          # violations/battery clauses unchanged
-  Phase B, gated on BOTH: not any(_feasible(...) over runs) AND glob
-  evidence on the incumbent (glob_offenders or a "glob" viol_class):
-      offenders = sorted({i in incumbent.glob_offenders} ∪ {i with
-                          viol_class[i] == "glob"}, ACCENT role only —
-                          lobes/dominant are identity (claude's blades are
-                          lobes: family ladder territory, NOT this path);
-                          shaves/counters cannot glob)
-      twin-close each offender via ONE top-level _sym_prep + _local_pairs
-      call (leader↔follower partners removed together — _drop's follower
-      propagation is the precedent); build ≤ 3 singleton(-closed) sets in
-      sorted order + 1 union set when ≥ 2.
-      Per set: removed_px = count_nonzero(ref & ∪ target-scale true solos
-      of the set) — skip the set if removed_px > REMOVE_MAX_FRAC × ref ink;
-      vparts/imap/absorbed like the decimation block, reason
-      f"removed: presence globs at T={target} (sep/pocket evidence)";
-      run _run on vparts (re-derives pairing on survivors — a fired axis
-      survives twin-coherent removal; EXPECTED_SYM is asserted, NOT
-      loosened); rinfo = {"glob_evidenced": True, "fid_live":
-      min(_iou_bool, _boundary_iou) vs reference_mask(vparts, ...) with its
-      own _band_width, "removed_px": removed_px}.
-  Appended LAST → the unchanged key's index term tie-breaks toward the
-  incumbent. fid_live NEVER enters the arbitration key — floor waiver only;
-  the key's -fidelity stays full-reference for every run. ONE removal
-  phase, no recursion.
-
-— R4-5: reporting ————————————————————————————————
-  Winner remap: the existing absorbed-record path handles removal variants
-  as-is (absorbed entries, NOT _Run.drops — each index accounted once);
-  the drops summary prefix becomes "removal win:" when the winning rinfo is
-  glob-evidenced and the vlabel is a phase-B "remove …" label (decimation
-  keeps "collapse win:"). RenderResult fid_live/removed_ink filled from the
-  winning rinfo (None/0 otherwise). Harness prints both (render_debug.py
-  round-4 brief).
-  AMENDED by R4-6/7: rinfo["fid_live"] and RenderResult.fid_live are
-  RENAMED fid_ref — the floor-substitute fidelity vs the variant's OWN
-  reference: survivors-reference for removal variants, idealized-geometry
-  reference for extrapolated variants. rinfo gains "kind":
-  "removal" | "extrapolate"; the harness prints both fid and fid_ref with
-  the kind tag (per-cell truth — an idealization win must never hide
-  behind either number alone).
-
-────────────────────────────────────────────────────────────────────────────
-ROUND-4 AMENDMENT (user directive, post-strips): "take the geometry and
-'extrapolate' symmetries due to the heavy globbing" (claude); figma loses
-recognizability at low T (circle squared, equal rows drifted). Locked
-decisions: (1) FEASIBILITY rule — a render that breaks a DETECTED family's
-regularity is infeasible (round-3 build symmetry extended to rotational +
-translational; offering is not enough: the lopsided cross has LOWER raw jag
-than a clean star, so symmetric variants can only win through the
-feasibility term); (2) figma = regularity snap + round-identity curvature
-floor; (3) claude = uniform 12-spike star @32, uniform 6-spike @16 (the
-R4-1 per-gap evidence picks the star's n exactly as it picks decimation
-depth). Probe ground facts: figma = spine Rectangle + 3 Circles r 234.6/
-235.9/239.3 (spread 0.020), two cy equal to 0.1 px, row pitch 478.6/481.4
-(CV 0.003), pill h≈2r; claude blade widths 21–46 / lengths 149–178 px
-(median width ≈ 2 px at T=32 → representable; < 1 px at 16 → n/2).
-
-More constants (same block):
-    REG_EXT_TOL = 0.06       # size group: max relative extent spread
-    REG_ALIGN_TOL = 0.02     # × S — center alignment snap tolerance
-    REG_PITCH_CV = 0.05      # uniform-pitch group: max spacing CV
-    ROUND_ID_MIN_EXTENT = 7  # px — round-identity floor applies from here
-
-— R4-6: radial symmetry extrapolation (claude) ————————————————
-  Position: _collapse_variants (the family branch already computes sp =
-  {n, phase, r_outer, r_inner, width, spoke_hw, spikes}).
-  (a) The existing uniform star variants become EXTRAPOLATED variants:
-      vkind "extrapolate", rinfo = {"kind": "extrapolate", "fid_ref":
-      min(_iou_bool, _boundary_iou) vs reference_mask of the star itself}
-      — the uniform star fits claude's organic ±8° source at ~0.44 area,
-      so its floor MUST be judged against the idealized reference; the
-      full-ref fid stays in the arbitration key and the report.
-  (b) Star-n ladder: when the R4-1 per-gap evidence is majority-sub-
-      representable at T, ALSO offer star_polygon with n//2 spikes (pitch
-      doubled, phase preserved, same median width) — claude@16's 6-spike;
-      @32 (1/12 evidence) keeps n=12.
-  (c) Family-harmonized multi-part variant: blades rebuilt UNIFORM at
-      canonical res (median width, median length, centers at median radial
-      distance, comb angles phase + k·360/n) — vparts substitution, imap
-      identity, absorbed = {}; composes with the [::2] decimation ladder
-      under evidence. The round-3 comb harmonization stops being merely
-      "offered": under the feasibility rule it is the only feasible
-      multi-part form of a detected family.
-  (d) ROTATIONAL FEASIBILITY RULE: at T ≤ COLLAPSE_MAX_T, when
-      _radial_family fires, any run whose family blades do not render
-      comb-regular (uniform (d, fx, fy) + comb angles + uniform width)
-      appends violation "radial regularity: detected family rendered
-      irregular [reg]" → infeasible. Constructive test — variants built by
-      (a)/(b)/(c) are regular by construction and skip it; the organic
-      incumbent carries it automatically. If even the extrapolated
-      variants miss their fid_ref floor, everything is infeasible and
-      least-bad ships RECORDED, as today (the rule never crashes a render).
-
-— R4-7: translational regularity extrapolation (figma) ———————————
-  Position: a new top-level detector + a vkind "extrapolate" variant in
-  _collapse_variants; pure numpy over primitive FIELDS (no raster work,
-  no new library surface).
-      def _regularity_groups(parts: list[Part], canvas_hw) -> dict:
-          # size groups: same-kind adds, ≥ 3 MEMBERS (2-member sets are
-          #   mirror-twin territory), relative extent spread ≤ REG_EXT_TOL
-          #   → snap all extents to the member median;
-          # alignment: among group members, center coords equal within
-          #   REG_ALIGN_TOL × S on x or y → snap to the mean;
-          # pitch groups: ≥ 3 add centers (cross-kind) near-collinear
-          #   along an axis with spacing CV ≤ REG_PITCH_CV → snap to
-          #   uniform pitch about the mean position.
-          # figma probe margins: 0.020 ≤ 0.06, 0.1 px, CV 0.003 ≤ 0.05.
-  Extrapolated variant: parts rebuilt with snapped geometry at canonical
-  res, imap identity, absorbed = {}, rinfo {"kind": "extrapolate",
-  "fid_ref": vs reference_mask(vparts)}. In-run, regularity sets join the
-  twin-harmonization pass (uniform (d, fx, fy) across the set; snap deltas
-  tied for aligned/pitched coordinates so the grid survives placement).
-  TRANSLATIONAL FEASIBILITY RULE: at T ≤ COLLAPSE_MAX_T, a run whose final
-  choices break a detected group's equality/alignment/pitch (geometric
-  check on the chosen tweaks — cheap, deterministic) appends
-  "regularity … [reg]" → infeasible, same shape as R4-6(d).
-
-— R4-8: round-identity curvature floor (figma's squared circle) —————
-  Position: the candidate filter beside allowed_k. For Circle adds that
-  are NOT the construction's dominant, in constructions whose dominant is
-  rectilinear (Rectangle / RotatedRectangle / RoundedRectangle / Polygon):
-  when the part's target extent ≥ ROUND_ID_MIN_EXTENT, candidates with
-  degree < 2 are filtered — the distinguishing round form renders at least
-  as the chamfered octagon, never a bare square among flats. Below the
-  extent floor the grid cannot show roundness and the rule stands down
-  (figma@16's 4-px circles: regularity, not curvature, carries
-  recognizability there). claude's hub: the dominant IS the Circle → rule
-  N/A; gmail/vscode/discord have no rectilinear-dominant circle lobes.
-
-BUILT-DIVERGENCES (what the !fc implementation changed vs the brief above —
-each was forced by a measured failure, not preference):
-  - NO ungated uniform-star labels (star12u/star-n//2): thin-spike Polygon
-    labels under-match even their own reference at T ≤ 32 (raster vs
-    coverage disagree on sub-px spikes; flip-invariance filters add sym
-    violations). The EXTRAPOLATED form is the family-harmonized MULTI-PART
-    comb: full-n comb when the per-gap evidence says representable, n//2
-    comb when not (the user-locked 12@32 / 6@16). star_organic stays the
-    gated round-2/3 variant, unchanged.
-  - Comb blades take max(median width, 1px at target) for the full-n comb
-    and max(median width, MIN-FEATURE at target) for the decimated comb —
-    extrapolating to a thinner-than-representable ideal makes the variant's
-    own reference unsatisfiable. Blades extend INWARD past the hub edge
-    (union absorbs the overlap; edge-exact inner ends detach by raster
-    phase). Blades keep deg ≥ 1 (D0's 90° angle snap axis-aligns the comb
-    into a '#').
-  - Reference substitution goes DEEPER than the floor waiver: extrapolate/
-    decimate/removal runs are SEARCHED against their own reference
-    (ref_run/pockets_run/topo_ref_run params on _run; defaults keep every
-    other caller byte-identical), and _feasible's topology clause accepts
-    rinfo["topo_ref"]. fid_ref is AREA IoU only (boundary IoU at
-    min-feature comb scale measures raster phase, not structure).
-  - Scale-noise guards for ref-substituted runs (round-3's "feasibility
-    saturation" doctrine): newly-violated FLOOR semantics in-search
-    (a transient sub-floor global state must not mass-flag every part);
-    retention/distinct skip parts whose LOCAL short dim < min-feature;
-    pockets < 2×POCKET_MIN dropped; pocket retention judged in AGGREGATE
-    at POCKET_RETAIN_REF (one marginal wedge of twelve must not veto a
-    comb); rotation-invariant twin keys (comb blades at different angles
-    share one twin set, so drift is judged set-wide).
-  - _clamp_exempt: a sub-representable part clamping up to min-feature is
-    LEGAL inflation (the min-feature doctrine demands it).
-  - The translational detector SKIPS radial-family blades (a family owns
-    its blades; they would double-register as a size group), and the
-    translational render-audit applies only to reg_check runs (incumbent +
-    regularize variant) — a radial comb legitimately moves the members the
-    original clusters were measured on. Size-group equality is judged by
-    AREA (rotated same-kind members legitimately differ in bbox).
-  - The round-identity floor cost lobe_union@32 its jag win (1.070 LOSS):
-    the circle lobe stays octagonal instead of squaring — the figma@32
-    doctrine trade, accepted per-cell.
-  - Post-strip round (user: "figma@16 still globbing, unrecognizable"):
-    extrapolated runs render the IDEALIZED geometry, so their search keeps
-    only degree + raster phase: candidates locked to isotropic sizes within
-    ±1 px of true extent (the round±1 PARITY candidates stay — a 4.4 px
-    circle must raster 4 px, not 5) plus the sub-representable up-clamp,
-    snaps ≤ 0.5 px, NO parent-follow drift (the pill shrank fy 0.68 and
-    follow dragged the circles into the silhouette step). Background-SPILL
-    cap (SPILL_FRAC_REF, sub-min-feature parts exempt): the ideal is known —
-    don't paint meaningfully outside it; open-corner negative space (the
-    step) has no pocket to guard it. ROUNDED identity: an RRect add with a
-    representable corner radius keeps ≥ D1 (the pill's chamfered corner IS
-    the upper half of figma's armpit dent). The comb relaxations (aggregate
-    pockets at POCKET_RETAIN_REF, 2×POCKET_MIN floor, sub-min-feature
-    identity skips, area-only fid_ref + valve trigger) are scoped to
-    fam_run — they must never leak to non-family extrapolated runs, whose
-    per-pocket veto + boundary term police exactly the spill that globbed
-    figma. Variant topology gets the canonical escape (rinfo["topo_canon"])
-    — a thin-bladed comb's REFERENCE degenerates at tiny T while the render
-    is cleanly connected.
-
-────────────────────────────────────────────────────────────────────────────
-ROUND 5 (BUILT — !fc) — the L-CORNER doctrine. User-drawn ideal: a thin X
-at 16×16 renders "symmetrical, diagonals reduced into L corners for minimal
-jank and heavy 1px stepping", generalized to "a rendering basis for the
-current rendering curves on diagonals like VSCode and so on". The missing
-vocabulary rung: D0 axis-aligns a thin diagonal away entirely, D1's Θ-slope
-still staircases at ~1px width; the reduction renders the stroke as the
-COARSEST digital line — axis runs joined by single corners.
-  - `straighten.stroke_axis_runs(x0, y0, x1, y1, width, form, band_axis,
-    band_at, run_center)`: "l"/"lr" (single corner), "z" (the drawn flat-X
-    form: dominant run through the center + transverse tip stubs), "z2"
-    (user-locked for near-square strokes: tip treads + center band +
-    risers, breaks at the span quartiles — the four corners of a crossing
-    pair stay distinct). Derived coordinates round to the target grid.
-  - Crossing strokes (center cluster ≤ 0.3×span) share ONE band: axis along
-    the composite's tip spread, band_at on the crossing center,
-    quartile breaks symmetric about it (stroke-relative breaks give
-    pinwheel chirality, not the drawn mirror X).
-  - The reduction competes BOTH as ordinary `_candidates` forms (d=0,
-    in-place, where a feasible regime can take them) AND as the
-    `axisreduce` EXTRAPOLATED variant (ref-substituted — the candidate
-    forms alone cannot beat the most-faithful fallback in sub-floor
-    territory, and "less accurate but more true to the style" is the
-    point). Roles are INHERITED (re-inference on 1px forms makes the
-    accent square the dominant); sym detection is OFF (the forms are exact
-    mirrors by construction — integer-grid rectilinear polygons raster
-    tie-free; the half-px axis-detection noise was the last asymmetry);
-    Polygon parts in ref-runs render EXACTLY as built (f=1, no snaps).
-  - Raster/coverage duality for 1px runs: width 1.6 (half-thickness 0.3 →
-    quarter-px 0.25) keeps the raster 1px while the ≥0.5-coverage
-    reference sees 0.6; width 1.0 is a zero-thickness polyline whose
-    reference is EMPTY; 0.49 hits the quarter-px 0.5 TIE and fattens to
-    2px. Gates: elongated (hi ≥ 2·lo), genuinely diagonal (>10° off-axis),
-    thin (lo ≤ min-feature+1 at target), never radial-family blades.
-
-GOTCHAS (round 4)
-  - Feasibility-rule scope is T ≤ COLLAPSE_MAX_T only; 64+ untouched.
-  - Regularity violations classify "reg" in viol_class, NOT "glob" —
-    phase-B removal must not fire off a regularity violation.
-  - asterisk6's winners are ALREADY regular stars — the byte-compare gate
-    must still hold after the rule lands.
-  - A phase-snapped star may legitimately fire a mirror axis: EXPECTED_SYM
-    claude/asterisk12 become "any" (see the harness brief) — do not let
-    the zero-spurious audit flag a doctrine win.
-  - If extrapolation fires, fid_ref AND full-ref fid both print; neither
-    substitutes for the other in the report.
-  - cx_t/cy_t TARGET-scale (× ft) — the canonical center silently shifts
-    every ring at T=16 by ~6 px.
-  - np.bincount minlength=r_max mandatory; r_map int32 (np.hypot truncation
-    is deterministic, H8).
-  - asterisk6 strips must stay BYTE-IDENTICAL (gate change guard) even
-    though it never decimated; thin_x@16 must NOT construct phase B
-    (class "floor", not "glob").
-  - The decimation reason string changes — update the README quote when
-    recording results.
-  - Re-verify the 9/12 vs 1/12 margins on the real decomposition (the plan
-    numbers used 1-decimal-rounded primitives) BEFORE locking GAP_FUSE_FRAC;
-    the absorbed reason's {sub}/{n} makes the evidence auditable per cell.
-  - Phase B variants are only CONSTRUCTED when nothing is feasible — never
-    arbitrate removal against a feasible incumbent (the n_live + jag
-    parsimony tailwind would otherwise reward weak-evidence removals).
-
-════════════════════════════════════════════════════════════════════════════
-ROUND-6 BRIEF — proportion honesty + run-≥2 geometric extensions + strays
-(steps 3, 4, 5 of the approved plan; step 2 + the slope helpers live in
-straighten.py's brief, step 1 in render_debug.py's, step 6 is diagnose-first
-and gets its brief AFTER the R1_DEBUG trace on the post-step-2..5 state.)
-
-Directives: "globbing and overproportions on the VSCode are not good";
-"at higher resolutions … 1px diagonal formations (many bumps) instead of
-geometric extensions"; "runs perfectly on the 5 fixtures" (×{16,24,32}).
-User ruling: uniform 1px 45° staircases are AVOIDED UNLESS COMPLETELY
-NECESSARY — hierarchy: axis runs / run-≥2 slopes (±26.57°, ±63.43°) first,
-uniform 45° only when run-≥2 fails the floors, irregular true-angle only as
-recorded fallback. Measured (thin-bar solo J at 32): 63.43° run-2 form 2.0,
-45° uniform 28.0, true 50° 31.6 — the metric ALREADY ranks them; the gap is
-that the run-≥2 form is never offered. NO pricing change.
-
-──────────────────────────────────────────────────────────────────────────
-TASK 6-R1
-  Offer run-≥2 slope bases in _candidates (the "geometric extension" rung).
-
-WHAT YOU ARE WRITING
-  File:      this file (render.py)
-  Position:  inside _candidates (~line 1030) — a new base-append block
-             directly AFTER the `if narrow:` block (after the
-             `sizes.append((fx, fy))` loop ends, ~line 1097), BEFORE the
-             `out = []` product loop; plus one new keyword param.
-  Imports:   from .straighten import snap_slope_run2, snap_triangle_run2
-             (extend the existing `from .straighten import (...)` block)
-  Signature (param change only):
-      def _candidates(part_t, degrees, extent_xy, min_feat, aniso,
-                      narrow=False, axis_reduce=True,
-                      run2=True):
-          # run2: offer run-≥2 slope-snapped bases (False for radial-
-          # family blades — rotational identity outranks the slope grid)
-  Called by: _run's cand_sets build (~line 2111) — pass
-             run2=(i not in no_lcorner), the SAME exclusion set the
-             axis_reduce param already uses (radial blades, line 2108-2110).
-
-CONCEPT
-  Goal:   a ~50° bar can render as a 63.43° run-2 digital line — uniform
-          2-px steps, zero staircase teeth, on-grid.
-  Method: append ONE extra base (like the wedge/narrow bases) whose angle
-          is the nearest member of Θ∖{45,135}; the existing degree × size ×
-          mode product and the jag-first key do the rest.
-  - snap_slope() goes to the NEAREST Θ member; for angles in the 45°-zone
-    that is 45 — whose long edges are 1-px teeth (W_STEP prices them). The
-    run-≥2 neighbour is never generated today; this base is that rung.
-  - The base competes honestly: if rotating to the run-2 slope breaks the
-    fid floor / retention, 45° (or true angle, as fallback) still wins —
-    exactly the "unless completely necessary" ruling.
-
-STEP-BY-STEP
-  1. Gate (rotated kinds). After the narrow block, for add parts:
-       pr is RotatedRectangle | RoundedRectangle | RotatedEllipse,
-       lo, hi = _local_dims(pr); elongated (lo > 0 and hi >= 2.0 * lo),
-       genuinely diagonal (min(angle % 90, 90 − angle % 90) > JAG_ANGLE_TOL),
-       and snap_slope(pr.angle) lands on 45/135 (the zone where the nearest-
-       member snap produces teeth).
-  2. Append the base.
-       r2 = snap_slope_run2(pr.angle)
-       bases.append(Part(replace(pr, angle=r2), part_t.op, part_t.group))
-     - dedupe: skip if abs(r2 − pr.angle % 180) ≤ 1e-6 (already on it).
-     - D1 re-snaps this base via snap_slope → back to 45! So the base must
-       survive the ladder: D1 of an already-run-2 angle snaps to ITSELF
-       (26.57/63.43 ∈ Θ) — verify snap_slope idempotence on the run-2
-       members, it holds by construction.
-  3. Triangle variant. Same position, for Triangle adds: if any edge longer
-     than K45·√2 px (at part_t scale — i.e. target px) has direction within
-     TRI_SNAP_TOL[1]° of 45/135, append
-       pts = snap_triangle_run2(pr)        # straighten.py brief, 6-S2
-       if pts is not None:
-           bases.append(Part(Triangle(*pts), part_t.op, part_t.group))
-  4. Wire run2 at the call site (line ~2116): run2=i not in no_lcorner.
-     Update the no_lcorner comment — the set now scopes BOTH reductions.
-
-GOTCHAS
-  - Candidate-count: ONE base × existing degrees/sizes/modes ≈ +25% for
-    qualifying parts only — measure wall time in the step-3 sweep.
-  - Determinism: bases order is deterministic (append after narrow block,
-    fixed sequence) — k-index ties keep H8.
-  - thin_x@16/24 + long_diag are the L-corner-doctrine guards: if a feasible
-    run-2 form displaces axisreduce at T ≤ 24, FLAG for strip review (round-5
-    doctrine is locked; do not silently accept).
-  - Ref-run candidate filter (line ~2127) keeps f=1/snap≤0.5 candidates of
-    EVERY base — run-2 bases pass through it unchanged; no edit there.
-
-──────────────────────────────────────────────────────────────────────────
-TASK 6-R2
-  Baseline-relative proportion guard (all runs, add parts).
-
-WHAT YOU ARE WRITING
-  File:      this file (render.py)
-  Position:  (a) one constant in the round-6 constants block (create it
-             after ROUND_ID_MIN_EXTENT, ~line 700):
-                 PROP_SPILL_FRAC = 0.10
-             (b) a lazy baseline helper + check inside _optimize_part
-             (~line 2434): helper defined next to _clamp_exempt; the check
-             goes in the candidate loop directly after the existing
-             ref-run spill block (~line 2500), before the _INFL_ROLES check.
-  Signature (inner helper, closes over cand_sets/cand_rasters/ref_l):
-      def _base_spill(q, d):
-          # min spill px vs ref_l over part q's f=1.0 candidates at
-          # degree d; cached in a dict keyed (q, d); falls back to the
-          # candidate's own spill (extra=0) when no f=1 twin exists
-  Called by: the candidate loop in _optimize_part only.
-
-CONCEPT
-  Goal:   vscode@16's dominant must not buy −J with f=1.23 width (+1 px col
-          = 25% spill); gmail@16's bar must not render 4-wide over a 3-wide
-          reference (the 1.169 LOSS).
-  Method: cap the EXTRA spill a candidate paints outside ref_l beyond what
-          the SAME-DEGREE f=1 form already paints — proportion drift is
-          priced, straightening quantization is not.
-  - circle@16's accepted square spills its corners at f=1 too → extra = 0 →
-    untouched BY CONSTRUCTION (that's why the guard is baseline-relative,
-    not absolute like the ref-run SPILL_FRAC_REF cap, which stays as-is).
-  - ref_l is bound for ALL runs (line ~1920): live reference when
-    ref_run is None — the guard needs no new state.
-
-STEP-BY-STEP
-  1. Lazy baseline: dict base_spl: dict[tuple[int,int], int] beside the
-     other per-run caches; _base_spill(q, d) scans cand_sets[q] for entries
-     with d match and fx==fy==1.0, takes min over
-       int(np.count_nonzero(cand_rasters[q][k] & ~ref_l))
-     (f=1 always exists: _size_factors emits 1.0 first; parent-follow
-     appends include f=1; comb appends carry their own f — fall back to
-     extra=0 when the scan finds nothing).
-  2. The check, in the loop after the ref-run spill block:
-       applies when pp[i].op == "add"
-       skip when _clamp_exempt(i, cand_solo)            (legal clamp-up)
-       skip when isinstance(cand.primitive, Polygon)
-            and not isinstance(parts_t[i].primitive, Polygon)
-            (round-5 axis-run forms: their f=1 "twin" is the D0 box —
-             a false baseline)
-       spl  = int(np.count_nonzero(cand_solo & ~ref_l))
-       ok   = spl - _base_spill(i, d) <= max(2.0,
-                  PROP_SPILL_FRAC * int(np.count_nonzero(cand_solo)))
-       fold into per_part_ok; count gf_seen["prop"] on failure for the
-       R1_DEBUG fallback line.
-  3. Followers: mirror the check for each j in flw on the flipped solo
-     (same pattern as the existing _inflation_ok follower loop) — baseline
-     keyed on the LEADER's candidates (the flip preserves spill counts
-     against a mirror-stable ref only approximately; use the leader's
-     baseline, it is the same geometry).
-
-GOTCHAS
-  - Tune 0.10 ONLY against a named miss (H1); lobe_union@24/32 are accepted
-    round-identity LOSSes — if the guard newly rejects their inflation,
-    measure first, exempt only on evidence (_clamp_exempt may already cover).
-  - This guard makes some parts lose ALL feasible candidates where they
-    previously had one → fallback path [class "prop" → record as "other"
-    unless glob_seen] — watch viol counts sweep-wide; the intent is the
-    OPPOSITE (proportion-honest candidates exist: f=1 is always offered).
-  - subtracts are exempt (op gate): counters/shaves carve INSIDE ref by
-    construction; _bite_ok already polices them.
-
-──────────────────────────────────────────────────────────────────────────
-TASK 6-R3
-  Claimed-stray clause in the final-mask audit (the gmail@32 orphan).
-
-WHAT YOU ARE WRITING
-  File:      this file (render.py)
-  Position:  (a) constant STRAY_OUT_FRAC = 0.60 in the round-6 block;
-             (b) one clause inside the final-mask audit loop (~line 2906),
-             BEFORE the claim-skip (`if any(... solo_now(q) ...): continue`).
-  Called by: nothing new — it extends the existing audit pass.
-
-CONCEPT
-  Goal:   a sub-min-feature component that lies mostly OUTSIDE the
-          reference is a stray even when a live part claims it (gmail@32:
-          the dominant's sliver between the mirrored V counter tips).
-  Method: same removal + 1:1 record as the unclaimed branch, PLUS a
-          violation tagged [stray] — a new feasibility class, so a
-          stray-free run outranks a cleaned one in arbitration.
-
-STEP-BY-STEP
-  1. Inside the loop, after `area` is computed, before the claim check:
-       out = int(np.count_nonzero(comp & ~(ref_l > 0)))
-       if out >= STRAY_OUT_FRAC * area:
-           final[comp] = 0
-           extra_drops.append(f"stray component removed ({area} px, "
-                              f"{out}/{area} outside ref) — final-mask audit")
-           violations.append(
-               f"{tag}: claimed sub-min-feature stray outside ref [stray]")
-           continue
-  2. The unclaimed branch below stays EXACTLY as-is (drops-only, no
-     violation — its components are noise, not misfit evidence).
-
-GOTCHAS
-  - The [stray] violation makes the cleaned run INFEASIBLE via _feasible's
-    `not r.violations`. If gmail@32 has no stray-free run, the cleaned
-    incumbent still wins the fallback arbitration and ships viol=1 —
-    measured contingency for step 6/8: either a candidate-level fix makes
-    the counter tips meet, or the violation downgrades to drop-only with
-    user sign-off. Do NOT pre-decide; measure.
-  - Removal precedes sym measurement and the battery (already ordered);
-    `violations` (the run list, line ~2612 scope) is the right sink — the
-    per-part part_violation dict is wrong here (no part owns the orphan).
-  - Sweep-wide guard: diff variant winners before/after — any cell silently
-    carrying claimed outside-ref slivers flips feasibility.
-
-──────────────────────────────────────────────────────────────────────────
-ROUND-6 BUILT-DIVERGENCES (what measurement forced past the briefs)
-  - 6-R2 prop guard: the Polygon-type exemption was a BUG — straighten()
-    emits Polygon for every primitive at every degree, so the type test
-    matched every candidate and silently neutered the guard (first
-    checkpoint's "all-synthetics stable" was a no-op artifact). Removed;
-    round-5 axis-run candidates need no carve-out (priced out vs live ref,
-    extra≈0 in their own ref-run).
-  - Baselines are per (PART, degree): followers get FLIPPED f=1 twins vs
-    their own true form — the pair-flip phase error is constant across
-    candidates and must cancel (gmail's mirrored V counters failed every
-    candidate against the leader's baseline).
-  - Subtract mirror added: uncarved-in-ref-empty px (true ∩ ¬cand ∩ ¬ref)
-    — _bite_ok polices over-carving, nothing policed UNDER-carving
-    (gmail@16's V closed at f=0.68 for jag).
-  - Scope: INCUMBENT runs only. Ref-runs already carry the round-4
-    idealized-candidate lock + SPILL_FRAC_REF; stacking the guard there
-    broke figma's regularize equilibrium and round-5 axisreduce cells.
-  - Rotated thin strokes exempt via _local_dims width < min-feature
-    (extents[] and solo-bbox are blind to stroke width on rotated
-    geometry — long_diag's 1.5-px bars).
-  - 6-R3 stray clause: ALSO covers claimed AT-min-feature debris
-    (area ≤ min_feat² — gmail's 3×2 sliver has min dim == min_feat);
-    unclaimed branch keeps round-3 scope byte-identical. Fixture gate
-    gained a silhouette-topology column (a persisting detached blob is
-    otherwise invisible to the table).
-  - distinct_ok own-soften (step 6): REF-RUNS ONLY and mass roles
-    (dominant/lobe) only — softening accents let thin_x@16's accent drift
-    until the battery failed [retention]/[conn]; incumbent runs keep
-    own-hard unconditionally (claude guard + sweep stability).
-  - slopereg variant (step 7): T ≥ 32 only (round-5 L-corner owns thin
-    diagonals at 16/24 — the sym-off slopereg form measured fid_ref
-    0.289/0.544 there and would displace the locked doctrine on raw J);
-    enable_sym=False (pair-flip phase killed fid_ref 0.682→0.564 at 32);
-    fid_ref area-only when ALL substituted parts are thin strokes
-    (round-4 comb doctrine: boundary IoU at ≤min-feature stroke scale is
-    raster phase).
-  - Snap harmonization (step 6): matches ABSOLUTE integer target extents
-    (d, round(fx·ex_i), round(fy·ey_i)) with free ≤0.5 snaps — the ratio
-    tuple was structurally a no-op for perturbed groups (equal ratios →
-    unequal pixels); tie-break smallest snap then index (H8).
-
-════════════════════════════════════════════════════════════════════════════
-ROUND-7 BRIEF — the REPRESENTED-GEOMETRY heuristic (user ruling, 2026-06-12)
-
-Directive: figma's top pill renders inconsistently at 16 — deg=1 chamfer at
-16/24 (regularize ref-runs) but deg=0 BOX at 32 (incumbent run): the
-rounded-identity floor is scoped `ref_run is not None`, so the pill's
-identity depends on WHICH RUN wins arbitration. User ruling: "It is round
-at this level with that curvature included because it renders the
-separation of the components well (represented geometry heuristic)" —
-identity-bearing curvature is rendered at EVERY scale at its representable
-degree, in EVERY run; the geometry is what visually separates components.
-
-──────────────────────────────────────────────────────────────────────────
-TASK 7-R1
-  Lift the rounded-identity floor from ref-runs to all runs.
-
-WHAT YOU ARE WRITING
-  File:      this file (render.py)
-  Position:  the rounded-identity block (~line 2396) — delete the
-             `if ref_run is not None:` gate (keep the loop body, dedent);
-             update its comment: the floor describes the PART, not the run.
-  Called by: nothing new — deg_min/budgets flow into degree_sets as today.
-
-CONCEPT
-  - The floor's gate `parts_t[q].primitive.corner_radius >= 1.0` already
-    encodes representability — below 1px the rule stands down, exactly the
-    "subtle where the grid can't show it" arm of the ruling. No new
-    constant.
-  - Expected movers (DELIBERATE under the ruling — adjudicate per cell,
-    do not auto-revert): figma@32 pill box→chamfer (the named fix);
-    capsule@16/24 (the case docstring says "sharp rect @16" — round-1-era
-    doctrine this ruling supersedes; update `render_debug._shapes()`'s
-    capsule comment when the cell moves); tab_body (body cr 24, tab cr 5);
-    discord (RRect dominant) — every RRect add with cr ≥ 1px at target.
-  - Guards: vscode (dominant cr 0.71px at 16 — below the gate, unchanged);
-    the Circle round-identity floor keeps its lobe/accent + extent ≥ 7
-    scope (untouched); fam-blade D1 floors untouched.
-
-STEP-BY-STEP
-  1. Remove the gate; dedent the loop. Comment: round 7 — represented
-     geometry: the floor describes the part's identity, not the run kind.
-  2. Full sweep + 5-fixture gate run; per-cell diff vs /tmp/r6_final3_*
-     and /tmp/r6_final2_fixtures.txt; list every mover with before/after.
-  3. Strips for every mover (strips-before-metrics); the figma@16/24/32
-     pill must now be the SAME form family at all three sizes (chamfer →
-     chamfer → chamfer-or-truer).
-
-GOTCHAS
-  - capsule@16's accepted 0.339 will move — that is the ruling operating,
-    not a regression; record per-cell, update the case's expectation
-    comment, flag in the README round-7 record.
-  - The budget bump (`budgets[q] = max(budgets[q], 1)`) comes with the
-    floor — keep them together or D1 sits outside a 0-budget and the
-    escalation clause re-enters.
-
-──────────────────────────────────────────────────────────────────────────
-TASK 7-R2
-  figma@16 pill raster cleanliness (the lopsided chamfer).
-
-WHAT YOU ARE WRITING
-  File:      this file (render.py) — diagnose FIRST (no pre-committed
-             mechanism): at 16 the regularize-frame pill rasters rows
-             5→7→9→6 wide with a 1px downward shift vs the original ref
-             (record: deg=1 f=1 snap=(0,0) — so the asymmetry comes from
-             the SNAPPED ideal's placement or the chamfer polygon's
-             raster phase, not the tweak search).
-  Probe:     raster the pill's D1 form standalone at 16 (straighten(
-             prim, 1) → _raster_part) vs its slot in the regularize vref;
-             compare row widths; the fix lands wherever the asymmetry
-             originates (snapped-geometry placement vs _chamfer_pts
-             rounding) — keep it scoped to that origin.
-  Acceptance: the user's attached 16×16 ideal — symmetric pill, curvature
-             present on the corners, clean component separation from the
-             middle row.
-────────────────────────────────────────────────────────────────────────────
+build_constructions prepares the per-feature geometry. assemble_render returns
+masks, diagnostics and a protected-accent mask. Keep reported drops and
+feasibility failures: a rendered mask is not necessarily an accepted fit.
+Earlier search designs and fixture results are in DEVELOPMENT.md.
 """
 
 from __future__ import annotations
@@ -1124,7 +243,7 @@ class RenderResult:
     #                                        "group" | None (harness audit)
 
 
-# ── reference protocol + baseline ────────────────────────────────────────
+# reference protocol + baseline
 
 
 def reference_coverage(parts: list[Part], canvas_hw: tuple[int, int],
@@ -1155,7 +274,7 @@ def naive_mask(parts: list[Part], canvas_hw: tuple[int, int], target: int) -> np
     return cv2.resize(canon, (target, target), interpolation=cv2.INTER_NEAREST)
 
 
-# ── jag metric (J2 — the digital-line doctrine, round 3) ─────────────────
+# jag metric (J2 — the digital-line doctrine, round 3)
 
 
 def _staircase_penalty(contour: np.ndarray) -> float:
@@ -1264,7 +383,7 @@ def _topology(mask: np.ndarray) -> tuple[int, int]:
     return n_cc - 1, holes
 
 
-# ── structural role inference ────────────────────────────────────────────
+# structural role inference
 
 
 def infer_roles(parts: list[Part], canvas_hw: tuple[int, int]) -> list[Role]:
@@ -1337,7 +456,7 @@ def _budget_extent(p) -> float:
     return hi if (lo > 0 and hi >= ELONGATED_ASPECT * lo) else lo
 
 
-# ── candidate generation ─────────────────────────────────────────────────
+# candidate generation
 
 
 def _build_candidate(part_t: Part, degree: int, fx: float, fy: float,
@@ -1467,7 +586,7 @@ def _candidates(part_t: Part, degrees: list[int], extent_xy: tuple[float, float]
                     if key not in seen2:
                         seen2.add(key)
                         sizes.append((fx, fy))
-    # ── round 6 — the run-≥2 "geometric extension" rung: a diagonal whose
+    # round 6 — the run-≥2 "geometric extension" rung: a diagonal whose
     # nearest Θ member is 45° renders 1-px teeth at length (W_STEP prices
     # them, but no alternative base exists, so the true angle wins by
     # fidelity and ships irregular bump trains). Offer the nearest RUN-≥2
@@ -1513,7 +632,7 @@ def _candidates(part_t: Part, degrees: list[int], extent_xy: tuple[float, float]
                 for mode in (0, 1, 2):
                     cand, dx, dy = _build_candidate(base, d, fx, fy, mode)
                     out.append((cand, d, fx, fy, dx, dy))
-    # ── round 5 — the L-CORNER doctrine (user-drawn ideal): a thin DIAGONAL
+    # round 5 — the L-CORNER doctrine (user-drawn ideal): a thin DIAGONAL
     # stroke also offers its axis-run reductions (L / mirrored-L / Z), the
     # coarsest digital line — zero staircase, single corners. Direct-emit at
     # the pre-sized target width and d=0 (the maximal-reduction rung; the
@@ -1551,7 +670,7 @@ def _candidates(part_t: Part, degrees: list[int], extent_xy: tuple[float, float]
     return out
 
 
-# ── constraints ──────────────────────────────────────────────────────────
+# constraints
 
 
 def _inflation_ok(cand_solo: np.ndarray, orig_solo: np.ndarray) -> bool:
@@ -1659,7 +778,7 @@ def _outline_gaps(ref: np.ndarray, parts: list[Part],
     return out
 
 
-# ── symmetrization ───────────────────────────────────────────────────────
+# symmetrization
 
 
 def _flip_mask(mask: np.ndarray, a2: int, vertical: bool) -> np.ndarray:
@@ -1841,7 +960,7 @@ def _local_pairs(parts: list[Part], solos: list[np.ndarray],
     return leader_of, pair_axis, deltas
 
 
-# ── label collapse ───────────────────────────────────────────────────────
+# label collapse
 
 
 def _fit_single_label(mask: np.ndarray, h: int, w: int
@@ -2187,7 +1306,7 @@ def _collapse_variants(parts: list[Part], roles: list[Role],
             if best_star is not None and best_star[1] >= COLLAPSE_MIN_IOU:
                 out.append(assemble(best_star[0], f"star{sp['n']}",
                                     best_star[1], "star_organic"))
-            # ── blade decimation (round 3) — round-4 EVIDENCE gate: a pair is
+            # blade decimation (round 3) — round-4 EVIDENCE gate: a pair is
             # sub-representable iff its fused span covers ≥ GAP_FUSE_FRAC of
             # the pair's shared radial span (the old any-8-adjacency test
             # over-fired on claude@32's organic spacing — open item (b)).
@@ -2236,7 +1355,7 @@ def _collapse_variants(parts: list[Part], roles: list[Role],
                 sub2 = sum(1 for f_ in fr2 if f_ >= GAP_FUSE_FRAC)
                 if sub2 * 2 >= len(keep2) and len(order_b[::3]) >= 3:
                     out.append(decim(order_b[::3], 3))
-            # ── round 4: family-harmonized multi-part EXTRAPOLATION, for
+            # round 4: family-harmonized multi-part EXTRAPOLATION, for
             # IRREGULAR families only (a family already on an exact comb —
             # asterisk6 — needs no extrapolation; its round-3 paths stand).
             # Blades rebuilt UNIFORM (median dims, median radial distance,
@@ -2337,7 +1456,7 @@ def _collapse_variants(parts: list[Part], roles: list[Role],
     return out
 
 
-# ── the grid-fit search ──────────────────────────────────────────────────
+# the grid-fit search
 
 
 @dataclass
@@ -2503,7 +1622,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
         violations: list[str] = []
         parts_t = [_scale_part(_floatify(p), f) for p in pp]
 
-        # ── symmetry prep: global axis, else local mirror pairs ──
+        # symmetry prep: global axis, else local mirror pairs
         leader_of: dict[int, int] = {}
         self_paired: set[int] = set()
         pair_axis: dict[int, tuple[bool, int]] = {}
@@ -2548,8 +1667,8 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
                     u |= true_solos[i]
             group_union[g] = u
 
-        # ── min-feature pass: drop / clamp / force-merge BEFORE the search;
-        # PAIR-COHERENT — the leader decides for its mirror twin ──
+        # min-feature pass: drop / clamp / force-merge BEFORE the search;
+        # PAIR-COHERENT — the leader decides for its mirror twin
         drop_reason: dict[int, str] = {}
 
         def _drop(i: int, reason: str) -> None:
@@ -2599,7 +1718,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
         dropped = [i in drop_reason for i in range(n)]
         live = [i for i in range(n) if not dropped[i]]
 
-        # ── candidate sets + initial state (most faithful within budget).
+        # candidate sets + initial state (most faithful within budget).
         # Degrees ABOVE the budget stay as ESCALATION options (the floor
         # outranks the straightening doctrine). Budgets key on LOCAL-frame
         # extents (length for elongated strokes); followers carry no candidate
@@ -2801,7 +1920,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
                     return False
             return True
 
-        # ── distinctness: retention measures COVERAGE, not identity — a part
+        # distinctness: retention measures COVERAGE, not identity — a part
         # absorbed into a sibling is still "covered". Every add must keep
         # ≥ RETAIN_FRAC of its EXCLUSIVE territory (pixels only it covers in
         # the true forms), or the jag-first objective fuses identity-bearing
@@ -2873,8 +1992,8 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
                     return False          # newly broke a sibling
             return True
 
-        # ── round-3 constraint battery: separation, pockets, pronouncedness —
-        # all newly-violated vs a per-part-optimization snapshot ──
+        # round-3 constraint battery: separation, pockets, pronouncedness —
+        # all newly-violated vs a per-part-optimization snapshot
         se3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         sep_pairs: list[tuple[int, int]] = []
         if len(add_live) >= 2:
@@ -3298,7 +2417,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
         for i in order:                       # pass 1: static grid-snap candidates
             _optimize_part(i)
 
-        # ── parent-follow candidates (the composition clause): a subordinate
+        # parent-follow candidates (the composition clause): a subordinate
         # must cut the SNAPPED parent, not the absolute grid. Followers are
         # excluded — their geometry mirrors the leader's follow automatically.
         group_dom: dict[int, int] = {}
@@ -3333,7 +2452,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
             _optimize_part(i)
         violations.extend(part_violation[i] for i in sorted(part_violation))
 
-        # ── twin harmonization: identical-shape siblings must not end with
+        # twin harmonization: identical-shape siblings must not end with
         # MIXED degrees from fractional-phase ties. Leaders only — followers
         # mirror automatically.
         twin_sets: dict[tuple, list[int]] = {}
@@ -3425,7 +2544,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
                 choice[:] = saved
             choice[:] = best_choice
 
-        # ── round 4 — regularity snap harmonization: members of a detected
+        # round 4 — regularity snap harmonization: members of a detected
         # size group share their FULL tweak tuple (degree, fx, fy, dx, dy)
         # when a matching candidate exists — identical primitives (the
         # extrapolated variant) then raster identically up to translation.
@@ -3504,7 +2623,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
                 if not ok:
                     choice[:] = saved
 
-        # ── radial spacing harmonization (round 3): for a kept blade family,
+        # radial spacing harmonization (round 3): for a kept blade family,
         # offer the comb (each blade rotated about the hub onto a uniform
         # pitch) as a SET-WIDE alternative — offered and arbitrated, never
         # forced (claude's organic ±8° may honestly win on fidelity).
@@ -3561,7 +2680,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
                             and global_ok(set(comb_k), comb_base, trial=trial)):
                         choice[:] = saved
 
-        # ── render_fit refiner (optional torch): polish leader deltas when
+        # render_fit refiner (optional torch): polish leader deltas when
         # the deterministic result is flagged; decoded state must beat the
         # incumbent under the SAME hard key + full battery or it is discarded
         if enable_sym and live and ref_run is None:
@@ -3654,7 +2773,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
 
         final = compound() if live else np.zeros((target, target), np.uint8)
 
-        # ── counter-integrity audit (pair-coherent): a fused/vanished island
+        # counter-integrity audit (pair-coherent): a fused/vanished island
         # is dropped — with its mirror twin — and the compound re-rendered.
         island_changed = False
         for i in list(live):
@@ -3680,7 +2799,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
         if island_changed:
             final = compound() if live else np.zeros((target, target), np.uint8)
 
-        # ── final-mask audit (round 3): unclaimed sub-min-feature components
+        # final-mask audit (round 3): unclaimed sub-min-feature components
         # are stray pixels (the gmail@32 class) — removed AND recorded, never
         # silently erased; sym is measured AFTER the audit
         extra_drops: list[str] = []
@@ -3776,7 +2895,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
                                        d, fx, fy, dx, dy, None,
                                        part_violation.get(i)))
 
-        # ── round 4 — the EXTRAPOLATED-SYMMETRY feasibility rule: a render
+        # round 4 — the EXTRAPOLATED-SYMMETRY feasibility rule: a render
         # that breaks a DETECTED family's regularity is infeasible, full
         # stop. Offering symmetric variants is not enough — the lopsided
         # cross has LOWER raw jag than a clean star, so the regular form can
@@ -3892,7 +3011,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
         battery = bool(live) and batt_class is None
         if os.environ.get("R1_DEBUG") and batt_class is not None:
             print(f"          battery fail [{batt_class}]")
-        # ── round 4 — glob attribution for the removal phase: which live
+        # round 4 — glob attribution for the removal phase: which live
         # adds assembled the glob (absolutely-fused separated pairs; accents
         # covering a filled protected pocket). Computed only on flagged runs
         # — zero cost on clean ones. Indices are in THIS run's part list.
@@ -3918,7 +3037,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
                     glob_offenders=glob_offenders,
                     viol_class=dict(part_viol_class))
 
-    # ── incumbent + collapse variants, arbitrated honestly ──
+    # incumbent + collapse variants, arbitrated honestly
     incumbent = _run(parts, roles_orig, canon_solos, lambda i: f"#{i}",
                      reg_check=True)
     runs: list[tuple[_Run, str | None, dict | None, dict | None,
@@ -4297,7 +3416,7 @@ def render_debug(parts: list[Part], canvas_hw: tuple[int, int],
                                                  rinfo.get("topo_canon"))))
         return fid_ok and not r.violations and r.battery and topo_ok
 
-    # ── round 4 — phase B, removal on globbing evidence: ONLY when nothing
+    # round 4 — phase B, removal on globbing evidence: ONLY when nothing
     # is feasible AND the incumbent carries glob evidence; accent-role
     # offenders only (lobes/dominant are identity — claude's blades are
     # LOBES: family-ladder territory, never this path); twin-closed; one
@@ -4447,9 +3566,9 @@ def render(parts: list[Part], canvas_hw: tuple[int, int], target: int) -> np.nda
     return render_debug(parts, canvas_hw, target).mask
 
 
-# ── the cross-construction ASSEMBLY layer + construction builder (production;
+# the cross-construction ASSEMBLY layer + construction builder (production;
 #    lifted from the render_debug harness so application/pipeline.py never
-#    imports a debug module — the harness imports these back) ──
+# imports a debug module — the harness imports these back)
 
 _FX_BG = (238, 238, 238)   # composite background: white-on-white features stay visible
 

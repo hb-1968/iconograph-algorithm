@@ -1,137 +1,12 @@
-"""R1 render tier — degree-ladder straightening (pure geometry, no scoring).
+"""Map primitives to area-matched forms along a curvature ladder.
 
-Maps each primitive to its "straightened" form at a permitted-curvature degree:
-0 = fully straight … 3 = true curve. Straightened forms are Polygon parts
-(op/group preserved) rasterized at half-pixel precision by common._raster_part;
-degree 3 (and curvature-free kinds at their max) returns the part unchanged.
-The ladder per kind (area-MATCHED, not bbox-matched — a bbox square reads
-visibly oversized and strains the sibling-retention constraint):
+Degree 0 is rectilinear; degree 3 retains the true curve. Preserve operation
+and group labels. Rotated forms snap angles at lower degrees; wedges snap
+start and sweep together so arcs crossing 360 degrees remain valid.
 
-    Circle        D0 square (side r√π) · D1 octagon · D2 16-gon · D3 true
-    Ellipse       D0 rect · D1 affine octagon · D2 affine 16-gon · D3 true
-    RotEllipse    same + angle snap {0,90} / {0,45,90,135} / original
-    Rectangle     degree-invariant (already straight) — corner polygon below D3
-    RotRect       angle snap {0,90} / 45-grid / original-angle box
-    RoundedRect   D0 sharp rect · D1 chamfer (chord between arc endpoints —
-                  lies INSIDE the arc, never inflates: composition-safe) ·
-                  D2/D3 true
-    Triangle      edge angles within 15° (D0) / 8° (D1) of a 45-multiple snap
-                  to it, vertices re-derived as line intersections · D2/D3 true
-    Wedge         arc → chord fan (1 / 2 / 4+ chords), (a0, sweep) snapped to
-                  45 / 22.5 / no grid — NEVER snap a0/a1 independently (a1 may
-                  exceed 360 to cross the seam)
-
-Raster convention (probed, pinned by render_debug's self-test): cv2.fillPoly is
-OUTLINE-INCLUSIVE with round-half-up vertex placement — an integer-corner box
-(a..b) fills pixels a..b (b−a+1 wide); fractional edges round OUTWARD. Emitted
-polygons are therefore INSET ~0.5 px per edge (boxes lose 1 from each dim,
-N-gons lose 0.5/cos(π/n) of circumradius, snapped-triangle edge lines shift 0.5
-inward, wedge arcs lose 0.5 of radius) so the fill matches the
-pixel-centers-inside coverage rule the supersampled reference uses.
-
-Also exports the geometry transforms the grid-fit search (render.py) tweaks
-candidates with: translate_prim / scale_about_center / prim_center / prim_bbox —
-and star_polygon, the radial-family collapse form (claude's hub + 12 blades
-render as ONE clean star label whose n-fold symmetry is exact by construction).
-Deterministic throughout (H8): closed-form trig, no RNG.
-
-Round 3 — the DIGITAL SLOPE GRID Θ (SLOPE_GRID_DEG): slopes {0, ±26.57°, 45°,
-±63.43°, 90°} raster as periodic digital lines whose step runs are ≥ 2 px (or
-pure axis) — the only slopes stage-4 refinement digests; 45° stays legitimate
-as a SHORT chamfer only (≤ K45 diagonal moves — "straight edges that form from
-single corners"). snap_slope() replaces the 45°-grid snap at D1; the D1 circle
-form is a chamfered square (corner cuts capped at K45) instead of the regular
-octagon, whose long 45° edges are all 1-px teeth at larger radii.
-
-════════════════════════════════════════════════════════════════════════════
-ROUND-6 BRIEF — the straighten.py share (steps 2 + 3-helpers of the plan)
-
-TASK 6-S1
-  Close the Triangle D1 snap dead zones (one constant + one stale docstring).
-
-WHAT YOU ARE WRITING
-  File:      this file (straighten.py)
-  Position:  the TRI_SNAP_TOL constant (~line 74) and _snap_triangle's
-             docstring (~line 233).
-  Change:    TRI_SNAP_TOL = (15.0, 8.0)  →  (15.0, 13.5)
-             docstring: "45-multiple" → "Θ member (snap_slope)" — the code
-             moved to the slope grid in round 3, the docstring did not.
-  Called by: straighten() Triangle branch (~line 494) — no caller changes.
-
-CONCEPT
-  - The farthest any angle sits from Θ is 13.285° (the midpoint of the
-    0↔26.57° gap). D1's tol=8 therefore leaves DEAD ZONES — (8°, 18.57°),
-    (34.57°, 37°), (53°, 55.43°), (71.43°, 82°) — where a triangle edge
-    keeps its TRUE angle while the record says deg=1: gmail@32's V inner
-    edges (~72-82°) and vscode@32's chevron hypotenuses render as
-    irregular 1-2px bump trains exactly there. tol=13.5 covers the grid.
-  - D0 (tol 15) already snaps everything; only the D1 member changes.
-
-GOTCHAS
-  - competition's triangle edges (0°, 59.0°→63.43 Δ4.4, 119.5°→116.57
-    Δ2.9) all sat within the OLD tolerance — verified unaffected; it and
-    bevel_rect are the named guards in the step-2 sweep.
-  - The area-ratio guard in _snap_triangle (0.25-4.0×) already rejects
-    degenerate snaps — no new guard needed at the wider tolerance.
-
-──────────────────────────────────────────────────────────────────────────
-TASK 6-S2
-  Run-≥2 slope helpers: snap_slope_run2 + a restricted-grid triangle snap.
-
-WHAT YOU ARE WRITING
-  File:      this file (straighten.py)
-  Position:  snap_slope_run2 directly below snap_slope (~line 148);
-             SLOPE_GRID_RUN2 beside SLOPE_GRID_DEG (~line 133);
-             snap_triangle_run2 directly below _snap_triangle (~line 270).
-  Imports:   none new (math/np already imported).
-  Signatures:
-      SLOPE_GRID_RUN2: tuple[float, ...]
-          # Θ minus the 45° class: (0.0, 26.565051..., 63.434948..., 90.0,
-          #  116.565051..., 153.434948...) — the slopes whose digital lines
-          #  have step runs ≥ 2 px (or pure axis); no 1-px teeth at all
-      def snap_slope_run2(angle: float) -> float:
-          # nearest SLOPE_GRID_RUN2 member, mod 180, wrap-aware —
-          # the same selection rule as snap_slope, restricted grid
-      def snap_triangle_run2(p: Triangle
-                             ) -> tuple[tuple[float, float], ...] | None:
-          # _snap_triangle against SLOPE_GRID_RUN2 with tol=RUN2_TRI_TOL;
-          # None on degenerate result (caller skips the base)
-  Called by: render.py _candidates (round-6 brief there, TASK 6-R1).
-
-CONCEPT
-  Goal:   give the candidate generator the "geometric extension" rung —
-          the nearest slope whose raster is uniform runs ≥ 2 px.
-  Method: same nearest-member selection as snap_slope on the restricted
-          grid; for triangles, reuse _snap_triangle's edge-line
-          re-intersection by threading the grid through it.
-  - Max distance to the restricted grid is 18.435° (at exactly 45°), so
-    RUN2_TRI_TOL = 18.5 makes the triangle snap total — every edge moves
-    to a run-≥2 slope; the fid floor at the call site arbitrates whether
-    such a rotation is affordable ("avoided unless completely necessary").
-
-STEP-BY-STEP
-  1. Constants. SLOPE_GRID_RUN2 from the same atan2-exact values as
-     SLOPE_GRID_DEG (copy the member expressions, drop 45.0 and 135.0);
-     RUN2_TRI_TOL = 18.5 beside it.
-  2. snap_slope_run2: copy snap_slope's loop verbatim with the restricted
-     grid (or refactor both onto a shared _snap_to_grid(angle, grid) —
-     preferred per H5; snap_slope keeps its public signature).
-  3. _snap_triangle gains an optional grid param defaulting to None
-     (= use snap_slope, byte-identical behavior for every existing
-     caller); when grid is given, the per-edge `m = snap_slope(theta)`
-     becomes `m = _snap_to_grid(theta, grid)`.
-  4. snap_triangle_run2(p) = _snap_triangle(p, RUN2_TRI_TOL,
-     grid=SLOPE_GRID_RUN2).
-
-GOTCHAS
-  - snap_slope_run2 must be IDEMPOTENT on run-2 members (D1 re-snaps the
-    base in the ladder): nearest-member of an exact member is itself —
-    holds as long as the grid values are the same float expressions used
-    to build the base angle (do not re-derive via degrees(atan(0.5))
-    in one place and a literal in the other).
-  - H8: pure closed-form selection, no RNG, no dict iteration order.
-  - Keep _snap_triangle's default-path bytes identical: the grid param
-    must not change the snap of any existing call (default None branch).
+Rasterization uses outline-inclusive fillPoly with round-half-up vertices.
+Polygon edges are inset by roughly half a pixel to match continuous extents.
+This module supplies geometry; the renderer scores candidate feasibility.
 """
 
 from __future__ import annotations
@@ -169,7 +44,7 @@ TRI_SNAP_TOL = (15.0, 13.5)       # D0 / D1 edge-angle snap tolerance, degrees
 #   rendered as irregular 1-2px bump trains). 13.5 covers the full grid.
 
 
-# ── polygon builders ─────────────────────────────────────────────────────
+# polygon builders
 
 
 def _ngon(cx: float, cy: float, rx: float, ry: float, n: int,
@@ -618,7 +493,7 @@ def asterisk_polygon(cx: float, cy: float,
     return tuple(pts)
 
 
-# ── the ladder ───────────────────────────────────────────────────────────
+# the ladder
 
 
 def straighten(p: Primitive, degree: int) -> Primitive:
@@ -708,7 +583,7 @@ def straighten_part(part: Part, degree: int) -> Part:
     return Part(primitive=straighten(part.primitive, degree), op=part.op, group=part.group)
 
 
-# ── transforms the grid-fit search tweaks candidates with ────────────────
+# transforms the grid-fit search tweaks candidates with
 
 
 def prim_center(p: Primitive) -> tuple[float, float]:

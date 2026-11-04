@@ -1,25 +1,8 @@
-"""Stage 5 phase 5 — connect the composed pieces into ONE continuous 1px stroke.
+"""Join composed components with one-pixel bridges.
 
-`compose_icon` (phase 3) leaves the native logo + two frame-letters 1px-SEPARATED, so
-`ComposeResult.union` holds several 8-connected 1px components (the logo is often itself a
-few pieces — discord = face ring + 2 eyes + mouth). `connect_snake` joins them into a single
-pen-stroke with the user's **stricter-snake rule: the connecting line must never form a
-degree-3 T-JUNCTION; a degree-4 X / 4-way crossing is fine.**
-
-Mechanism (CONNECT + the connection-side DISCONNECT, per the user rulings):
-  - MST over the components by nearest-pixel gap → n-1 single-point 1px `LINE_4` bridges (each
-    pair joined once).
-  - Each bridge lands mid-stroke, which would be a degree-3 T. **OPEN the crossed stroke**:
-    remove one of the join pixel's stroke-neighbours (topology-guarded to stay connected) so the
-    join is a clean degree-2 pass — a closed loop (O/D bowl, the discord face ring) opens into
-    an arc. Removal-based (no added pixel) → no whisker stubs, unlike the add-a-4-way-crossing
-    alternative (the user picked 'open — clean arcs' over 'cross — keep loops closed').
-  - Scope = the CONNECTION joins only; each letter's and each logo's OWN internal junctions
-    (the react atom's branches, F's bar) are left intact.
-
-Deterministic (H8): `cv2.connectedComponents` row-major labels, `cdist` sqeuclidean + lexsort
-tiebreak, hand-Prim's MST with a `(dist,i,j)` tiebreak, `cv2.LINE_4`, fixed 4-neighbour fill
-order. No RNG, no interpolating cv2 op.
+Use a deterministically ordered minimum spanning tree of nearest-pixel gaps.
+Open connection-created T-junctions where connectivity permits; existing
+junctions within a logo or letter remain intact. Four-way crossings are allowed.
 """
 from __future__ import annotations
 

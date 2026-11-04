@@ -1,21 +1,4 @@
-"""monogram_debug.py — Stage-5 phase-1 harness: name → two defining letters.
-
-Text-only, lightweight (no image panels, no .cache, no BLAS pinning). Reads
-fixtures/names.json, runs select_monogram_letters() on each requested fixture's
-display name, and prints a  stem | name | got | expected  table.
-
-The four user-given examples (Discord→DC, Adobe Illustrator→AI, Android→AD,
-Medium→MD) carry hard expected values and GATE acceptance (H1 — ground truth
-visible before any tuning). The remaining seeds print as observations only.
-
-Run:
-    python -m iconograph.monogram_debug                     # DEFAULT_FIXTURES
-    python -m iconograph.monogram_debug discord medium-m    # specific stems
-
-Note: select_monogram_letters lives in application/monogram/common.py and is
-written by the user from the brief in that file's docstring — until then this
-harness raises ImportError, which is expected.
-"""
+"""Inspect the name-to-two-letter monogram selector."""
 from __future__ import annotations
 
 import json

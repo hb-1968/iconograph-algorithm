@@ -1,161 +1,10 @@
-"""Lightweight, single-process debug harness for the stage-3 R1 render tier.
+"""Inspect synthetic constructions or fixture renderings.
 
-Two modes:
-
-SYNTHETIC (default): hand-built Part compositions spanning the methodology axes
-— sole-curve hard straightening, counters vs shaves, lobe/accent sibling
-competition, negative-group counters, auto-degenerate capsules — rendered at
-small hicolor grids and compared against the supersampled reference and the
-naive nearest-neighbour baseline the renderer must beat.
-
-FIXTURE (--fixtures): the real pipeline — loads the cached L2 segmentation (raw
-pickle reads, diff_debug's pattern), runs decompose_shape per Feature in-process
-(decompositions are computed once and reused across all target sizes), offsets
-each construction to full-canvas coords, renders every construction
-INDEPENDENTLY on the shared global grid (per-feature rendering avoids
-cross-feature CSG group collisions), and composites by segment color. L1
-Classified segments render as 1-part add constructions. Features whose
-decomposition returns no parts are deferred (R3 residual territory, reported).
-
-    python -m iconograph.render_debug                    # all shapes, sizes 16/24/32/64
-    python -m iconograph.render_debug circle annulus     # specific shapes
-    python -m iconograph.render_debug --fixtures         # default fixtures (discord, gmail, claude)
-    python -m iconograph.render_debug --fixtures vscode  # specific fixture stems
-    python -m iconograph.render_debug --final            # assemble + deliver the
-                                                         #   FINAL render products
-                                                         #   (source | final@16 |
-                                                         #   final@24), one clean row
-                                                         #   per fixture + a combined
-                                                         #   gallery → testbed/render/
-                                                         #   final/ . --final --all for
-                                                         #   the full dataset.
-    python -m iconograph.render_debug --sizes 16,32      # specific target sizes
-    python -m iconograph.render_debug --degrees          # + per-degree ladder panels (H7,
-                                                         #   synthetic mode only)
-    python -m iconograph.render_debug --twice            # render twice, assert byte-
-                                                         #   identical masks (H8)
-
-Synthetic strip panels per (shape, size): reference | naive NN | R1 render |
-diff (red = missed reference, blue = spill), all nearest-upscaled. Fixture
-strips: one PNG per fixture, a row per size: aligned source | reference
-composite | naive composite | R1 composite (segment colors, light-grey bg so
-white-on-white features stay visible) → testbed/render/fixtures/fx_<stem>.png
-(synthetic shape strips → testbed/render/synthetic/<name>_<size>.png).
-Startup self-test pins the fillPoly raster convention (outline-inclusive,
-round-half-up: an integer-corner box (a..b) fills pixels a..b exactly) — it
-silently corrupts every downstream number if wrong.
-
-────────────────────────────────────────────────────────────────────────────
-ROUND-4 BRIEF (H10: you implement) — harness side of removal-on-globbing
-(render.py's round-4 brief is the renderer side; land that first).
-
-(a) New synthetic "asterisk12" in _shapes() — the claude-geometry analogue
-    the decimation evidence gate is tuned against:
-        hub Circle(96, 96, 18) + 12 RotatedRectangle blades ~52×7, centers
-        at radius ~44 from the hub, angles = 30° pitch + a HAND-WRITTEN
-        deterministic jitter list (e.g. +8,-6,+4,-8,+6,-4 repeating — no
-        RNG, H8), all "add", canvas (S, S).
-    EXPECTED_SYM["asterisk12"] = "none" (organic jitter must not fire an
-    axis — guard). Tune blade width/jitter so @16 is majority-sub-
-    representable (decimates; ladder picks 6 vs 4) and @32 is not (12
-    blades survive). Probe with _subrep_pairs' printed {sub}/{n} evidence
-    in the absorbed reason.
-(b) Per-cell truth columns: both print sites (the fixture per-construction
-    line and the synthetic per-cell line) append, getattr-guarded like the
-    round-2/3 fields:
-        f"  {kind} {fid_ref:.3f} removed {removed_ink}px"  # only when
-        # fid_ref is not None; kind = "live" (removal) | "extr"
-        # (extrapolated) — a removal/decimation/idealization win must
-        # never hide behind the full-ref fid alone (per-cell-truth
-        # taxonomy); removed px only for removal wins
-(c) Optional, TIMEBOXED: "pocket_dot" — body whose pocket lodges a dot
-    accent such that every candidate (incl. mode-0) fills the pocket →
-    absolute pocket failure attributable to the accent → phase-B removal
-    fires and wins with battery TRUE. The search avoids avoidable globs by
-    design, so this may be untunable — if so, record an open item and gate
-    the accent path on the claude fixture + unit-level attribution instead.
-
-AMENDMENT (extrapolated symmetry — render.py brief R4-6/7/8):
-(d) New synthetic "row_stack" in _shapes() — the figma-geometry analogue:
-        Rectangle spine + RoundedRectangle pill (h ≈ 2r) + 3 Circles with
-        DELIBERATE small perturbations (radii e.g. 26.0/26.6/25.4, two cy
-        equal within ~1 px, row pitch off-uniform by ~1 %), all "add",
-        S = 192, hand-written values (no RNG, H8). The regularity detector
-        must fire (margins mirror the figma probe: spread 0.020, CV 0.003)
-        and the extrapolated variant must snap radii/alignment/pitch
-        exactly. EXPECTED_SYM["row_stack"] = "none".
-(e) EXPECTED_SYM amendments: "claude" and "asterisk12" become "any" — a
-    phase-snapped extrapolated star may legitimately fire a mirror axis;
-    neither a fire nor a non-fire is an audit failure for these two.
-(f) New EXPECTED_REG audit table (same gate shape as EXPECTED_SYM — zero
-    expected-but-missed AND zero spurious):
-        "radial": claude, asterisk6, asterisk12     # _radial_family fires
-        "group":  figma, row_stack                  # _regularity_groups fires
-        "none":   everything else (wedge, competition, discord, gmail,
-                  vscode, thin_x, long_diag, tab_body, ... — discord's two
-                  eyes are a 2-member set: mirror-twin territory, size
-                  groups need ≥ 3)
-    Harness prints detected-vs-expected per cell; REG constants loosen only
-    against a named miss, one constant per change, strips before/after.
-
-Acceptance gates (restated for round 4 + amendment): full grid no
-regressions (jag wins, floor-or-drop, topo, sym-audit at parity or better;
-viol budget re-measured and reported per cell); asterisk6@16/@32 strips
-BYTE-IDENTICAL (its winners are already regular stars — the feasibility
-rule must not shift them); thin_x@16 unchanged and phase B not constructed
-(its violations classify "floor"); claude@16 = uniform 6-spike extrapolated
-star, claude@32 = uniform 12-spike extrapolated star (fid_ref ≥ floor,
-full-ref fid reported beside it either way, viol < 7); figma@32 = three
-EQUAL aligned circles on a uniform pitch with the circle at ≥ octagon
-degree, figma@16 = regular aligned stack (recognizability strips judged
-under H1); asterisk12 @16 decimated-star / @32 12-spike per the same
-evidence; row_stack per (d); EXPECTED_REG audit clean; --twice
-byte-identical on the grid + claude + figma ×2; vscode/discord/gmail cells
-unchanged.
-
-════════════════════════════════════════════════════════════════════════════
-ROUND-6 BRIEF — the gate surface (step 1 of the approved plan)
-
-TASK 6-H1
-  Make the 5-fixture × {16,24,32} gate visible: defaults + per-cell table.
-
-WHAT YOU ARE WRITING
-  File:      this file (render_debug.py)
-  Position:  (a) DEFAULT_FIXTURES (~line 165) → ("discord", "gmail",
-             "vscode", "claude", "figma");
-             (b) a `strays` count in _process_fixture's stats dict
-             (~line 503) — count of r.drops entries containing
-             "stray component removed", summed across features per cell;
-             (c) a gate table in main()'s fixtures branch, printed after
-             the existing fixture summary (~line 637);
-             (d) module docstring: record the ROUND-6 GATE — every fixture
-             cell at T ∈ {16, 24, 32}: no LOSS, viol 0, strays 0,
-             reg/sym audits pass, visual strip sign-off (user's ruling:
-             "16, 24, 32 exclusively").
-  Imports:   none new.
-  Signature (table emitter, module level beside the summaries):
-      def _gate_table(all_stats: list[dict]) -> None:
-          # one row per (stem, T): Jratio (LOSS tag), viol, strays,
-          # reg-audit, floor-or-drop, verdict PASS/FAIL; then a one-line
-          # tally "gate: N/15 cells green"
-  Called by: main(), fixtures branch only.
-
-CONCEPT
-  - The gate is a TABLE, not a paragraph: 15 cells, each green or named —
-    the per-cell-truth doctrine (3-decimal ratios, LOSS tags) applied to
-    the shipping decision. A cell is green iff: ratio ≤ 1.0, viol == 0,
-    strays == 0, floor_ok, reg_audit_ok (sym has no per-fixture
-    expectation — the figma mirror guard already prints separately).
-  - Synthetic DEFAULT_SIZES stays (16, 24, 32, 64) — the 60-cell sweep is
-    the regression guard; only the FIXTURE gate is 16/24/32.
-
-GOTCHAS
-  - Print-only change: stats math and strips must be byte-identical —
-    --twice before/after is the step-1 check.
-  - r.drops strings are the source of truth for strays (RenderResult has
-    no dedicated field; do not add one — the drop record IS the contract).
-  - ASCII only in cv2 panel captions (Hershey renders non-ASCII as ??);
-    the table goes to stdout, so Ĵ etc. are fine THERE.
+Use --fixtures for real logos, --final for assembled products, --all for the
+fixture set and --twice to compare repeated output bytes. Synthetic and
+fixture grids report fidelity, topology, drops and feasibility separately.
+Outputs go under testbed/render/. The startup check pins fillPoly's
+outline-inclusive, round-half-up raster convention.
 """
 
 from __future__ import annotations
@@ -331,7 +180,7 @@ def _shapes() -> dict[str, Callable[[], tuple[list[Part], tuple[int, int]]]]:
                                  Part(Circle(141, 76, 40), A),
                                  Part(Triangle((60.0, 165.0), (95.0, 165.0), (77.0, 135.0)), A),
                                  Part(Circle(51, 96, 15), SUB)], (S, S)),
-        # ── round-3 cases: each exposes one critique mechanic ──
+        # round-3 cases: each exposes one critique mechanic
         # 10 — 1px-STEPPING: a V of two long ~63° bars (gmail's trap without
         #      the pillars) — must render as clean 2-px vertical runs, never a
         #      1-px 45° staircase; vertical axis must fire (sym 1.0)
@@ -357,7 +206,7 @@ def _shapes() -> dict[str, Callable[[], tuple[list[Part], tuple[int, int]]]]:
         "tab_body": lambda: ([
             Part(RoundedRectangle(86.0, 96.0, 120.0, 120.0, 0.0, 24.0), A),
             Part(RoundedRectangle(152.0, 96.0, 56.0, 10.0, 0.0, 5.0), A)], (S, S)),
-        # ── round-4 cases: extrapolated symmetry ──
+        # round-4 cases: extrapolated symmetry
         # 14 — RADIAL EXTRAPOLATION (claude analogue): hub + 12 thin blades on
         #      a HAND-JITTERED organic comb (±6°-class, no RNG — H8). The
         #      per-gap evidence must decimate @16 and keep 12 @32; the
@@ -384,7 +233,7 @@ def _shapes() -> dict[str, Callable[[], tuple[list[Part], tuple[int, int]]]]:
     }
 
 
-# ── fillPoly half-pixel convention self-test ─────────────────────────────
+# fillPoly half-pixel convention self-test
 
 
 def _selftest() -> None:
@@ -407,7 +256,7 @@ def _selftest() -> None:
             f"bbox ({x},{y},{w},{h}) n={n}, expected ({ex},{ey},{ew},{eh}) n={ew * eh}")
 
 
-# ── panels ───────────────────────────────────────────────────────────────
+# panels
 
 
 def _up(mask: np.ndarray, target: int) -> np.ndarray:
@@ -443,7 +292,7 @@ def _degree_panels(parts: list[Part], canvas_hw: tuple[int, int],
     return out
 
 
-# ── fixture mode ─────────────────────────────────────────────────────────
+# fixture mode
 
 
 def _fixture_constructions(stem: str):
@@ -714,7 +563,7 @@ def _process_fixture(stem: str, sizes: tuple[int, ...], twice: bool,
     return stats
 
 
-# ── final render product (assembled deliverable; stage-4 refine's input) ──
+# final render product (assembled deliverable; stage-4 refine's input)
 
 
 
@@ -770,7 +619,7 @@ def _final_worker(stem: str, sizes: tuple[int, ...], twice: bool):
     return row, buf.getvalue()
 
 
-# ── per-case driver ──────────────────────────────────────────────────────
+# per-case driver
 
 
 def _process(name: str, builder, sizes: tuple[int, ...], degrees: bool,

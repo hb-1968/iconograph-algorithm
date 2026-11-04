@@ -1,15 +1,8 @@
-"""H6 .cache/stages/ helper — per-fixture, per-stage memoization.
+"""Cache per-fixture stage outputs in memory and on disk.
 
-Cache key is (source PNG sha256, application/ tree sha256). Either mismatch
-wipes that fixture's stage artifacts. Storage is pickle so dataclasses,
-ndarrays, and lists-of-tuples round-trip through the same path. Per H8 the
-cached output is byte-identical to the fresh computation.
-
-A process-local RAM cache fronts the disk pickle store: cached() consults
-_RAM_CACHE first, falls back to disk on miss, populates RAM on both fresh
-compute and disk hit. Master-process prewarm() bulk-loads existing pkls
-into the dict before fork() so worker pools get COW-shared upstream stages
-without per-worker pickle reads.
+Keys bind source PNG bytes and application/cache source bytes; comment edits
+also invalidate disk entries. Values are pickled. prewarm loads valid entries
+before fork so workers inherit them through copy-on-write memory.
 """
 
 from __future__ import annotations
@@ -24,18 +17,10 @@ from typing import Any, Callable, Iterable
 _PKG_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT = _PKG_ROOT.parents[1]
 CACHE_ROOT = _REPO_ROOT / ".cache" / "stages"
-# The fixtures BASIS directory — overridable so an uncurated sample set
-# (fixtures-sample/, the real-world app-icon basis) can drive the testbed +
-# harnesses without touching the curated H9 fixtures/. Default (env unset) is
-# byte-identical to the historical constant. The stage cache namespace stays
-# SHARED (CACHE_ROOT keys by stem) — sample stems are reverse-DNS and cannot
-# collide with curated stems; sample runs use explicit stem lists.
+# Override the fixture basis without changing the shared stem-based cache namespace.
 FIXTURES_ROOT = Path(os.environ.get("ICONOGRAPH_FIXTURES",
                                     str(_REPO_ROOT / "fixtures")))
-# Testbed OUTPUT root, basis-aware: the default basis writes testbed/ as always;
-# an overridden basis (ICONOGRAPH_FIXTURES=fixtures-sample) writes under
-# testbed/<basis-name>/ so sample strips are FILTERABLE from the curated set's
-# (user directive 2026-07-11) and basis runs never overwrite each other's grids.
+# Separate output directories by fixture basis.
 TESTBED_ROOT = (_REPO_ROOT / "testbed"
                 if FIXTURES_ROOT == _REPO_ROOT / "fixtures"
                 else _REPO_ROOT / "testbed" / FIXTURES_ROOT.name)

@@ -1,41 +1,9 @@
-"""Lightweight stage-4 refine harness — pixel-level perimeter outline + disjoint repair.
+"""Inspect the production perimeter-refinement chain at 16 and 24 pixels.
 
-    python -m iconograph.refine_debug                  # default: discord, gmail, vscode, claude, figma
-    python -m iconograph.refine_debug <stem> [stem ...]  # explicit set
-    python -m iconograph.refine_debug --twice          # H8 determinism assert (pixels + trace order)
-    python -m iconograph.refine_debug --trace          # per-component normalize decision table
-
-Per fixture x feed size {16, 24}: composite the stage-3 render -> full refine chain un-blot ->
-widen (@24-gated) -> deburr edge nibs (ref-gated) -> normalize_stroke_width (per-stroke
-thin/hollow-widen/keep arbitration on the blot metric; trace threaded here) -> symmetrize
-(retention-guarded accents + fold-then-repair) -> perimeter_ring (the arbitrated outline tail: plain
-AND pocket-averse connect_disjoint -> reopen_channels chain-blot carve ->
-relieve_tight_pockets outward wall relief, competing on count_tight_pockets), wrapped by
-the production accessory passes: carve_accent before / restore_accent after (protected
-assembly accents), fill_glyph_channels before the chain and stamp_glyph_ink after
-perimeter_ring (mastodon's m ink-lines). The chain is
-IDENTICAL to production refine_perimeter. Emits a side-by-side strip `render | outline raw |
-connected (fills red) | stroke (normalize diff, red adds / blue thins) | refined outline
-(net red/blue)` to testbed/refine/<stem>.png. Report columns per cell: pass px deltas,
-fired=<acted>/<comps>, blot=<2x2 all-ink blocks> and tight=<count_tight_pockets> on the
-FINAL ring (the two gate metrics), the tail px delta, and the per-stage thin-residue chain
-resid sil/ub/wid/deb/nrm. Reuses render_debug's fixture->masks seam (no decomposition
-re-plumbing). BLAS pinned to 1 thread.
-
-PROTECTED ACCENT (assemble_render's third return): a deliberately-placed assembly accent
-(instagram's separated camera dot) is CARVED OUT of the silhouette before the chain and
-OR-ed back onto the final ring — mirroring production refine_perimeter's `protected=` —
-because refine's oracles are blind to it (its reference is empty at the placed position).
-Column semantics with an accent present: blot + tight* + the c4/c8 caption are measured on
-the RESTORED ring (the shipped product; tight* excludes the accent zone — instagram@24's
-3x3-OUTLINE dot carries a user-ratified 1x1 interior hole that must not read as wireframe
-tightness); raw tight/asym/ret/stray stay on the chain's OWN pre-restore product (the
-arbitration never saw the dot — its metrics aren't charged for it, and the dot is an
-INTENTIONAL asymmetry/non-ref accent that would misread as asym/stray). With a glyph
-channel present, `stray` additionally excludes the glyph-channel/valley zone (the fill
-and the K ink are deliberate ref-empty ink, not render noise); blot/tight/tight* stay
-charged for the glyph zone (K is trimmed 8-separated off the ring, probed blot-clean).
-
+Write stage strips and report stroke changes, connectivity, blot and pocket
+counts. --twice checks repeatability; --trace shows normalization decisions.
+Protected accents are restored before final metrics. Accent and glyph zones
+are excluded only from the diagnostics that explicitly mark those exclusions.
 """
 
 from __future__ import annotations

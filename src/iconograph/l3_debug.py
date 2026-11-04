@@ -1,17 +1,4 @@
-"""Lightweight, single-process debug harness for stage-3 L3 shape fitting.
-
-No fork pool, no full testbed wiring — runs `fit_features` over cached L2 outputs and
-emits a per-fixture H7 strip plus a numeric report, for fast iteration on the fitter.
-
-    python -m iconograph.l3_debug                 # default: android-head_flat, gmail, obsidian
-    python -m iconograph.l3_debug <stem> [stem …] # specific fixtures
-
-Each strip is four panels: aligned (target) | L2 features | L3 pass-1 (greedy) |
-L3 pass-2 (cleaned), captioned with part counts so the redundancy cleanup (p1 → p2)
-is visible. Fitted shapes render in a palette; deferrals (no adequate fit) render red.
-Loads each stage through the project cache (self-heals a crash-truncated cache by
-recomputing serially); L3 itself is computed fresh. BLAS pinned to one thread.
-"""
+"""Compare fixtures against the legacy L3 beam-search fitting baseline."""
 
 from __future__ import annotations
 

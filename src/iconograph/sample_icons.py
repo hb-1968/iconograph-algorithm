@@ -1,20 +1,8 @@
-"""sample_icons.py — deterministic DEV sampler of installed app icons → fixtures-sample/.
+"""Sample installed-app icons for fixture testing.
 
-Thin consumer of `appicons.py` (the shared census/resolution layer — the production
-`build` command uses the same chain): sample a seeded random subset of the machine's
-INSTALLED apps and materialize a self-contained fixtures basis directory the debug
-harnesses run against via ICONOGRAPH_FIXTURES=fixtures-sample. The production pack
-builder is `python -m iconograph build` — this script exists for curve-ball hunting
-on reproducible subsets.
-
-    python -m iconograph.sample_icons                # sample N_SAMPLE into fixtures-sample/
-    python -m iconograph.sample_icons --dry          # print the census + pick, write nothing
-    python -m iconograph.sample_icons --n 50         # bigger batch
-
-Eligibility = installed apps (the .desktop census — round-2 lesson: theme packs alias
-thousands of NOT-installed apps) minus fuzzy matches against the curated H9 fixtures/.
-Deterministic (H8): fixed SEED, sorted pool, no timestamps — double runs are
-byte-identical.
+Use the shared app census and resolver, exclude curated matches, and sample
+with a fixed seed. --dry lists the selection without writing files. The
+builder processes installed apps directly; sampling is a development tool.
 """
 from __future__ import annotations
 

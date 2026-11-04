@@ -1,23 +1,8 @@
-"""Stage-3 label-cleaner (WS2): clean a feature's decomposition before render.
+"""Clean decompositions before rendering.
 
-Runs once per feature, AFTER decompose_shape and BEFORE the R1 render, on the
-padded canonical canvas. Five conservative, no-regression cleanups on the
-Decomposition's Parts:
-
-  Job 1a  prune redundant parts        (_post_prune FREE pass)
-  Job 1b  merge near-duplicate adds    (same group/type, IoU ≥ MERGE_IOU)
-  Job 1c  re-fit loose primitives      (re-fit to the source the part covers)
-  Job 2   drop no-op (zero-bite) subtracts  (label normalization)
-  Job 3   re-select variant by sub-case (burst → rot-spurs, gated)
-
-Every mutating step is gated on min(area, boundary) IoU vs the source (the score
-the whole pipeline arbitrates on): a change is accepted only if it does NOT lower
-that number (H1). A hard fallback returns the ORIGINAL decomposition if the net
-result ever drops below base. Pure function, no RNG → byte-identical reruns (H8).
-
-Roles (dominant/lobe/accent/shave/counter) are NOT attached here — render recomputes
-them via infer_roles; Job 2 only removes the dead subtracts that would mislabel.
-All primitives are H5 reuse of compress/common.py + compress/decompose.py.
+Prune redundant parts, merge duplicate adds, refit loose primitives, remove
+zero-bite subtracts and reconsider burst variants. Accept changes only when
+min(area IoU, boundary IoU) does not decrease; otherwise retain the original.
 """
 
 import numpy as np

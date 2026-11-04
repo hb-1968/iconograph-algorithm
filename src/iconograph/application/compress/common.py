@@ -233,13 +233,13 @@ def _fit_arc_circle(points: np.ndarray) -> tuple[Circle, float] | None:
     return Circle(cx=cx, cy=cy, r=r), rmse
 
 
-# --------------------------------------------------------------------------- #
+# #
 # Rotated-primitive fitters (lifted from L2 so L1/L2/L3 share one definition,
 # H5). Each returns (Primitive, rasterized mask, analytical area) | None — the
 # same 3-tuple shape as the axis-aligned fitters above. A rotated primitive only
 # competes when it earns it (elongation / ≥5 not-too-angular points); a blob is
 # left to the axis-aligned fitters.
-# --------------------------------------------------------------------------- #
+# #
 ROT_RECT_MIN_ASPECT = 2.0                 # rotated rect only when elongated
 ROT_ELLIPSE_POLY_TOL = 0.02
 ROT_ELLIPSE_MAX_VERTICES = 8
@@ -315,14 +315,14 @@ def _fit_rotated_ellipse(
     return prim, fit, float(math.pi * (a_full / 2.0) * (b_full / 2.0))
 
 
-# --------------------------------------------------------------------------- #
+# #
 # Construction vocabulary (signed primitives) + mask algebra.
 #
 # Lifted from the L2 compound-classify prototype (H5 — one source of truth for
 # L1/L2/L3). A *construction* is a list of Parts: every "add" is OR'd, then every
 # "subtract" is carved (AND-NOT). Order-independent within each op group. The
 # fitting layer (L3) builds constructions; these helpers rasterize and score them.
-# --------------------------------------------------------------------------- #
+# #
 MIN_FEATURE_DIVISOR = 48                  # smallest meaningful extent ≈ S / divisor
 
 Op = Literal["add", "subtract"]
@@ -623,7 +623,7 @@ def _post_prune(parts: list["Part"], target: np.ndarray, h: int, w: int,
     return keep
 
 
-# ── boundary-aware scoring (contour fidelity) ───────────────────────────
+# boundary-aware scoring (contour fidelity)
 # Pure area IoU hides corner/edge error (a sharp rect scores ~0.93 against a
 # rounded "pill"; an ellipse scores high against a square). Boundary IoU
 # (Cheng 2021) restricts the IoU to a d-px band along each boundary, so wrong
@@ -755,9 +755,9 @@ def _scale_part(part: Part, f: float) -> Part:
     return Part(primitive=_scale(part.primitive, f), op=part.op, group=part.group)
 
 
-# ── mirror symmetry (lifted from diff_fit.py per H5 — shared by the diff
+# mirror symmetry (lifted from diff_fit.py per H5 — shared by the diff
 # refiner's grid-reflection tying and the R1 renderer's symmetrization; pure
-# numpy/cv2, NO torch, so render.py can import without pulling the refiner) ──
+# numpy/cv2, NO torch, so render.py can import without pulling the refiner)
 ANGLE_SNAP_DEG = 1.5     # reflect/decode: angle within this of 0 (mod 90°) → exact axis-aligned type
 SYM_MIN_IOU = 0.90       # mask-vs-reflected-mask IoU to accept a mirror axis
 SYM_PAIR_IOU = 0.50      # part-vs-reflected-partner raster IoU to call two parts a mirrored pair
@@ -883,13 +883,13 @@ def _cand_inscribed_circle(
     return Ellipse(cx=cx, cy=cy, rx=float(r), ry=float(r)), fit, float(math.pi * r * r)
 
 
-# --------------------------------------------------------------------------- #
+# #
 # Largest inscribed axis-aligned rectangle (histogram maximal-rectangle DP on a
 # downscaled proxy — the one sanctioned hand-rolled loop; no OpenCV/skimage
 # inscribed-rect primitive exists, and the `lir` lib needs numba which has no
 # wheel for this interpreter). Used to fit a rectangular hole tightly without
 # the bounding-rect overshoot. Lifted from the L2 compound-classify prototype.
-# --------------------------------------------------------------------------- #
+# #
 _INSCRIBED_PROXY = 160
 
 
@@ -967,10 +967,10 @@ def _cand_inscribed_rectangle(
     return Rectangle(x=int(x), y=int(y), w=int(rw), h=int(rh)), fit, float(rw * rh)
 
 
-# --------------------------------------------------------------------------- #
+# #
 # Hole detection / filling / fitting (negation support, shared by L2's detection
 # gate and L3's holed/annular templates). Lifted from the L2 prototype + L2 itself.
-# --------------------------------------------------------------------------- #
+# #
 HOLE_AREA_FRAC = 0.03           # a hole must be ≥ this fraction of the filled area to count
 HOLE_FIT_MIN_IOU = 0.50         # only subtract a hole a primitive actually matches
 
@@ -1035,11 +1035,11 @@ def _fit_hole(hole_mask: np.ndarray, h: int, w: int, min_feat: int) -> Primitive
     return best
 
 
-# --------------------------------------------------------------------------- #
+# #
 # D1 contour-parse vocabulary — a shape's outer boundary as typed runs + corners.
 # Shared so the contour parser (D1), edge-tracer (D2), and junction tagger (D3)
 # read one definition (H5).
-# --------------------------------------------------------------------------- #
+# #
 @dataclass(frozen=True)
 class Corner:
     """An approx-polygon vertex: 'corner' (sharp turn) vs 'smooth', plus convexity —

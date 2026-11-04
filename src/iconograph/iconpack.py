@@ -1,25 +1,9 @@
-"""iconpack.py — the `build` command: every installed app → the Iconograph theme.
+"""Build light and dark icon themes from installed applications.
 
-    python -m iconograph build [--cores N] [--update] [--only GLOB]
-
-Scans the installed-app census (appicons.installed_apps), resolves each icon
-through the brand→Adwaita chain (appicons.resolve_icon), runs the stage 1→5
-pipeline (application.pipeline.build_icon) and compiles the snakes into a
-SELECTABLE freedesktop icon theme:
-
-    ~/.local/share/icons/Iconograph/{index.theme, 24x24/apps/, 32x32/apps/}
-
-Toggle ON:  gsettings set org.gnome.desktop.interface icon-theme 'Iconograph'
-Toggle OFF: gsettings set org.gnome.desktop.interface icon-theme 'Adwaita'
-(Inherits=Adwaita,hicolor — apps the pack doesn't cover keep their normal icon.)
-
-INCREMENTAL by default (the manifest hash+skip rule — run it after installing a
-new app; everything already built is skipped; the manifest flushes after every
-app so an interrupted run resumes). `--update` reprocesses the ENTIRE set (the
-explicit lever after pipeline code improvements). Icon file basenames are the
-`.desktop` `Icon=` values VERBATIM (the theme-lookup contract). Deterministic
-per app (H8): single-threaded workers, no RNG; the pool order only affects log
-interleaving, never pixels.
+Write 24/32-pixel PNGs and scalable SVGs under ~/.local/share/icons/. Preserve
+Icon names for theme lookup. Incremental builds skip unchanged sources with
+complete outputs; --update rebuilds all selected apps. Flush the manifest
+after each app so completed work can be resumed.
 """
 from __future__ import annotations
 
@@ -45,12 +29,8 @@ ICONS_ROOT = Path.home() / ".local/share/icons"
 STAGE_DIR = REPO_ROOT / ".cache" / "build" / "sources"
 SIZES = (24, 32)
 
-# TWO parallel themes from the SAME snake mask, differing only in fill: black
-# glyphs for light desktops, white for dark (a black icon vanishes on a dark
-# background). Light first — the default toggle target. The manifest lives with
-# the light theme; each app's output paths are recorded relative to ICONS_ROOT
-# (theme-name-prefixed) so ONE manifest entry tracks both themes' PNGs and the
-# skip/prune logic resolves them under a single root.
+# Both themes share a mask. The light-theme manifest records paths relative to
+# ICONS_ROOT.
 LIGHT_DIR = ICONS_ROOT / "Iconograph"
 DARK_DIR = ICONS_ROOT / "Iconograph-Dark"
 PACK_DIR = LIGHT_DIR                       # manifest home (light == the primary theme)

@@ -1,15 +1,7 @@
-"""Stage 3 D1 — contour parse: a mask's outer boundary → typed runs + corners.
+"""Parse mask contours into straight/arc runs and convex/concave corners.
 
-Pipeline position (the contour-driven decomposer that replaces the monolithic L3 beam):
-    D1 contour_parse (THIS) → D2 edge-tracing → D3 junction + residual
-
-D1 turns a feature mask into a `ParsedContour`. The full-resolution ordered outer contour
-(`_largest_contour`, CHAIN_APPROX_NONE) is reduced to dominant vertices (`approxPolyDP`); each
-vertex is tagged CORNER (sharp path turn) or SMOOTH (shallow, partway along a curve); the boundary
-is split at corners into maximal RUNS, each classified STRAIGHT (hugs its chord) or ARC (bows). No
-fitting happens here — D1 only produces the typed boundary that D2 traces (corner/straight run → a
-triangle or rect edge; arc run → an ellipse). Deterministic (H8): approxPolyDP (Ramer–Douglas–
-Peucker) + angle / chord-deviation tests, no RNG.
+Normalize contour orientation and parse interior holes alongside the outer
+boundary. Coordinates remain in the input mask's pixel frame.
 """
 
 from __future__ import annotations
@@ -126,9 +118,9 @@ def parse_shape(mask: np.ndarray) -> ParsedShape | None:
     return ParsedShape(outer=outer, holes=holes)
 
 
-# --------------------------------------------------------------------------- #
+# #
 # overlay (testbed / debug)
-# --------------------------------------------------------------------------- #
+# #
 _STRAIGHT_COL = (0x43, 0x63, 0xD8)       # blue — straight run
 _CONVEX_ARC_COL = (0xE6, 0x19, 0x4B)     # red — convex arc (additive)
 _CONCAVE_ARC_COL = (0x91, 0x1E, 0xB4)    # purple — concave arc (subtractive)

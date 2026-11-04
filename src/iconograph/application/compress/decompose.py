@@ -1,25 +1,9 @@
-"""Stage 3 D2+D3 — contour-driven decomposer: trace primitives + tag junctions/residual.
+"""Fit signed primitive groups to outer contours and holes.
 
-Pipeline position (the contour-driven decomposer that supersedes the monolithic L3 beam):
-    D1 contour_parse (parse_shape) → D2+D3 decompose (THIS)
-
-Given a feature mask, D2 traces the D1 boundary into a small set of signed primitives and D3 tags
-the leftovers. The mechanism is **edge-tracing by convexity** (the locked design):
-
-  - a CONVEX arc run → an ellipse that ADDS;  a CONCAVE arc run → an ellipse that SUBTRACTS
-    (so Apple's bite / a ring's inner edge / a notch carve, generically — no hint needed);
-  - each arc-ellipse fit is constrained to the feature's own bbox (AXIS_BBOX_FRAC) so a partial,
-    ill-conditioned arc can't balloon into a giant circle;
-  - the convex-arc ellipses are carved by half-planes from the straight runs they cross (the whale
-    hull's flat top → ellipse − rect = half-disc), then accepted AS A GROUP iff the carved
-    construction stays within S — spill ≤ ACCEPT_SPILL, judged AFTER the carve — so a true half-disc
-    passes while an un-carvable runaway that engulfs background is demoted to a junction label;
-  - the straight-edged remainder is covered by best-fit primitives; interior HOLES subtract a fitted
-    primitive; what no primitive explains (coverage < ADEQUATE_COV) is the small **residual** mask.
-
-Operates on a PADDED canvas so an enclosing ellipse can spill into background and be carved.
-Deterministic (H8): cv2 fitters + numpy, fixed run order, integer-keyed carve sort, no RNG.
-Output is a `Decomposition`.
+Trace convex arcs with additions and concave boundaries with subtractions;
+fill residual regions and compare candidates by area and boundary agreement.
+Negative CSG groups represent compound holes. Optional diff_fit refines
+sub-adequate candidates at test time.
 """
 
 from __future__ import annotations
@@ -77,7 +61,7 @@ from scipy.signal import find_peaks
 from skimage.feature import peak_local_max
 from skimage.morphology import medial_axis
 
-# ── knobs ───────────────────────────────────────────────────────────────
+# knobs
 HARD_RUN_CAP = 16        # outer runs > this ⇒ genuinely complex → whole-feature residual
 MIN_ARC_FRAC = 0.02      # relative arc floor (was 0.05 — a cliff that silently deleted letterform
 #                          counter arcs at 0.024-0.049 and crown scallops; probe-calibrated)
@@ -175,9 +159,9 @@ class Decomposition:
     structured: bool = field(default=False)   # True only for the L2-geometry annulus — earns the STRUCT bonus in _arbitrate
 
 
-# --------------------------------------------------------------------------- #
+# #
 # geometry helpers (the WRITE-NEW primitives, per the H11 audit)
-# --------------------------------------------------------------------------- #
+# #
 def _fit_arc_ellipse(points: np.ndarray, bbox: tuple[int, int, int, int]) -> RotatedEllipse | None:
     """Least-squares ellipse through an arc run's dense points, CONSTRAINED to the feature's own bbox
     so a partial, ill-conditioned arc can't balloon. None if too short, degenerate, or a runaway: an
@@ -303,9 +287,9 @@ def _concave_notch_triangles(parsed: ParsedShape) -> list[Triangle]:
     return tris
 
 
-# --------------------------------------------------------------------------- #
+# #
 # the decomposer (D2 trace + D3 junction/residual)
-# --------------------------------------------------------------------------- #
+# #
 def _spill_carves(adds: list[Part], target: np.ndarray, runs, h: int, w: int) -> list[Part]:
     """Carve the construction's over-reach (adds outside S) with half-planes from the straight runs,
     each oriented to put S on the inside. Candidates are accepted in deterministic descending order of
@@ -1633,9 +1617,9 @@ def decompose_shape(mask: np.ndarray, min_feat: int, hint: str | None = None,
     return _arbitrate(candidates)
 
 
-# --------------------------------------------------------------------------- #
+# #
 # overlay (testbed / debug)
-# --------------------------------------------------------------------------- #
+# #
 _PALETTE: tuple[tuple[int, int, int], ...] = (
     (0x3C, 0xB4, 0x4B), (0x43, 0x63, 0xD8), (0xF5, 0x82, 0x31),
     (0x91, 0x1E, 0xB4), (0x46, 0x99, 0x90), (0x9A, 0x63, 0x24),

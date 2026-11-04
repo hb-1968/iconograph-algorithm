@@ -1,1 +1,1 @@
-"""Stage 5 — standard logos: connected-component / OCR letter extraction."""
+"""Unimplemented OCR-based letter extraction; production uses the app name."""

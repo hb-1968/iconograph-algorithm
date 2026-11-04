@@ -1,11 +1,6 @@
 """CLI entrypoint for iconograph."""
 
-# Pin BLAS / OpenMP thread pools to 1 BEFORE any numpy / cv2 / sklearn import.
-# Conditional: only set when this invocation will fork a worker pool. Single-
-# process `bench --serial` (or any future `--nproc 1`) skips the cap so the
-# master can use full-thread BLAS. The decision must happen pre-import because
-# BLAS reads these env vars once on first numpy import; setting them later is
-# silently ignored on most builds.
+# Set thread limits before NumPy imports them; serial benchmarks keep host defaults.
 import os
 import sys
 

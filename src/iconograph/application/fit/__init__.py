@@ -1,1 +1,1 @@
-"""Stage 6: aggressive fitting protocol — per-target (scale, x, y) optimization."""
+"""Unused fitting placeholders; composition is implemented in monogram/."""

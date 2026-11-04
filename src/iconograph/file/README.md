@@ -1,1 +1,4 @@
-deferred until the application pipeline ships — see CLAUDE.md §3.
+# File icons
+
+The file-icon pipeline is unimplemented. The current build handles application
+icons; see the [project README](../../../README.md).

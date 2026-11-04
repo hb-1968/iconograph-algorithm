@@ -1,17 +1,7 @@
-"""Pre-compression categorization gate (report-only diagnostic + build-report flag).
+"""Flag color-carried marks whose interior detail disappears in preprocessing.
 
-Flags logos whose identity is interior colour-contrast on a solid badge and would be
-flattened to a block before stage-3 compression — the same signal `categorize.
-_color_carried` routes on, computed here independently from the source as the
-validation / audit surface for the detector (harness: `precompress_gate_debug`).
-
-Criterion (user ruling — "if discarding colour collapses the silhouette to a simple
-shape, colour carried the identity"): the alpha silhouette collapses to ONE simple
-primitive (`fit_simple_primitive` IoU >= COLLAPSE_IOU) AND holds enclosed interior
-colour-contrast marks (`interior_mark_mask` fraction >= MARK_FRAC_FLOOR) AND was NOT
-already routed colour-aware (not color_essential, not is_compound). EasyEffects /
-Ptyxis fire; the compound/colour logos (chrome, claude, instagram, youtube-music, …)
-are excluded because they're already handled. Report-only — never changes output.
+Compare envelope simplicity and enclosed color contrast. This diagnostic is
+report-only and does not change categorization or stop application builds.
 """
 from __future__ import annotations
 

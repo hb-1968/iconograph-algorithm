@@ -1,1 +1,1 @@
-"""Compose abstract + monogram → write Fedora hicolor tree + manifest.json."""
+"""Unused composition placeholder; see monogram/compose.py and iconpack.py."""

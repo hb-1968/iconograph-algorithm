@@ -1,14 +1,4 @@
-"""Lightweight, single-process debug harness for stage-3 L2 feature segmentation.
-
-No fork pool, no grid composite — runs segment_features over cached L1 outputs and
-prints a numeric report, for fast iteration without spiking every core.
-
-    python -m iconograph.l2seg_debug [stem ...]      # default: all fixtures
-    python -m iconograph.l2seg_debug --dump <stem>   # colour-coded part split PNG
-
-Loads each stage through the project cache (self-heals crash-truncated caches by
-recomputing serially). BLAS pinned to one thread.
-"""
+"""Inspect cached L2 features; --dump writes a segmentation overlay."""
 
 from __future__ import annotations
 

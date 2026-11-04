@@ -1,50 +1,9 @@
-"""Stage-4 consistency cleanup — a deterministic post-render pass.
+"""Refine rendered silhouettes into small-grid outlines.
 
-Two scene-level modes, each the complement of what per-construction render can
-express (render.py is never modified):
-
-(1) MIRROR-SYMMETRY reconciliation (mask-domain, layer-on-top) — when a logo's
-CANONICAL silhouette is mirror-symmetric but its render drifted off-axis
-(gmail@16), the produced mask is half-mirrored about the axis so it reads clean
-and symmetric. The gate is the canonical axis (the "this logo IS symmetric"
-signal), so a large render drift is still corrected; an already-symmetric render
-(vscode) is left byte-identical, as is any logo with no global axis (figma).
-
-(2) WHOLE-GLYPH ROTATION (Parts-domain, re-render) — angle-tension reduction. A
-glyph whose strokes sit on diagonals composes from 1-px 45° staircases (high
-jag). Rotating the WHOLE glyph onto the 45° grid can land those strokes on the
-axis / run-≥2 slope members, so render expresses them as straight runs. The pass
-rotates every construction's Parts by a candidate angle, refits the rotated glyph
-to the incumbent's canvas footprint (fair scale), re-renders, and HARD-scores the
-composite: a rotation ships only when it is feasible (fidelity ≥ floor + topology
-preserved vs its OWN rotated reference) AND cuts jag-density by ≥ JAG_MARGIN_FRAC.
-Identity wins ties, so an upright glyph is only displaced by a strict win — the
-pass is byte-identical when nothing beats the margin (the no-op contract). Rotation
-fires only on ROTATION-ELIGIBLE marks — those with no canonical "up" (multi-fold
-symmetric, or a single thin stroke) — so a composed logo with an intended orientation
-is never tilted. (Whole-glyph rotation of figma/vscode mangles them into tilted blobs
-even as jag drops; the jag floor can't tell "cleaner same shape" from "same logo,
-tilted", so the ELIGIBILITY gate, not the floor, is what prevents that.) The
-monogram/letter class is a further eligibility signal, deferred to stage 5.
-
-Per-PART consistency — equalizing same-kind components that render unequal, and
-de-caving a convex part that rendered concave — was investigated and found
-INFEASIBLE as a layer-on-top post-pass: the seeds decompose into a single
-construction whose parts are FUSED in the silhouette, and a per-part solo render
-is smaller/squarer than that part's joint footprint, so re-stamping it either
-fragments the logo (figma@16/@24: 1→2 components) or square-ifies a circle
-(figma@32), violating the represented-geometry heuristic. figma's three circles
-are already geometrically equal (canonical radii 234.6 / 235.9 / 239.3, spread
-~2%); their rendered inequality is
-render's INDEPENDENT per-circle straightening, which only a render-level group
-harmonization can fix. That conflicts with "layer on top" and stays a render-level
-decision (see README §R1 round 10): the rotation mode sidesteps the fused-mask
-limit by transforming the Parts and RE-RENDERING, not by re-stamping the mask.
-
-Deterministic (H8): no RNG, fixed candidate-angle order, float64 rotation math,
-integer mirror; render_debug is itself deterministic. When no gate fires the output
-is value-identical to the input. The single public export is cleanup_scene.
-
+refine_perimeter runs artifact removal, stroke adjustment, guarded symmetry
+and perimeter repair. Protected accents are removed before refinement and
+restored afterward. Scene-level rotation and optimization helpers are
+separate from this production chain.
 """
 from __future__ import annotations
 
@@ -174,7 +133,7 @@ def _reconcile_symmetry(constructions: list[tuple[list[Part], tuple, str]],
     return [sym]
 
 
-# ── whole-glyph rotation (mode 2: Parts-domain, re-render) ───────────────────
+# whole-glyph rotation (mode 2: Parts-domain, re-render)
 # Rotation is a SUPPRESSIBLE scene DOF (the wedge doctrine at glyph scale):
 # offer the 45°-grid orientations, score, let the floor + jag margin arbitrate.
 ROTATION_ANGLES: tuple[float, ...] = (0.0, 90.0, 180.0, 270.0, 45.0, 135.0, 225.0, 315.0)
@@ -400,7 +359,7 @@ def _rotation_search(constructions: list[tuple[list[Part], tuple, str]],
     return list(rendered_masks)
 
 
-# ── cross-construction symmetry (the multi-construction case _reconcile_symmetry defers) ──
+# cross-construction symmetry (the multi-construction case _reconcile_symmetry defers)
 SCENE_SYM_MARGIN = 0.02   # composite symmetry IoU (about the CANONICAL axis) must improve by ≥ this
 SCENE_FID_KEEP = 0.85     # the shifted composite must stay this close to the incumbent (no drift)
 
@@ -479,7 +438,7 @@ def cleanup_scene(constructions: list[tuple[list[Part], tuple, str]],
     return _rotation_search(constructions, masks, canvas_hw, target)
 
 
-# ── Phase 2: outline / connect / squeeze (pixel-level, on the fused composite) ──────
+# Phase 2: outline / connect / squeeze (pixel-level, on the fused composite)
 # Phase 1 corrected the per-construction renders; Phase 2 works on the COMPOSITE
 # silhouette, reducing it to a 1-px centerline after bridging rasterization gaps and
 # merging near-parallel strokes — guarded so intended topology (counters, genuinely
@@ -713,7 +672,7 @@ def refine_outline(constructions: list[tuple[list[Part], tuple, str]],
     return restroke_outline(constructions, masks, canvas_hw, target)
 
 
-# ── Perimeter outline + diagonal "disjoint" repair (Stage-4 v1, pixel-level) ─────────
+# Perimeter outline + diagonal "disjoint" repair (Stage-4 v1, pixel-level)
 # A DIFFERENT product from the skeleton path above: the user's "outline" here is the 1-px
 # BOUNDARY PERIMETER of the silhouette (a closed loop hugging the edge), NOT the medial-
 # axis centerline. Renders are monochromatic, so the outline is the perimeter of the
@@ -870,7 +829,7 @@ def _connect_averse(out: np.ndarray, sil: np.ndarray, max_passes: int) -> np.nda
     return (out * 255).astype(np.uint8)
 
 
-# ── un-blot small features: counters that merge into the outline at tiny T ───────────
+# un-blot small features: counters that merge into the outline at tiny T
 # At feed res a small interior counter (discord's eyes @16) can sit so close to another
 # boundary that silhouette_outline merges its rim into the outline mass — the feature
 # "blots" and stops reading as a distinct element (at 24 the eyes outline as separate

@@ -1,21 +1,8 @@
-"""R1 render tier — render_fit: test-time differentiable TWEAK refiner.
+"""Optimize render candidates with optional CPU PyTorch refinement.
 
-diff_fit's proven pattern (torch CPU, NO training, lazy import, deterministic,
-soft-optimize → decode → re-score HARD by the caller) specialized to small
-tweak deltas around the deterministic grid-fit's chosen STRAIGHTENED forms:
-per-leader position deltas (±2 px, tanh-bounded) and per-axis log-scales
-([ln 0.95, ln 1.05]), optimized against the pre-threshold float coverage map
-with a band-weighted soft IoU + an anti-globbing gap-occupancy term + a prior
-pulling toward the incumbent. NO angle parameters (angles are doctrine — the
-digital slope grid) and NO existence gates (drops stay 1:1-accounted; part
-suppression is deterministic). Followers contribute the SAME tensors evaluated
-on the flipped grid, so the decoded deltas re-render through the caller's
-integer raster flips and pixel-exact symmetry survives — nothing this module
-rasterizes ever escapes; render.py re-applies the deltas deterministically and
-runs the result through the full feasibility battery + arbitration.
-
-Fires only behind render.py's gate; importing this module pulls torch (both
-refiners are lazy/optional siblings — the `diff` extra)."""
+Soft optimization proposes geometry; hard-render feasibility and scoring
+decide whether it replaces the incumbent.
+"""
 
 from __future__ import annotations
 

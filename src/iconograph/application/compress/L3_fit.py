@@ -1,35 +1,8 @@
-"""Stage 3 L3 — geometric shape fitting (the deferred fitter).
+"""Legacy beam-search baseline for signed primitive constructions.
 
-Pipeline position:
-    align (L0) → segment_prim_classify (L1) → L2_feature_segment (L2) → L3_fit (THIS)
-
-L2 hands L3 a `FeatureSegmentation`: already-fit L1 `Classified` primitives plus
-miss-derived `Feature`s (each tagged with a `kind` + `shape_hint`). L3 turns every
-`Feature` into a *construction* — a list of signed primitives whose boolean
-combination (`OR` the adds, then `AND-NOT` the subtracts) reconstructs the shape.
-Primitives may be rotated and may OVERLAP; the construction must fill the shape with
-no gaps and reach its rounded boundary ("fill the radius up").
-
-Two passes per feature (`_fit_one`):
-  1. PASS 1 — greedy + back-stepping = a bounded **beam search**. From each partial
-     construction, propose an ADD over the uncovered residual (`under = T & ¬recon`)
-     and a SUBTRACT over the spilled residual (`over = recon & ¬T`); score every
-     candidate by the WHOLE construction's IoU and keep the top-K. Scoring the whole
-     construction (not a per-step recall minus a spill penalty) is what makes overlap
-     safe: an overshoot can be carved by a later subtract, so enclosing candidates are
-     allowed. The L2 `shape_hint` seeds the search (single-primitive → 1-part seed;
-     half_circle → enclosing circle; composite / defer → cold start).
-  2. PASS 2 — cleanup: backward elimination drops any part whose removal costs < a
-     tolerance in IoU (the "several rectangles piled on one spot" case), then a
-     gap-fill covers any residual hole (the no-disjoint / arc-coverage guarantee).
-
-Deferral is a FIT-ADEQUACY decision: if the cleaned construction's IoU is below
-`ADEQUATE_IOU`, L3 emits a `Deferral` (carrying the mask for a later pass) rather than
-forcing a low-quality fit. Deterministic (H8): every choice is an argmax / stable-sort
-over a fixed-order candidate list with a total `_part_key` tie-break; no RNG.
-
-All geometry is rasterized-mask algebra via the shared `common` helpers (H5); no
-shapely / scipy (rotated rasterization is native to `cv2.boxPoints` / `cv2.ellipse`).
+Propose additions and subtractions, score whole-construction IoU, then prune
+redundant parts and fill gaps. Fits below ADEQUATE_IOU become deferrals.
+The production build uses contour-based decomposition instead.
 """
 
 from __future__ import annotations
@@ -82,7 +55,7 @@ if TYPE_CHECKING:
     from iconograph.application.categorize import Categorization
 
 
-# ── engine knobs ────────────────────────────────────────────────────────
+# engine knobs
 BEAM_K = 4                  # partial constructions kept per beam depth
 BEAM_M = 4                  # candidate children expanded per state per step
 MAX_PARTS = 6               # construction part budget (beam depth bound)
@@ -123,9 +96,9 @@ class FittedDecomposition:
     shapes: list[Classified | FittedShape | Deferral]
 
 
-# --------------------------------------------------------------------------- #
+# #
 # candidate generation (enclosing + inscribed fits over a residual lobe)
-# --------------------------------------------------------------------------- #
+# #
 def _fitter_prims(lobe: np.ndarray, h: int, w: int, min_feat: int) -> list[Primitive]:
     """Every enclosing / inscribed primitive fit to a residual lobe, in a fixed order
     (deterministic tie-break: ellipse-family first). Enclosing fits reach a curved
@@ -170,9 +143,9 @@ def _sub_candidates(over: np.ndarray, h: int, w: int, min_feat: int) -> list[Par
     return [Part(p, "subtract") for p in _fitter_prims(lobe, h, w, min_feat)]
 
 
-# --------------------------------------------------------------------------- #
+# #
 # deterministic ordering keys
-# --------------------------------------------------------------------------- #
+# #
 def _prim_key(p: Primitive) -> tuple:
     """A total ordering key for a primitive: type name first (disambiguates types),
     then rounded numeric fields. Same structure within a type → comparable; the leading
@@ -217,9 +190,9 @@ def _rank_key(iou: float, parts: list[Part] | tuple[Part, ...]) -> tuple:
     )
 
 
-# --------------------------------------------------------------------------- #
+# #
 # pass 1 — greedy + back-stepping beam search
-# --------------------------------------------------------------------------- #
+# #
 def _expand(parts: list[Part], target: np.ndarray, h: int, w: int,
             min_feat: int) -> list[list[Part]]:
     """Up to BEAM_M child constructions from one state — best ADD over the uncovered
@@ -272,9 +245,9 @@ def _pass1_beam(target: np.ndarray, seed: list[Part], h: int, w: int,
     return best[2]
 
 
-# --------------------------------------------------------------------------- #
+# #
 # pass 2 — redundancy cleanup
-# --------------------------------------------------------------------------- #
+# #
 def _eliminate(parts: list[Part], target: np.ndarray, h: int, w: int) -> list[Part]:
     """Backward elimination to a fixpoint: drop any part whose removal costs < PRUNE_TOL
     IoU. Fixed order (adds first, largest raster-area first, then subs; _part_key as the
@@ -338,9 +311,9 @@ def _pass2_cleanup(parts: list[Part], target: np.ndarray, h: int, w: int,
     return parts
 
 
-# --------------------------------------------------------------------------- #
+# #
 # hint routing — the L2 shape_hint seeds the engine
-# --------------------------------------------------------------------------- #
+# #
 CAPSULE_MIN_ASPECT = 1.8        # elongated enough to be a capsule (rect + cap) vs a blob
 
 
@@ -533,9 +506,9 @@ def _seed_for(mask: np.ndarray, hint: ShapeHint, h: int, w: int, min_feat: int) 
     return []
 
 
-# --------------------------------------------------------------------------- #
+# #
 # per-feature fit (both passes) + public orchestrator
-# --------------------------------------------------------------------------- #
+# #
 def _pad_for(th: int, tw: int, min_feat: int) -> int:
     """Padding margin around the feature so an enclosing primitive's overshoot lands in
     background (and is carvable by a subtract) instead of being silently clipped to the
@@ -612,9 +585,9 @@ def fit_features(
     return FittedDecomposition(image_shape=fs.image_shape, shapes=shapes)
 
 
-# --------------------------------------------------------------------------- #
+# #
 # overlay renderer (testbed / H7 strip + l3_debug share this)
-# --------------------------------------------------------------------------- #
+# #
 _FIT_PALETTE: tuple[tuple[int, int, int], ...] = (
     (0x3C, 0xB4, 0x4B), (0x43, 0x63, 0xD8), (0xF5, 0x82, 0x31),
     (0x91, 0x1E, 0xB4), (0x46, 0x99, 0x90), (0x9A, 0x63, 0x24),

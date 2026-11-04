@@ -1,8 +1,4 @@
-"""Torch-side utilities shared by diff_fit and render_fit (H5 lift).
-
-Both refiners are lazy/optional — this module imports torch at module level
-and must only ever be imported from inside their lazy paths (never from
-render.py / decompose.py top level)."""
+"""Shared tensor geometry for the optional differentiable refiners."""
 
 import torch
 

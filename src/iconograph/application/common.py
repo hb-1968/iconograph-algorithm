@@ -20,7 +20,7 @@ HICOLOR_SIZES: tuple[int, ...] = (16, 24)
 # 3x3 rect structuring element = the full 8-neighbourhood (incl. diagonals).
 _SE3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
-# --- Colour-carried detection (categorize._color_carried / color_carried cutout /
+# Colour-carried detection (categorize._color_carried / color_carried cutout /
 # the pre-compression gate). "If discarding colour collapses the silhouette to a
 # single simple primitive AND the interior has enclosed colour-contrast marks, the
 # identity lives in colour" (user ruling). Tunables shared by all three consumers.
